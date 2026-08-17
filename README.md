@@ -11,6 +11,9 @@ Do **not** use the retired Azure meek endpoint (`meek.azureedge.net`). The defau
 ## Usage
 
 ```kotlin
+import io.bluewallet.echalote.Echalote
+import io.bluewallet.echalote.ExitDialerOptions
+
 val dialer = Echalote.createExitDialer(
     ExitDialerOptions(
         meekUrl = Echalote.DEFAULT_MEEK_URL, // https://1603026938.rsc.cdn77.org/
@@ -30,10 +33,10 @@ Directory consensus/microdescriptors are fetched over **clearnet HTTP** (same as
 
 ## Coordinates
 
-`org.bitcoin.kmp:echalote`
+`io.bluewallet:echalote`
 
 ## Tests
 
 ```bash
-./gradlew :library:jvmTest
+./gradlew :echalote:jvmTest
 ```

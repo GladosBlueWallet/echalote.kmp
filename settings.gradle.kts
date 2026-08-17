@@ -14,4 +14,5 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "echalote"
-include(":library")
+include(":echalote")
+project(":echalote").projectDir = file("library")
