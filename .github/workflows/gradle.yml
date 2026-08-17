@@ -45,4 +45,4 @@ jobs:
           path: ~/.konan
           key: ${{ runner.os }}-konan-${{ hashFiles('**/gradle/libs.versions.toml', '**/gradle-wrapper.properties') }}
       - name: Run ${{ matrix.target }}
-        run: ./gradlew :library:${{ matrix.target }} --no-daemon
+        run: ./gradlew :echalote:${{ matrix.target }} --no-daemon
