@@ -41,7 +41,7 @@ data class MicrodescHead(
     val ipv6: String? = null,
     val microdesc: String,
     val flags: List<String>,
-    val version: String,
+    val version: String? = null,
     val entries: Map<String, String>,
     val bandwidth: Map<String, String>,
 )
@@ -171,7 +171,7 @@ object ConsensusParser {
                         ipv6 = ipv6,
                         microdesc = microdesc ?: throw IllegalArgumentException("Missing microdesc"),
                         flags = flags ?: throw IllegalArgumentException("Missing flags"),
-                        version = ver ?: throw IllegalArgumentException("Missing version"),
+                        version = ver,
                         entries = entries ?: throw IllegalArgumentException("Missing entries"),
                         bandwidth = bandwidth ?: throw IllegalArgumentException("Missing bandwidth"),
                     )
