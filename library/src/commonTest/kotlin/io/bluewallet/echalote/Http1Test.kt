@@ -42,4 +42,52 @@ class Http1Test {
         assertEquals(200, res.status)
         assertEquals("hello", res.body.decodeToString())
     }
+
+    @Test
+    fun http1MessageComplete_needs_content_length_and_full_body() {
+        val prefix = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n".encodeToByteArray()
+        assertEquals(false, http1MessageComplete("HTTP/1.1 200 OK\r\n".encodeToByteArray()))
+        assertEquals(false, http1MessageComplete(prefix + "hel".encodeToByteArray()))
+        assertEquals(true, http1MessageComplete(prefix + "hello".encodeToByteArray()))
+        assertEquals(true, http1MessageComplete(prefix + "helloTRAILING".encodeToByteArray()))
+        assertEquals(
+            false,
+            http1MessageComplete("HTTP/1.0 200 OK\r\n\r\nbody".encodeToByteArray()),
+        )
+    }
+
+    @Test
+    fun readHttp1Raw_stops_at_content_length_without_waiting_for_eof() {
+        val chunks = ArrayDeque(
+            listOf(
+                "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhe".encodeToByteArray(),
+                "llo".encodeToByteArray(),
+                "SHOULD_NOT_READ".encodeToByteArray(),
+            ),
+        )
+        val raw = readHttp1Raw { chunks.removeFirstOrNull() }
+        assertEquals("hello", parseHttp1Response(raw).body.decodeToString())
+        assertEquals(1, chunks.size)
+    }
+
+    @Test
+    fun readHttp1Raw_without_content_length_reads_until_eof() {
+        val chunks = ArrayDeque(
+            listOf(
+                "HTTP/1.0 200 OK\r\n\r\nnet".encodeToByteArray(),
+                "work".encodeToByteArray(),
+            ),
+        )
+        val raw = readHttp1Raw { chunks.removeFirstOrNull() }
+        assertEquals("network", parseHttp1Response(raw).body.decodeToString())
+    }
+
+    @Test
+    fun readHttp1Raw_truncated_content_length_fails() {
+        val chunks = ArrayDeque(
+            listOf("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhe".encodeToByteArray()),
+        )
+        val err = runCatching { readHttp1Raw { chunks.removeFirstOrNull() } }.exceptionOrNull()
+        assertEquals(true, err is IllegalArgumentException)
+    }
 }
