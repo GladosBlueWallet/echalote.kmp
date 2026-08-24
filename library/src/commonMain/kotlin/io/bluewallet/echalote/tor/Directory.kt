@@ -264,7 +264,12 @@ suspend fun buildExitCircuit(
     throw lastError ?: Exception("extend circuit failed")
 }
 
-class AggregateError(val errors: List<Throwable>, message: String) : Exception(message)
+class AggregateError(val errors: List<Throwable>, message: String) : Exception(formatAggregate(message, errors))
+
+private fun formatAggregate(message: String, errors: List<Throwable>): String {
+    val details = errors.mapNotNull { it.message?.takeIf(String::isNotBlank) }.distinct()
+    return if (details.isEmpty()) message else "$message: ${details.joinToString(" | ")}"
+}
 
 suspend fun <T, R> fetchFirstOk(
     items: List<T>,
