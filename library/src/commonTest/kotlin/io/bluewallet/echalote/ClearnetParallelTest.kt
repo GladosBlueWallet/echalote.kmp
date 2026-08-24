@@ -63,6 +63,8 @@ class ClearnetParallelTest {
         }
         assertTrue(ex is AggregateError || ex.message?.contains("fetchFirstOk", ignoreCase = true) == true)
         assertTrue(ex.message?.contains("fetchFirstOk", ignoreCase = true) == true)
+        assertTrue(ex.message!!.contains("fail a"), ex.message)
+        assertTrue(ex.message!!.contains("fail b"), ex.message)
     }
 
     @Test

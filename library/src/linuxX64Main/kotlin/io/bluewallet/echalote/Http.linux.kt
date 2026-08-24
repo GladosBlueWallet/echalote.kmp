@@ -43,22 +43,10 @@ actual fun defaultHttpEngine(): HttpEngine = HttpEngine { method, url, headers, 
             val rc = connect(fd, addr.ptr.reinterpret(), kotlinx.cinterop.sizeOf<sockaddr_in>().convert())
             check(rc == 0) { "connect failed" }
 
-            val path = parsed.path
-            val hdr = buildString {
-                append("$method $path HTTP/1.1\r\n")
-                append("Host: ${parsed.host}:${parsed.port}\r\n")
-                append("Connection: close\r\n")
-                if (headers.none { it.key.equals("Content-Length", true) }) {
-                    append("Content-Length: ${body.size}\r\n")
-                }
-                for ((k, v) in headers) append("$k: $v\r\n")
-                append("\r\n")
-            }.encodeToByteArray()
-            sendAll(fd, hdr)
-            if (body.isNotEmpty()) sendAll(fd, body)
+            sendAll(fd, buildHttp1Request(method, parsed, headers, body))
 
             val raw = recvAll(fd)
-            return@memScoped parseHttpResponse(raw)
+            return@memScoped parseHttp1Response(raw)
         } finally {
             close(fd)
         }
@@ -72,19 +60,6 @@ private fun ipv4ToNetworkOrder(host: String): UInt {
     require(bytes.all { it <= 255u }) { "invalid IPv4 $host" }
     val hostOrder = (bytes[0] shl 24) or (bytes[1] shl 16) or (bytes[2] shl 8) or bytes[3]
     return htonl(hostOrder)
-}
-
-private data class ParsedUrl(val host: String, val port: Int, val path: String)
-
-private fun parseHttpUrl(url: String): ParsedUrl {
-    val rest = url.removePrefix("http://")
-    val slash = rest.indexOf('/')
-    val hostPort = if (slash < 0) rest else rest.substring(0, slash)
-    val path = if (slash < 0) "/" else rest.substring(slash)
-    val colon = hostPort.indexOf(':')
-    val host = if (colon < 0) hostPort else hostPort.substring(0, colon)
-    val port = if (colon < 0) 80 else hostPort.substring(colon + 1).toInt()
-    return ParsedUrl(host, port, path)
 }
 
 @OptIn(ExperimentalForeignApi::class)
@@ -111,22 +86,4 @@ private fun recvAll(fd: Int): ByteArray {
         }
     }
     return concatBytes(*chunks.toTypedArray())
-}
-
-private fun parseHttpResponse(raw: ByteArray): HttpResponse {
-    val text = raw.decodeToString()
-    val split = text.indexOf("\r\n\r\n")
-    require(split >= 0) { "HTTP response missing header terminator" }
-    val head = text.substring(0, split)
-    val body = raw.copyOfRange(split + 4, raw.size)
-    val lines = head.split("\r\n")
-    val status = lines[0].split(" ").getOrNull(1)?.toIntOrNull() ?: 0
-    val headers = mutableMapOf<String, String>()
-    for (line in lines.drop(1)) {
-        val c = line.indexOf(':')
-        if (c > 0) headers[line.substring(0, c).trim()] = line.substring(c + 1).trim()
-    }
-    val length = headers.entries.firstOrNull { it.key.equals("Content-Length", true) }?.value?.toIntOrNull()
-    val sliced = if (length != null) body.copyOf(minOf(length, body.size)) else body
-    return HttpResponse(status, sliced, headers)
 }
