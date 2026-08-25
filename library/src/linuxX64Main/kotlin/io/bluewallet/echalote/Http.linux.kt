@@ -45,7 +45,7 @@ actual fun defaultHttpEngine(): HttpEngine = HttpEngine { method, url, headers, 
 
             sendAll(fd, buildHttp1Request(method, parsed, headers, body))
 
-            val raw = recvAll(fd)
+            val raw = recvHttp1(fd)
             return@memScoped parseHttp1Response(raw)
         } finally {
             close(fd)
@@ -75,15 +75,12 @@ private fun sendAll(fd: Int, data: ByteArray) {
 }
 
 @OptIn(ExperimentalForeignApi::class)
-private fun recvAll(fd: Int): ByteArray {
-    val chunks = ArrayList<ByteArray>()
+private fun recvHttp1(fd: Int): ByteArray {
     val buf = ByteArray(16 * 1024)
-    buf.usePinned { pinned ->
-        while (true) {
+    return readHttp1Raw {
+        buf.usePinned { pinned ->
             val n = recv(fd, pinned.addressOf(0), buf.size.convert(), 0)
-            if (n <= 0) break
-            chunks += buf.copyOf(n.toInt())
+            if (n <= 0) null else buf.copyOf(n.toInt())
         }
     }
-    return concatBytes(*chunks.toTypedArray())
 }

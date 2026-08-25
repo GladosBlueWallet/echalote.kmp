@@ -50,3 +50,73 @@ fun parseHttp1Response(raw: ByteArray): HttpResponse {
     val sliced = if (length != null) body.copyOf(minOf(length, body.size)) else body
     return HttpResponse(status, sliced, headers)
 }
+
+fun http1HeaderEnd(raw: ByteArray): Int {
+    val last = raw.size - 3
+    var i = 0
+    while (i < last) {
+        if (
+            raw[i] == 0x0d.toByte() &&
+            raw[i + 1] == 0x0a.toByte() &&
+            raw[i + 2] == 0x0d.toByte() &&
+            raw[i + 3] == 0x0a.toByte()
+        ) {
+            return i
+        }
+        i++
+    }
+    return -1
+}
+
+fun http1ContentLength(headerBytes: ByteArray): Int? {
+    val text = headerBytes.decodeToString()
+    for (line in text.split("\r\n").drop(1)) {
+        val c = line.indexOf(':')
+        if (c <= 0) continue
+        if (line.substring(0, c).trim().equals("Content-Length", ignoreCase = true)) {
+            return line.substring(c + 1).trim().toIntOrNull()
+        }
+    }
+    return null
+}
+
+fun http1MessageComplete(raw: ByteArray): Boolean {
+    val split = http1HeaderEnd(raw)
+    if (split < 0) return false
+    val length = http1ContentLength(raw.copyOf(split)) ?: return false
+    return raw.size - split - 4 >= length
+}
+
+fun readHttp1Raw(read: () -> ByteArray?): ByteArray {
+    val chunks = ArrayList<ByteArray>()
+    var total = 0
+    while (true) {
+        val chunk = read() ?: throw IllegalArgumentException("HTTP response missing header terminator")
+        if (chunk.isEmpty()) continue
+        chunks += chunk
+        total += chunk.size
+        val soFar = concatBytes(*chunks.toTypedArray())
+        val headerEnd = http1HeaderEnd(soFar)
+        if (headerEnd < 0) {
+            require(total <= 256 * 1024) { "HTTP headers too large" }
+            continue
+        }
+        val length = http1ContentLength(soFar.copyOf(headerEnd))
+        var haveBody = soFar.size - headerEnd - 4
+        if (length == null) {
+            while (true) {
+                val more = read() ?: break
+                if (more.isNotEmpty()) chunks += more
+            }
+            return concatBytes(*chunks.toTypedArray())
+        }
+        require(length >= 0) { "Invalid Content-Length: $length" }
+        while (haveBody < length) {
+            val more = read() ?: throw IllegalArgumentException("truncated HTTP body")
+            if (more.isEmpty()) continue
+            chunks += more
+            haveBody += more.size
+        }
+        return concatBytes(*chunks.toTypedArray())
+    }
+}
