@@ -207,6 +207,7 @@ internal class SecretTorClientDuplex {
                     val payload = encodeRelayPayload(RelayCmd.SENDME, 0, sendme, circ.targets, early = false)
                     send(writeCell(circ.id, CellCmd.RELAY, payload))
                 }
+                stream.onIncomingData(relay.fragment)
                 relayData.emit(circ to (stream to relay.fragment))
             }
             RelayCmd.END -> if (stream != null) {
