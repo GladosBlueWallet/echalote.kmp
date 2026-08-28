@@ -71,10 +71,9 @@ suspend fun streamFetch(input: String, init: StreamFetchInit): StreamResponse {
         append("\r\n")
     }
     init.stream.write(head.encodeToByteArray())
-    try {
-        init.stream.close()
-    } catch (_: Throwable) {
-    }
+    // Do not close the duplex here. A full close tears down TLS/Tor reads.
+    // The TypeScript client only half-closes the write side; this ByteDuplex
+    // has no half-close, and the response is framed by length/chunked.
 
     val reader = HttpByteReader(init.stream, abort)
     val headBytes = reader.readUntil(CRLFCRLF)
