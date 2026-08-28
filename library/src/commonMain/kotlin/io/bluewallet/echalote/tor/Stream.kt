@@ -43,29 +43,6 @@ internal class SecretTorStreamDuplex(
                 connected.complete(Unit)
             }
         }
-        offs += circuit.tor.relayData.on { (circ, pair) ->
-            val (stream, data) = pair
-            if (circ !== circuit || stream !== this) return@on
-            delivery--
-            if (delivery == 450) {
-                delivery = 500
-                val payload = encodeRelayPayload(
-                    RelayCmd.SENDME, id, ByteArray(0), circuit.targets, early = false,
-                )
-                circuit.tor.scope.launch {
-                    try {
-                        circuit.tor.send(writeCell(circuit.id, CellCmd.RELAY, payload))
-                    } catch (_: Throwable) {
-                    }
-                }
-            }
-            circuit.tor.scope.launch {
-                try {
-                    duplex.enqueue(data)
-                } catch (_: Throwable) {
-                }
-            }
-        }
         offs += circuit.tor.relayEnd.on { (circ, pair) ->
             val (stream, reason) = pair
             if (circ !== circuit || stream !== this) return@on
@@ -84,6 +61,24 @@ internal class SecretTorStreamDuplex(
 
     suspend fun waitConnected(abort: Abort?) {
         withAbort(abort) { connected.await() }
+    }
+
+    /** Must run on the cell reader. A per-cell launch can reorder RELAY_DATA. */
+    suspend fun onIncomingData(data: ByteArray) {
+        delivery--
+        if (delivery == 450) {
+            delivery = 500
+            val payload = encodeRelayPayload(
+                RelayCmd.SENDME, id, ByteArray(0), circuit.targets, early = false,
+            )
+            circuit.tor.scope.launch {
+                try {
+                    circuit.tor.send(writeCell(circuit.id, CellCmd.RELAY, payload))
+                } catch (_: Throwable) {
+                }
+            }
+        }
+        duplex.enqueue(data)
     }
 
     fun fail(reason: Throwable?) {
