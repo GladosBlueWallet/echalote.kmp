@@ -6,6 +6,7 @@ import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFails
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class StreamFetchTest {
@@ -14,14 +15,17 @@ class StreamFetchTest {
     private class MockDuplex(
         private val responseChunks: List<ByteArray>,
         private val keepOpen: Boolean = false,
+        private val dropOnClose: Boolean = false,
     ) : ByteDuplex {
         private val req = ArrayList<ByteArray>()
         private val written = kotlinx.coroutines.CompletableDeferred<Unit>()
         private var idx = 0
-        private var closed = false
+        var closed = false
+            private set
 
         override suspend fun read(n: Int): ByteArray {
             written.await()
+            if (closed && dropOnClose) return ByteArray(0)
             if (idx >= responseChunks.size) {
                 if (keepOpen) {
                     kotlinx.coroutines.CompletableDeferred<ByteArray>().await()
@@ -63,6 +67,20 @@ class StreamFetchTest {
         assertTrue(req.startsWith("get /api/ip http/1.1\r\n"))
         assertTrue(req.contains("host: check.torproject.org\r\n"))
         assertTrue(req.contains("connection: close\r\n"))
+        assertFalse(mock.closed)
+    }
+
+    @Test
+    fun doesNotFullCloseWriteSideBeforeReadingResponse() = runTest {
+        val body = """{"IsTor":true,"IP":"9.9.9.9"}"""
+        val mock = MockDuplex(
+            listOf(utf8("HTTP/1.1 200 OK\r\nContent-Length: ${body.length}\r\n\r\n$body")),
+            dropOnClose = true,
+        )
+        val res = streamFetch("https://check.torproject.org/api/ip", StreamFetchInit(mock))
+        assertEquals("true", res.jsonObject()["IsTor"])
+        assertEquals("9.9.9.9", res.jsonObject()["IP"])
+        assertFalse(mock.closed)
     }
 
     @Test

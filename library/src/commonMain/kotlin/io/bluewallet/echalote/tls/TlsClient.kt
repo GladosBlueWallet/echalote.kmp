@@ -28,7 +28,10 @@ private const val HS_FINISHED = 20
  * Userspace TLS 1.2 client: ECDHE_RSA_WITH_AES_256_GCM_SHA384, no PKI trust.
  * Exposes the leaf certificate DER for Tor CERTS `sign_to_tls`.
  */
-internal class TlsClientDuplex {
+internal class TlsClientDuplex(
+    private val hostName: String? = null,
+    recordTransport: ByteDuplex? = null,
+) {
     val inner: ByteDuplex
     val outer: ByteDuplex
     val leafCertDer = CompletableDeferred<ByteArray>()
@@ -41,9 +44,10 @@ internal class TlsClientDuplex {
         val (outerPub, outerPriv) = pairedByteDuplexes()
         inner = innerPub
         outer = outerPub
+        val transport = recordTransport ?: innerPriv
         scope.launch {
             try {
-                handshakeAndPump(innerPriv, outerPriv)
+                handshakeAndPump(transport, outerPriv, hostName)
             } catch (e: Throwable) {
                 leafCertDer.completeExceptionally(e)
                 ready.completeExceptionally(e)
@@ -138,11 +142,11 @@ private class TlsEngine(val transport: ByteDuplex) {
 
 private data class TlsSession(val leaf: ByteArray, val tls: TlsEngine)
 
-private suspend fun runTlsHandshake(transport: ByteDuplex): TlsSession {
+private suspend fun runTlsHandshake(transport: ByteDuplex, hostName: String?): TlsSession {
     val tls = TlsEngine(transport)
     val hs = HandshakeBuf(tls)
     val clientRandom = secureRandom(32)
-    val clientHello = buildClientHello(clientRandom)
+    val clientHello = buildClientHello(clientRandom, hostName)
     hs.transcript = concatBytes(hs.transcript, clientHello)
     tls.writeRecord(REC_HS, clientHello)
 
@@ -270,8 +274,12 @@ private suspend fun runTlsHandshake(transport: ByteDuplex): TlsSession {
     return TlsSession(leaf, tls)
 }
 
-private suspend fun TlsClientDuplex.handshakeAndPump(transport: ByteDuplex, app: ByteDuplex) {
-    val session = runTlsHandshake(transport)
+private suspend fun TlsClientDuplex.handshakeAndPump(
+    transport: ByteDuplex,
+    app: ByteDuplex,
+    hostName: String?,
+) {
+    val session = runTlsHandshake(transport, hostName)
     leafCertDer.complete(session.leaf)
     ready.complete(Unit)
     val tls = session.tls
@@ -347,8 +355,16 @@ private fun handshakeMessage(type: Int, body: ByteArray): ByteArray {
     return out
 }
 
-private fun buildClientHello(random: ByteArray): ByteArray {
+private fun buildClientHello(random: ByteArray, hostName: String?): ByteArray {
+    val sni = if (hostName.isNullOrEmpty()) {
+        ByteArray(0)
+    } else {
+        val host = hostName.encodeToByteArray()
+        val nameEntry = concatBytes(byteArrayOf(0), u16(host.size), host)
+        tlsExt(0x0000, concatBytes(u16(nameEntry.size), nameEntry))
+    }
     val exts = concatBytes(
+        sni,
         tlsExt(0x000d, run {
             val algs = byteArrayOf(0x04, 0x01, 0x05, 0x01)
             concatBytes(u16(algs.size), algs)
@@ -378,4 +394,33 @@ private fun u16(v: Int): ByteArray {
     val b = ByteArray(2)
     b.putU16be(0, v)
     return b
+}
+
+/** TLS 1.2 over [transport]. [outer] is plaintext HTTP after handshake. */
+suspend fun wrapTls(
+    transport: ByteDuplex,
+    hostName: String,
+    abort: Abort? = null,
+): ByteDuplex {
+    val tls = TlsClientDuplex(hostName, transport)
+    try {
+        withAbort(abort) { tls.ready.await() }
+    } catch (err: Throwable) {
+        tls.close()
+        throw err
+    }
+    return object : ByteDuplex {
+        override suspend fun read(n: Int): ByteArray = tls.outer.read(n)
+        override suspend fun write(bytes: ByteArray) = tls.outer.write(bytes)
+        override fun close() {
+            try {
+                tls.close()
+            } catch (_: Throwable) {
+            }
+            try {
+                transport.close()
+            } catch (_: Throwable) {
+            }
+        }
+    }
 }

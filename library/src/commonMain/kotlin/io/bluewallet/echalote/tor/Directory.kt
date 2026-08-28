@@ -502,7 +502,7 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
                             if (tor === client) resetTor()
                         }
                         meek.start()
-                        client.waitOrThrow()
+                        client.waitOrThrow(signal)
                         tor = client
                     } catch (err: Throwable) {
                         try {
@@ -684,4 +684,6 @@ object Echalote {
     ) = io.bluewallet.echalote.buildExitCircuit(client, signal, options)
     suspend fun streamFetch(url: String, init: StreamFetchInit) =
         io.bluewallet.echalote.streamFetch(url, init)
+    suspend fun wrapTls(transport: ByteDuplex, hostName: String, abort: Abort? = null) =
+        io.bluewallet.echalote.wrapTls(transport, hostName, abort)
 }
