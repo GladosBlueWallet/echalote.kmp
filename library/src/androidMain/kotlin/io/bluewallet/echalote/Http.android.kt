@@ -10,7 +10,7 @@ import java.net.URL
 
 actual fun defaultHttpEngine(): HttpEngine = HttpEngine { method, url, headers, body, timeoutMs, decompress ->
     withContext(Dispatchers.IO) {
-        if (url.startsWith("http://")) {
+        if (usesCleartextHttp1(url)) {
             http1OverTcp(method, url, headers, body, timeoutMs)
         } else {
             httpsUrlConnection(method, url, headers, body, timeoutMs, decompress)
