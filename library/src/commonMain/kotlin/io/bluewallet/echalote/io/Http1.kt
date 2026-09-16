@@ -2,6 +2,9 @@ package io.bluewallet.echalote
 
 data class DirHttpUrl(val host: String, val port: Int, val path: String)
 
+/** Tor directory authorities speak HTTP/1.1. Platform HTTPS stacks apply ATS/cleartext bans. */
+fun usesCleartextHttp1(url: String): Boolean = url.startsWith("http://")
+
 fun parseHttpUrl(url: String): DirHttpUrl {
     require(url.startsWith("http://")) { "parseHttpUrl expects http://, got $url" }
     val rest = url.removePrefix("http://")

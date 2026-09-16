@@ -5,6 +5,15 @@ import kotlin.test.assertEquals
 
 class Http1Test {
     @Test
+    fun directory_urls_use_cleartext_http1_not_platform_https_stack() {
+        CONSENSUS_MIRRORS.forEach { url ->
+            assertEquals(true, usesCleartextHttp1(url), url)
+        }
+        assertEquals(false, usesCleartextHttp1(DEFAULT_MEEK_URL))
+        assertEquals(false, usesCleartextHttp1("https://check.torproject.org/api/ip"))
+    }
+
+    @Test
     fun parseHttpUrl_host_port_path() {
         val u = parseHttpUrl("http://217.196.147.77:80/tor/status-vote/current/consensus-microdesc")
         assertEquals("217.196.147.77", u.host)

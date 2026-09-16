@@ -27,7 +27,7 @@ import platform.posix.socket
  */
 @OptIn(ExperimentalForeignApi::class)
 actual fun defaultHttpEngine(): HttpEngine = HttpEngine { method, url, headers, body, timeoutMs, _ ->
-    if (url.startsWith("https://")) {
+    if (!usesCleartextHttp1(url)) {
         throw UnsupportedOperationException("linuxX64 default HttpEngine is HTTP-only; inject an engine for HTTPS meek")
     }
     val parsed = parseHttpUrl(url)
