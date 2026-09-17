@@ -40,6 +40,7 @@ internal data class NtorRequest(
     val ntorOnionKey: ByteArray,
 ) {
     fun size() = relayidRsa.size + ntorOnionKey.size + publicX.size
+
     fun write(cursor: Cursor) {
         cursor.write(relayidRsa)
         cursor.write(ntorOnionKey)
@@ -47,7 +48,10 @@ internal data class NtorRequest(
     }
 }
 
-internal data class NtorResponse(val publicY: ByteArray, val auth: ByteArray) {
+internal data class NtorResponse(
+    val publicY: ByteArray,
+    val auth: ByteArray,
+) {
     companion object {
         fun read(cursor: Cursor) = NtorResponse(cursor.read(32), cursor.read(32))
     }
@@ -71,16 +75,30 @@ internal data class NtorResult(
             publicY: ByteArray,
         ): NtorResult {
             val protoid = "ntor-curve25519-sha256-1"
-            val secretInput = concatBytes(
-                sharedXy, sharedXb, relayidRsa, publicB, publicX, publicY, utf8Bytes(protoid),
-            )
+            val secretInput =
+                concatBytes(
+                    sharedXy,
+                    sharedXb,
+                    relayidRsa,
+                    publicB,
+                    publicX,
+                    publicY,
+                    utf8Bytes(protoid),
+                )
             val tMac = utf8Bytes("$protoid:mac")
             val tKey = utf8Bytes("$protoid:key_extract")
             val tVerify = utf8Bytes("$protoid:verify")
             val verify = hmacSha256(tVerify, secretInput)
-            val authInput = concatBytes(
-                verify, relayidRsa, publicB, publicY, publicX, utf8Bytes(protoid), utf8Bytes("Server"),
-            )
+            val authInput =
+                concatBytes(
+                    verify,
+                    relayidRsa,
+                    publicB,
+                    publicY,
+                    publicX,
+                    utf8Bytes(protoid),
+                    utf8Bytes("Server"),
+                )
             val auth = hmacSha256(tMac, authInput)
             val mExpand = utf8Bytes("$protoid:key_expand")
             val keyBytes = hkdfSha256(secretInput, tKey, mExpand, HASH_LEN * 3 + KEY_LEN * 2)

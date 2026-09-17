@@ -1,6 +1,10 @@
 package io.bluewallet.echalote
 
-data class HttpResponse(val status: Int, val body: ByteArray, val headers: Map<String, String> = emptyMap())
+data class HttpResponse(
+    val status: Int,
+    val body: ByteArray,
+    val headers: Map<String, String> = emptyMap(),
+)
 
 interface HttpEngine {
     suspend fun request(
@@ -31,15 +35,16 @@ fun HttpEngine(
         timeoutMs: Long,
         decompress: Boolean,
     ) -> HttpResponse,
-): HttpEngine = object : HttpEngine {
-    override suspend fun request(
-        method: String,
-        url: String,
-        headers: Map<String, String>,
-        body: ByteArray,
-        timeoutMs: Long,
-        decompress: Boolean,
-    ): HttpResponse = block(method, url, headers, body, timeoutMs, decompress)
-}
+): HttpEngine =
+    object : HttpEngine {
+        override suspend fun request(
+            method: String,
+            url: String,
+            headers: Map<String, String>,
+            body: ByteArray,
+            timeoutMs: Long,
+            decompress: Boolean,
+        ): HttpResponse = block(method, url, headers, body, timeoutMs, decompress)
+    }
 
 expect fun defaultHttpEngine(): HttpEngine

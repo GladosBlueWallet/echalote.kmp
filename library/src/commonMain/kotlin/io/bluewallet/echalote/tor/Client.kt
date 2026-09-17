@@ -9,7 +9,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 internal class Emitter<T> {
-    private val lock = Mutex()
     private val listeners = ArrayList<(T) -> Unit>()
 
     fun on(fn: (T) -> Unit): () -> Unit {
@@ -28,11 +27,15 @@ internal class Emitter<T> {
         }
     }
 
-    suspend fun wait(abort: Abort?, pred: (T) -> Boolean = { true }): T {
+    suspend fun wait(
+        abort: Abort?,
+        pred: (T) -> Boolean = { true },
+    ): T {
         val done = CompletableDeferred<T>()
-        val off = on { v ->
-            if (pred(v) && !done.isCompleted) done.complete(v)
-        }
+        val off =
+            on { v ->
+                if (pred(v) && !done.isCompleted) done.complete(v)
+            }
         return try {
             withAbort(abort) { done.await() }
         } finally {
@@ -43,9 +46,18 @@ internal class Emitter<T> {
 
 internal sealed class TorState {
     data object None : TorState()
+
     data object Versioned : TorState()
-    data class Handshaking(val identity: ByteArray, val certs: TorCerts) : TorState()
-    data class Handshaked(val identity: ByteArray, val certs: TorCerts) : TorState()
+
+    data class Handshaking(
+        val identity: ByteArray,
+        val certs: TorCerts,
+    ) : TorState()
+
+    data class Handshaked(
+        val identity: ByteArray,
+        val certs: TorCerts,
+    ) : TorState()
 }
 
 open class TorClientDuplex {
@@ -56,7 +68,9 @@ open class TorClientDuplex {
         internal set
 
     open suspend fun waitOrThrow(abort: Abort? = null) = secret.waitOrThrow(abort)
+
     open suspend fun createOrThrow(abort: Abort? = null): Circuit = secret.createOrThrow(abort)
+
     open fun close() = secret.close()
 }
 
@@ -192,7 +206,10 @@ internal class SecretTorClientDuplex {
         }
     }
 
-    private suspend fun onRelay(circ: SecretCircuit, relay: DecodedRelay) {
+    private suspend fun onRelay(
+        circ: SecretCircuit,
+        relay: DecodedRelay,
+    ) {
         val stream = if (relay.streamId != 0) circ.streams[relay.streamId] else null
         when (relay.rcommand) {
             RelayCmd.EXTENDED2 -> relayExtended2.emit(circ to readExtended2(relay.fragment))
@@ -210,10 +227,11 @@ internal class SecretTorClientDuplex {
                 stream.onIncomingData(relay.fragment)
                 relayData.emit(circ to (stream to relay.fragment))
             }
-            RelayCmd.END -> if (stream != null) {
-                circ.streams.remove(stream.id)
-                relayEnd.emit(circ to (stream to readRelayEnd(relay.fragment)))
-            }
+            RelayCmd.END ->
+                if (stream != null) {
+                    circ.streams.remove(stream.id)
+                    relayEnd.emit(circ to (stream to readRelayEnd(relay.fragment)))
+                }
             RelayCmd.DROP -> {}
             RelayCmd.TRUNCATED -> {
                 if (circ.targets.isNotEmpty()) circ.targets.removeLast()
@@ -242,18 +260,19 @@ internal class SecretTorClientDuplex {
     suspend fun createOrThrow(abort: Abort? = null): Circuit {
         waitOrThrow(abort)
         val st = state as? TorState.Handshaked ?: throw InvalidTorStateError()
-        val circuit = circuitsLock.withLock {
-            var id = 0
-            do {
-                abort?.throwIfAborted()
-                val raw = Cursor(secureRandom(4)).readU32()
-                if (raw == 0) continue
-                id = raw or Int.MIN_VALUE
-            } while (id == 0 || circuits.containsKey(id))
-            val secret = SecretCircuit(id, this)
-            circuits[id] = secret
-            secret
-        }
+        val circuit =
+            circuitsLock.withLock {
+                var id = 0
+                do {
+                    abort?.throwIfAborted()
+                    val raw = Cursor(secureRandom(4)).readU32()
+                    if (raw == 0) continue
+                    id = raw or Int.MIN_VALUE
+                } while (id == 0 || circuits.containsKey(id))
+                val secret = SecretCircuit(id, this)
+                circuits[id] = secret
+                secret
+            }
         val material = secureRandom(20)
         send(writeCell(circuit.id, CellCmd.CREATE_FAST, createFastPayload(material)))
         val created = createdFast.wait(abort) { it.first === circuit }
@@ -262,13 +281,14 @@ internal class SecretTorClientDuplex {
         if (!equalBytes(result.keyHash, created.second.second)) throw InvalidKdfKeyHashError()
         val forwardDigest = Sha1.Hasher().update(result.forwardDigest)
         val backwardDigest = Sha1.Hasher().update(result.backwardDigest)
-        val target = Target(
-            st.identity,
-            forwardDigest,
-            backwardDigest,
-            Aes128Ctr128BEKey(Memory(result.forwardKey), Memory(ByteArray(16))),
-            Aes128Ctr128BEKey(Memory(result.backwardKey), Memory(ByteArray(16))),
-        )
+        val target =
+            Target(
+                st.identity,
+                forwardDigest,
+                backwardDigest,
+                Aes128Ctr128BEKey(Memory(result.forwardKey), Memory(ByteArray(16))),
+                Aes128Ctr128BEKey(Memory(result.backwardKey), Memory(ByteArray(16))),
+            )
         circuit.targets += target
         return LiveCircuit(circuit)
     }

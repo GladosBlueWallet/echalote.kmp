@@ -1,27 +1,44 @@
 package io.bluewallet.echalote
 
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 class ChannelDuplexOrderTest {
     @Test
-    fun sequential_enqueues_keep_relay_cell_order() = runBlocking {
-        val duplex = ChannelDuplex()
-        val chunks = (0 until 12).map { i ->
-            ByteArray(498) { pos -> if (pos == 0) i.toByte() else 1 }
+    fun sequential_enqueues_keep_relay_cell_order() =
+        runBlocking {
+            val duplex = ChannelDuplex()
+            val chunks =
+                (0 until 12).map { i ->
+                    ByteArray(498) { pos -> if (pos == 0) i.toByte() else 1 }
+                }
+            for (chunk in chunks) duplex.enqueue(chunk)
+            duplex.close()
+            val got = ArrayList<Byte>()
+            while (true) {
+                val piece = duplex.read(498)
+                if (piece.isEmpty()) break
+                got += piece.toList()
+            }
+            val expect = chunks.flatMap { it.toList() }
+            assertEquals(expect.size, got.size)
+            assertTrue(got == expect)
         }
-        for (chunk in chunks) duplex.enqueue(chunk)
-        duplex.close()
-        val got = ArrayList<Byte>()
-        while (true) {
-            val piece = duplex.read(498)
-            if (piece.isEmpty()) break
-            got += piece.toList()
+
+    @Test
+    fun close_delivers_already_enqueued_bytes_to_parked_reader() =
+        runBlocking {
+            val duplex = ChannelDuplex()
+            val pending = async { duplex.read(16) }
+            withTimeout(1_000) {
+                while (!duplex.hasParkedReader()) delay(1)
+            }
+            duplex.enqueueThenMarkClosedAndWake("hello".encodeToByteArray())
+            assertEquals("hello", pending.await().decodeToString())
         }
-        val expect = chunks.flatMap { it.toList() }
-        assertEquals(expect.size, got.size)
-        assertTrue(got == expect)
-    }
 }

@@ -1,8 +1,15 @@
 package io.bluewallet.echalote
 
-open class Circuit(val id: Int) {
+open class Circuit(
+    val id: Int,
+) {
     open suspend fun close() {}
-    open suspend fun extendOrThrow(microdesc: Microdesc, abort: Abort? = null) {}
+
+    open suspend fun extendOrThrow(
+        microdesc: Microdesc,
+        abort: Abort? = null,
+    ) {}
+
     open suspend fun openOrThrow(
         hostname: String,
         port: Int,
@@ -11,10 +18,16 @@ open class Circuit(val id: Int) {
     ): TorStreamDuplex = throw Unimplemented()
 }
 
-internal class LiveCircuit(internal val secret: SecretCircuit) : Circuit(secret.id) {
+internal class LiveCircuit(
+    internal val secret: SecretCircuit,
+) : Circuit(secret.id) {
     override suspend fun close() = secret.close()
-    override suspend fun extendOrThrow(microdesc: Microdesc, abort: Abort?) =
-        secret.extendOrThrow(microdesc, abort)
+
+    override suspend fun extendOrThrow(
+        microdesc: Microdesc,
+        abort: Abort?,
+    ) = secret.extendOrThrow(microdesc, abort)
+
     override suspend fun openOrThrow(
         hostname: String,
         port: Int,
@@ -51,7 +64,10 @@ internal class SecretCircuit(
         onCloseOrError(error)
     }
 
-    suspend fun extendOrThrow(microdesc: Microdesc, abort: Abort? = null) {
+    suspend fun extendOrThrow(
+        microdesc: Microdesc,
+        abort: Abort? = null,
+    ) {
         if (closed != null) throw (closed as? Throwable) ?: DestroyedError(0)
         val relayidRsa = Base64.decode(microdesc.identity)
         require(relayidRsa.size == HASH_LEN) { "bad identity" }
@@ -74,17 +90,24 @@ internal class SecretCircuit(
         val response = NtorResponse.read(Cursor(respBytes))
         val sharedXy = X25519.scalarMult(secret, response.publicY)
         val sharedXb = X25519.scalarMult(secret, ntorKey)
-        val result = NtorResult.finalizeOrThrow(
-            sharedXy, sharedXb, relayidRsa, ntorKey, publicX, response.publicY,
-        )
+        val result =
+            NtorResult.finalizeOrThrow(
+                sharedXy,
+                sharedXb,
+                relayidRsa,
+                ntorKey,
+                publicX,
+                response.publicY,
+            )
         if (!equalBytes(response.auth, result.auth)) throw InvalidNtorAuthError()
-        val target = Target(
-            relayidRsa,
-            Sha1.Hasher().update(result.forwardDigest),
-            Sha1.Hasher().update(result.backwardDigest),
-            Aes128Ctr128BEKey(Memory(result.forwardKey), Memory(ByteArray(16))),
-            Aes128Ctr128BEKey(Memory(result.backwardKey), Memory(ByteArray(16))),
-        )
+        val target =
+            Target(
+                relayidRsa,
+                Sha1.Hasher().update(result.forwardDigest),
+                Sha1.Hasher().update(result.backwardDigest),
+                Aes128Ctr128BEKey(Memory(result.forwardKey), Memory(ByteArray(16))),
+                Aes128Ctr128BEKey(Memory(result.backwardKey), Memory(ByteArray(16))),
+            )
         targets += target
     }
 

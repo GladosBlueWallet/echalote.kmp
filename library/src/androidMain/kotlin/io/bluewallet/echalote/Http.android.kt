@@ -5,18 +5,18 @@ import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.net.SocketTimeoutException
 import java.net.URL
 
-actual fun defaultHttpEngine(): HttpEngine = HttpEngine { method, url, headers, body, timeoutMs, decompress ->
-    withContext(Dispatchers.IO) {
-        if (usesCleartextHttp1(url)) {
-            http1OverTcp(method, url, headers, body, timeoutMs)
-        } else {
-            httpsUrlConnection(method, url, headers, body, timeoutMs, decompress)
+actual fun defaultHttpEngine(): HttpEngine =
+    HttpEngine { method, url, headers, body, timeoutMs, decompress ->
+        withContext(Dispatchers.IO) {
+            if (usesCleartextHttp1(url)) {
+                http1OverTcp(method, url, headers, body, timeoutMs)
+            } else {
+                httpsUrlConnection(method, url, headers, body, timeoutMs, decompress)
+            }
         }
     }
-}
 
 private fun http1OverTcp(
     method: String,
@@ -35,21 +35,11 @@ private fun http1OverTcp(
         sock.getOutputStream().flush()
         val input = sock.getInputStream()
         val buf = ByteArray(16 * 1024)
-        var received = false
-        val raw = readHttp1Raw {
-            val n = try {
-                input.read(buf)
-            } catch (e: SocketTimeoutException) {
-                if (!received) throw e
-                return@readHttp1Raw null
+        val raw =
+            readHttp1Raw {
+                val n = input.read(buf)
+                if (n < 0) null else buf.copyOf(n)
             }
-            if (n < 0) {
-                null
-            } else {
-                received = true
-                buf.copyOf(n)
-            }
-        }
         return parseHttp1Response(raw)
     }
 }
@@ -62,22 +52,23 @@ private fun httpsUrlConnection(
     timeoutMs: Long,
     decompress: Boolean,
 ): HttpResponse {
-    val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-        requestMethod = method
-        connectTimeout = timeoutMs.toInt().coerceAtLeast(1)
-        readTimeout = timeoutMs.toInt().coerceAtLeast(1)
-        instanceFollowRedirects = true
-        doInput = true
-        useCaches = false
-        if (!decompress) {
-            setRequestProperty("Accept-Encoding", "identity")
+    val conn =
+        (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = method
+            connectTimeout = timeoutMs.toInt().coerceAtLeast(1)
+            readTimeout = timeoutMs.toInt().coerceAtLeast(1)
+            instanceFollowRedirects = true
+            doInput = true
+            useCaches = false
+            if (!decompress) {
+                setRequestProperty("Accept-Encoding", "identity")
+            }
+            for ((k, v) in headers) setRequestProperty(k, v)
+            if (method == "POST" || body.isNotEmpty()) {
+                doOutput = true
+                outputStream.use { it.write(body) }
+            }
         }
-        for ((k, v) in headers) setRequestProperty(k, v)
-        if (method == "POST" || body.isNotEmpty()) {
-            doOutput = true
-            outputStream.use { it.write(body) }
-        }
-    }
     try {
         val status = conn.responseCode
         val stream = if (status in 200..299) conn.inputStream else conn.errorStream

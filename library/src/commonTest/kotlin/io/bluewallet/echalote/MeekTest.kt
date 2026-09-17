@@ -46,22 +46,23 @@ class MeekTest {
     }
 
     @Test
-    fun doesNotPostUntilFirstOutboundBytes() = runBlocking {
-        var posts = 0
-        val first = CompletableDeferred<Int>()
-        val engine = HttpEngine { _, _, _, body, _, _ ->
-            posts += 1
-            if (!first.isCompleted) first.complete(body.size)
-            HttpResponse(200, ByteArray(0))
+    fun doesNotPostUntilFirstOutboundBytes() =
+        runBlocking {
+            var posts = 0
+            val first = CompletableDeferred<Int>()
+            val engine =
+                HttpEngine { _, _, _, body, _, _ ->
+                    posts += 1
+                    if (!first.isCompleted) first.complete(body.size)
+                    HttpResponse(200, ByteArray(0))
+                }
+            val stream = createMeekStream("http://example.test/meek/", engine)
+            stream.start()
+            delay(40)
+            assertEquals(0, posts)
+            stream.duplex.write(byteArrayOf(1, 2, 3))
+            val n = withTimeout(2_000) { first.await() }
+            assertEquals(3, n)
+            stream.error(Exception("test teardown"))
         }
-        val stream = createMeekStream("http://example.test/meek/", engine)
-        stream.start()
-        delay(40)
-        assertEquals(0, posts)
-        stream.duplex.write(byteArrayOf(1, 2, 3))
-        val n = withTimeout(2_000) { first.await() }
-        assertEquals(3, n)
-        stream.error(Exception("test teardown"))
-    }
 }
-

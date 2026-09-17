@@ -6,14 +6,17 @@ internal class RsaCert(
     val x509: X509Certificate,
 ) {
     fun sha1OrThrow(): ByteArray = Sha1.hash(x509.spkiDer)
+
     fun verifyOrThrow(): Boolean {
         x509.checkValidity()
         return true
     }
+
     companion object {
         const val RSA_TO_TLS = 1
         const val RSA_SELF = 2
         const val RSA_TO_AUTH = 3
+
         fun read(cursor: Cursor): RsaCert {
             val type = cursor.readU8()
             val length = cursor.readU16()
@@ -34,8 +37,10 @@ internal class CrossCert(
         if (currentEpochMillis() > expirationMillis) throw ExpiredCertError()
         return true
     }
+
     companion object {
         const val RSA_TO_ED = 7
+
         fun read(cursor: Cursor): CrossCert {
             val type = cursor.readU8()
             cursor.readU16()
@@ -67,12 +72,14 @@ internal class Ed25519Cert(
         if (!Ed25519.verify(key, payload, signature)) throw InvalidSignatureError()
         return true
     }
+
     companion object {
         const val ED_TO_SIGN = 4
         const val SIGN_TO_TLS = 5
         const val SIGN_TO_AUTH = 6
         const val SIGNER_EXT = 4
         const val AFFECTS_VALIDATION = 1
+
         fun read(cursor: Cursor): Ed25519Cert {
             val type = cursor.readU8()
             cursor.readU16()
@@ -159,7 +166,10 @@ internal class PartialCerts {
     var signToAuth: Ed25519Cert? = null
 }
 
-internal fun verifyTorCerts(pcerts: PartialCerts, tlsLeafDer: ByteArray): TorCerts {
+internal fun verifyTorCerts(
+    pcerts: PartialCerts,
+    tlsLeafDer: ByteArray,
+): TorCerts {
     val rsaSelf = pcerts.rsaSelf ?: throw ExpectedCertError()
     val rsaToEd = pcerts.rsaToEd ?: throw ExpectedCertError()
     val edToSign = pcerts.edToSign ?: throw ExpectedCertError()
@@ -169,7 +179,9 @@ internal fun verifyTorCerts(pcerts: PartialCerts, tlsLeafDer: ByteArray): TorCer
             val inner = Der.parse(der).asSequence()[1].asBitStringBytes()
             inner.size != 12 + 128
         }
-    ) throw InvalidCertError()
+    ) {
+        throw InvalidCertError()
+    }
     if (!rsaSelf.x509.verifySelfSigned()) throw InvalidSignatureError()
     if (rsaToEd.verifyOrThrow() != true) throw Exception("Could not verify ID_TO_ED cert")
     val prefix = utf8Bytes("Tor TLS RSA/Ed25519 cross-certificate")

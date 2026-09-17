@@ -26,32 +26,33 @@ import platform.posix.socket
  * implemented on linuxX64; inject [HttpEngine] for tests or use JVM/Android/iOS.
  */
 @OptIn(ExperimentalForeignApi::class)
-actual fun defaultHttpEngine(): HttpEngine = HttpEngine { method, url, headers, body, timeoutMs, _ ->
-    if (!usesCleartextHttp1(url)) {
-        throw UnsupportedOperationException("linuxX64 default HttpEngine is HTTP-only; inject an engine for HTTPS meek")
-    }
-    val parsed = parseHttpUrl(url)
-    memScoped {
-        val fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
-        check(fd >= 0) { "socket failed" }
-        try {
-            val addr = alloc<sockaddr_in>()
-            memset(addr.ptr, 0, kotlinx.cinterop.sizeOf<sockaddr_in>().convert())
-            addr.sin_family = AF_INET.convert()
-            addr.sin_port = htons(parsed.port.toUShort())
-            addr.sin_addr.s_addr = ipv4ToNetworkOrder(parsed.host)
-            val rc = connect(fd, addr.ptr.reinterpret(), kotlinx.cinterop.sizeOf<sockaddr_in>().convert())
-            check(rc == 0) { "connect failed" }
+actual fun defaultHttpEngine(): HttpEngine =
+    HttpEngine { method, url, headers, body, timeoutMs, _ ->
+        if (!usesCleartextHttp1(url)) {
+            throw UnsupportedOperationException("linuxX64 default HttpEngine is HTTP-only; inject an engine for HTTPS meek")
+        }
+        val parsed = parseHttpUrl(url)
+        memScoped {
+            val fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+            check(fd >= 0) { "socket failed" }
+            try {
+                val addr = alloc<sockaddr_in>()
+                memset(addr.ptr, 0, kotlinx.cinterop.sizeOf<sockaddr_in>().convert())
+                addr.sin_family = AF_INET.convert()
+                addr.sin_port = htons(parsed.port.toUShort())
+                addr.sin_addr.s_addr = ipv4ToNetworkOrder(parsed.host)
+                val rc = connect(fd, addr.ptr.reinterpret(), kotlinx.cinterop.sizeOf<sockaddr_in>().convert())
+                check(rc == 0) { "connect failed" }
 
-            sendAll(fd, buildHttp1Request(method, parsed, headers, body))
+                sendAll(fd, buildHttp1Request(method, parsed, headers, body))
 
-            val raw = recvHttp1(fd)
-            return@memScoped parseHttp1Response(raw)
-        } finally {
-            close(fd)
+                val raw = recvHttp1(fd)
+                return@memScoped parseHttp1Response(raw)
+            } finally {
+                close(fd)
+            }
         }
     }
-}
 
 private fun ipv4ToNetworkOrder(host: String): UInt {
     val parts = host.split('.')
@@ -63,7 +64,10 @@ private fun ipv4ToNetworkOrder(host: String): UInt {
 }
 
 @OptIn(ExperimentalForeignApi::class)
-private fun sendAll(fd: Int, data: ByteArray) {
+private fun sendAll(
+    fd: Int,
+    data: ByteArray,
+) {
     data.usePinned { pinned ->
         var off = 0
         while (off < data.size) {

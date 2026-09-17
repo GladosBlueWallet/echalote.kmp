@@ -24,6 +24,21 @@ private const val HS_SERVER_HELLO_DONE = 14
 private const val HS_CLIENT_KEY_EXCHANGE = 16
 private const val HS_FINISHED = 20
 
+internal open class TlsAlertError(
+    message: String,
+) : Exception(message)
+
+internal class TlsCloseNotify : TlsAlertError("TLS close_notify")
+
+internal fun tlsPumpError(error: Throwable): Throwable? = if (error is TlsCloseNotify) null else error
+
+private fun throwTlsAlert(body: ByteArray): Nothing {
+    val level = if (body.isNotEmpty()) body.u8(0) else -1
+    val desc = if (body.size >= 2) body.u8(1) else -1
+    if (desc == 0) throw TlsCloseNotify()
+    throw TlsAlertError("TLS alert level=$level desc=$desc")
+}
+
 /**
  * Userspace TLS 1.2 client: ECDHE_RSA_WITH_AES_256_GCM_SHA384, no PKI trust.
  * Exposes the leaf certificate DER for Tor CERTS `sign_to_tls`.
@@ -36,6 +51,8 @@ internal class TlsClientDuplex(
     val outer: ByteDuplex
     val leafCertDer = CompletableDeferred<ByteArray>()
     val ready = CompletableDeferred<Unit>()
+    var pumpError: Throwable? = null
+        internal set
     private val job = SupervisorJob()
     internal val scope = CoroutineScope(job + Dispatchers.Default)
 
@@ -76,7 +93,9 @@ internal class TlsClientDuplex(
     }
 }
 
-private class TlsEngine(val transport: ByteDuplex) {
+private class TlsEngine(
+    val transport: ByteDuplex,
+) {
     var readSeq = 0L
     var writeSeq = 0L
     var readKey: ByteArray = ByteArray(0)
@@ -87,7 +106,10 @@ private class TlsEngine(val transport: ByteDuplex) {
     var encryptedWrite = false
     val writeMutex = Mutex()
 
-    suspend fun writeRecord(type: Int, fragment: ByteArray) = writeMutex.withLock {
+    suspend fun writeRecord(
+        type: Int,
+        fragment: ByteArray,
+    ) = writeMutex.withLock {
         val body = if (encryptedWrite) seal(type, fragment) else fragment
         val hdr = ByteArray(5)
         hdr[0] = type.toByte()
@@ -102,14 +124,20 @@ private class TlsEngine(val transport: ByteDuplex) {
         val len = hdr.u16be(3)
         require(len in 1..18432) { "bad TLS record length $len" }
         val fragment = transport.readExact(len)
-        if (type == REC_ALERT) {
-            val desc = if (fragment.size >= 2) fragment.u8(1) else -1
-            throw Exception("TLS alert $desc")
+        if (type == REC_ALERT && !encryptedRead) {
+            throwTlsAlert(fragment)
         }
-        return if (encryptedRead) type to open(type, fragment) else type to fragment
+        val body = if (encryptedRead) open(type, fragment) else fragment
+        if (type == REC_ALERT) {
+            throwTlsAlert(body)
+        }
+        return type to body
     }
 
-    private fun seal(type: Int, plaintext: ByteArray): ByteArray {
+    private fun seal(
+        type: Int,
+        plaintext: ByteArray,
+    ): ByteArray {
         val explicit = ByteArray(8)
         explicit.putU64be(0, writeSeq)
         val nonce = concatBytes(writeIv, explicit)
@@ -123,7 +151,10 @@ private class TlsEngine(val transport: ByteDuplex) {
         return concatBytes(explicit, ct, tag)
     }
 
-    private fun open(type: Int, fragment: ByteArray): ByteArray {
+    private fun open(
+        type: Int,
+        fragment: ByteArray,
+    ): ByteArray {
         require(fragment.size >= 8 + 16) { "short GCM record" }
         val explicit = fragment.copyOfRange(0, 8)
         val tag = fragment.copyOfRange(fragment.size - 16, fragment.size)
@@ -140,9 +171,15 @@ private class TlsEngine(val transport: ByteDuplex) {
     }
 }
 
-private data class TlsSession(val leaf: ByteArray, val tls: TlsEngine)
+private data class TlsSession(
+    val leaf: ByteArray,
+    val tls: TlsEngine,
+)
 
-private suspend fun runTlsHandshake(transport: ByteDuplex, hostName: String?): TlsSession {
+private suspend fun runTlsHandshake(
+    transport: ByteDuplex,
+    hostName: String?,
+): TlsSession {
     val tls = TlsEngine(transport)
     val hs = HandshakeBuf(tls)
     val clientRandom = secureRandom(32)
@@ -166,12 +203,15 @@ private suspend fun runTlsHandshake(transport: ByteDuplex, hostName: String?): T
                 require(body.size >= 34) { "short ServerHello" }
                 serverRandom = body.copyOfRange(2, 34)
                 var o = 34
-                val sidLen = body.u8(o); o += 1 + sidLen
-                val suite = body.u16be(o); o += 2
+                val sidLen = body.u8(o)
+                o += 1 + sidLen
+                val suite = body.u16be(o)
+                o += 2
                 require(suite == TLS_ECDHE_RSA_AES256_GCM_SHA384) { "unexpected cipher $suite" }
                 o += 1
                 if (o + 2 <= body.size) {
-                    val extLen = body.u16be(o); o += 2
+                    val extLen = body.u16be(o)
+                    o += 2
                     val end = o + extLen
                     while (o + 4 <= end) {
                         val et = body.u16be(o)
@@ -196,10 +236,13 @@ private suspend fun runTlsHandshake(transport: ByteDuplex, hostName: String?): T
                 peerPoint = body.copyOfRange(4, 4 + plen)
                 ecdheParams = body.copyOfRange(0, 4 + plen)
                 var o = 4 + plen
-                sigHash = body.u8(o); o += 1
-                val sigId = body.u8(o); o += 1
+                sigHash = body.u8(o)
+                o += 1
+                val sigId = body.u8(o)
+                o += 1
                 require(sigId == 1) { "expected RSA signature" }
-                val slen = body.u16be(o); o += 2
+                val slen = body.u16be(o)
+                o += 2
                 signature = body.copyOfRange(o, o + slen)
             }
             HS_SERVER_HELLO_DONE -> gotHelloDone = true
@@ -210,12 +253,13 @@ private suspend fun runTlsHandshake(transport: ByteDuplex, hostName: String?): T
     require(leaf.isNotEmpty() && peerPoint.isNotEmpty()) { "incomplete TLS handshake" }
     val x509 = X509Certificate.parse(leaf)
     val signed = concatBytes(clientRandom, serverRandom, ecdheParams)
-    val (hash, prefix) = when (sigHash) {
-        4 -> Sha256.hash(signed) to RsaPublicKey.SHA256_DIGESTINFO
-        5 -> Sha384.hash(signed) to RsaPublicKey.SHA384_DIGESTINFO
-        2 -> Sha1.hash(signed) to RsaPublicKey.SHA1_DIGESTINFO
-        else -> throw Exception("unsupported TLS signature hash $sigHash")
-    }
+    val (hash, prefix) =
+        when (sigHash) {
+            4 -> Sha256.hash(signed) to RsaPublicKey.SHA256_DIGESTINFO
+            5 -> Sha384.hash(signed) to RsaPublicKey.SHA384_DIGESTINFO
+            2 -> Sha1.hash(signed) to RsaPublicKey.SHA1_DIGESTINFO
+            else -> throw Exception("unsupported TLS signature hash $sigHash")
+        }
     require(x509.rsaPublicKey().verifyPkcs1v15Digest(prefix, hash, signature)) {
         "TLS ServerKeyExchange signature failed"
     }
@@ -227,11 +271,12 @@ private suspend fun runTlsHandshake(transport: ByteDuplex, hostName: String?): T
     tls.writeRecord(REC_HS, cke)
 
     val sessionHash = Sha384.hash(hs.transcript)
-    val master = if (ems) {
-        tlsPrfSha384(premaster, "extended master secret", sessionHash, 48)
-    } else {
-        tlsPrfSha384(premaster, "master secret", concatBytes(clientRandom, serverRandom), 48)
-    }
+    val master =
+        if (ems) {
+            tlsPrfSha384(premaster, "extended master secret", sessionHash, 48)
+        } else {
+            tlsPrfSha384(premaster, "master secret", concatBytes(clientRandom, serverRandom), 48)
+        }
     val keyBlock = tlsPrfSha384(master, "key expansion", concatBytes(serverRandom, clientRandom), 72)
     tls.writeKey = keyBlock.copyOfRange(0, 32)
     tls.readKey = keyBlock.copyOfRange(32, 64)
@@ -281,26 +326,28 @@ private suspend fun TlsClientDuplex.handshakeAndPump(
 ) {
     val session = runTlsHandshake(transport, hostName)
     leafCertDer.complete(session.leaf)
-    ready.complete(Unit)
     val tls = session.tls
-    val incoming = scope.launch {
-        try {
-            while (true) {
-                val (type, frag) = tls.readRecord()
-                if (type == REC_CCS) continue
-                if (type != REC_APP) {
-                    if (type == REC_HS) continue
-                    throw Exception("unexpected TLS record $type")
+    val incoming =
+        scope.launch {
+            runCatching {
+                while (true) {
+                    val (type, frag) = tls.readRecord()
+                    if (type == REC_CCS) continue
+                    if (type != REC_APP) {
+                        if (type == REC_HS) continue
+                        throw TlsAlertError("unexpected TLS record $type")
+                    }
+                    if (frag.isNotEmpty()) app.write(frag)
                 }
-                if (frag.isNotEmpty()) app.write(frag)
-            }
-        } catch (_: Throwable) {
-            try {
-                app.close()
-            } catch (_: Throwable) {
+            }.onFailure { e ->
+                pumpError = tlsPumpError(e)
+                try {
+                    app.close()
+                } catch (_: Throwable) {
+                }
             }
         }
-    }
+    ready.complete(Unit)
     try {
         while (true) {
             val chunk = app.read(16 * 1024)
@@ -317,7 +364,9 @@ private suspend fun TlsClientDuplex.handshakeAndPump(
     }
 }
 
-private class HandshakeBuf(val tls: TlsEngine) {
+private class HandshakeBuf(
+    val tls: TlsEngine,
+) {
     var buf = ByteArray(0)
     var transcript = ByteArray(0)
 
@@ -346,7 +395,10 @@ private fun parseHandshake(raw: ByteArray): Triple<Int, ByteArray, ByteArray> {
     return Triple(type, raw.copyOfRange(4, 4 + len), raw.copyOfRange(0, 4 + len))
 }
 
-private fun handshakeMessage(type: Int, body: ByteArray): ByteArray {
+private fun handshakeMessage(
+    type: Int,
+    body: ByteArray,
+): ByteArray {
     val out = ByteArray(4 + body.size)
     out[0] = type.toByte()
     out[1] = (body.size ushr 16).toByte()
@@ -355,40 +407,51 @@ private fun handshakeMessage(type: Int, body: ByteArray): ByteArray {
     return out
 }
 
-private fun buildClientHello(random: ByteArray, hostName: String?): ByteArray {
-    val sni = if (hostName.isNullOrEmpty()) {
-        ByteArray(0)
-    } else {
-        val host = hostName.encodeToByteArray()
-        val nameEntry = concatBytes(byteArrayOf(0), u16(host.size), host)
-        tlsExt(0x0000, concatBytes(u16(nameEntry.size), nameEntry))
-    }
-    val exts = concatBytes(
-        sni,
-        tlsExt(0x000d, run {
-            val algs = byteArrayOf(0x04, 0x01, 0x05, 0x01)
-            concatBytes(u16(algs.size), algs)
-        }),
-        tlsExt(0x000a, concatBytes(u16(2), byteArrayOf(0x00, 0x17))),
-        tlsExt(0x000b, byteArrayOf(1, 0)),
-        tlsExt(0x0017, ByteArray(0)),
-        tlsExt(0xff01, byteArrayOf(0)),
-    )
-    val body = concatBytes(
-        u16(TLS_VERSION),
-        random,
-        byteArrayOf(0),
-        u16(2),
-        u16(TLS_ECDHE_RSA_AES256_GCM_SHA384),
-        byteArrayOf(1, 0),
-        u16(exts.size),
-        exts,
-    )
+private fun buildClientHello(
+    random: ByteArray,
+    hostName: String?,
+): ByteArray {
+    val sni =
+        if (hostName.isNullOrEmpty()) {
+            ByteArray(0)
+        } else {
+            val host = hostName.encodeToByteArray()
+            val nameEntry = concatBytes(byteArrayOf(0), u16(host.size), host)
+            tlsExt(0x0000, concatBytes(u16(nameEntry.size), nameEntry))
+        }
+    val exts =
+        concatBytes(
+            sni,
+            tlsExt(
+                0x000d,
+                run {
+                    val algs = byteArrayOf(0x04, 0x01, 0x05, 0x01)
+                    concatBytes(u16(algs.size), algs)
+                },
+            ),
+            tlsExt(0x000a, concatBytes(u16(2), byteArrayOf(0x00, 0x17))),
+            tlsExt(0x000b, byteArrayOf(1, 0)),
+            tlsExt(0x0017, ByteArray(0)),
+            tlsExt(0xff01, byteArrayOf(0)),
+        )
+    val body =
+        concatBytes(
+            u16(TLS_VERSION),
+            random,
+            byteArrayOf(0),
+            u16(2),
+            u16(TLS_ECDHE_RSA_AES256_GCM_SHA384),
+            byteArrayOf(1, 0),
+            u16(exts.size),
+            exts,
+        )
     return handshakeMessage(HS_CLIENT_HELLO, body)
 }
 
-private fun tlsExt(type: Int, data: ByteArray): ByteArray =
-    concatBytes(u16(type), u16(data.size), data)
+private fun tlsExt(
+    type: Int,
+    data: ByteArray,
+): ByteArray = concatBytes(u16(type), u16(data.size), data)
 
 private fun u16(v: Int): ByteArray {
     val b = ByteArray(2)
@@ -410,8 +473,21 @@ suspend fun wrapTls(
         throw err
     }
     return object : ByteDuplex {
-        override suspend fun read(n: Int): ByteArray = tls.outer.read(n)
-        override suspend fun write(bytes: ByteArray) = tls.outer.write(bytes)
+        override suspend fun read(n: Int): ByteArray {
+            val value = tls.outer.read(n)
+            if (value.isEmpty()) {
+                val err = tls.pumpError
+                if (err != null) throw err
+            }
+            return value
+        }
+
+        override suspend fun write(bytes: ByteArray) {
+            val err = tls.pumpError
+            if (err != null) throw err
+            tls.outer.write(bytes)
+        }
+
         override fun close() {
             try {
                 tls.close()

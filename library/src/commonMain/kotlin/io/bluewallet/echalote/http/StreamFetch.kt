@@ -1,9 +1,11 @@
 package io.bluewallet.echalote
 
-import kotlinx.coroutines.CancellationException as CoroutineCancellation
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.CancellationException as CoroutineCancellation
 
+internal const val TOR_BROWSER_USER_AGENT =
+    "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0"
 
 data class StreamFetchInit(
     val stream: ByteDuplex,
@@ -18,7 +20,9 @@ data class StreamResponse(
     val body: ByteArray,
 ) {
     val ok: Boolean get() = status in 200..299
+
     fun text(): String = body.decodeToString()
+
     fun jsonObject(): Map<String, String> {
         val t = text().trim()
         require(t.startsWith("{") && t.endsWith("}")) { "not a json object" }
@@ -27,7 +31,10 @@ data class StreamResponse(
         val out = mutableMapOf<String, String>()
         // tiny parser for {"IsTor":true,"IP":"..."}
         var i = 0
-        fun skipWs() { while (i < inner.length && inner[i].isWhitespace()) i++ }
+
+        fun skipWs() {
+            while (i < inner.length && inner[i].isWhitespace()) i++
+        }
         while (i < inner.length) {
             skipWs()
             require(inner[i] == '"') { "expected key" }
@@ -36,7 +43,10 @@ data class StreamResponse(
             while (inner[i] != '"') i++
             val key = inner.substring(ks, i)
             i++
-            skipWs(); require(inner[i] == ':'); i++; skipWs()
+            skipWs()
+            require(inner[i] == ':')
+            i++
+            skipWs()
             val value: String
             if (inner[i] == '"') {
                 i++
@@ -57,19 +67,26 @@ data class StreamResponse(
     }
 }
 
-suspend fun streamFetch(input: String, init: StreamFetchInit): StreamResponse {
+suspend fun streamFetch(
+    input: String,
+    init: StreamFetchInit,
+): StreamResponse {
     val abort = init.abort
     abort?.throwIfAborted()
     val url = parseUrl(input)
     val headers = LinkedHashMap<String, String>()
     if (init.headers.keys.none { it.equals("Host", true) }) headers["Host"] = url.host
     if (init.headers.keys.none { it.equals("Connection", true) }) headers["Connection"] = "close"
-    headers.putAll(init.headers)
-    val head = buildString {
-        append("GET ${url.target} HTTP/1.1\r\n")
-        for ((k, v) in headers) append("$k: $v\r\n")
-        append("\r\n")
+    if (init.headers.keys.none { it.equals("User-Agent", true) }) {
+        headers["User-Agent"] = TOR_BROWSER_USER_AGENT
     }
+    headers.putAll(init.headers)
+    val head =
+        buildString {
+            append("GET ${url.target} HTTP/1.1\r\n")
+            for ((k, v) in headers) append("$k: $v\r\n")
+            append("\r\n")
+        }
     init.stream.write(head.encodeToByteArray())
     // Do not close the duplex here. A full close tears down TLS/Tor reads.
     // The TypeScript client only half-closes the write side; this ByteDuplex
@@ -82,7 +99,7 @@ suspend fun streamFetch(input: String, init: StreamFetchInit): StreamResponse {
     val statusParts = (lines.firstOrNull() ?: "").split(" ")
     val status = statusParts.getOrNull(1)?.toIntOrNull() ?: 0
     val statusText = statusParts.drop(2).joinToString(" ")
-    if (status !in 200..599) throw IllegalArgumentException("Invalid HTTP status: ${lines.firstOrNull()}")
+    require(status in 200..599) { "Invalid HTTP status: ${lines.firstOrNull()}" }
     val responseHeaders = LinkedHashMap<String, String>()
     for (line in lines.drop(1)) {
         if (line.isEmpty()) continue
@@ -91,15 +108,17 @@ suspend fun streamFetch(input: String, init: StreamFetchInit): StreamResponse {
         responseHeaders[line.substring(0, colon).trim()] = line.substring(colon + 1).trim()
     }
     val transfer = responseHeaders.entries.firstOrNull { it.key.equals("Transfer-Encoding", true) }?.value
-    var bodyBytes = if (transfer != null && transfer.lowercase().contains("chunked")) {
-        reader.readChunkedBody()
-    } else {
-        val lengthHeader = responseHeaders.entries.firstOrNull { it.key.equals("Content-Length", true) }?.value
-            ?: throw IllegalArgumentException("HTTP response missing Content-Length and chunked encoding")
-        val length = lengthHeader.toIntOrNull() ?: throw IllegalArgumentException("Invalid Content-Length: $lengthHeader")
-        if (length < 0) throw IllegalArgumentException("Invalid Content-Length: $lengthHeader")
-        reader.readExact(length)
-    }
+    var bodyBytes =
+        if (transfer != null && transfer.lowercase().contains("chunked")) {
+            reader.readChunkedBody()
+        } else {
+            val lengthHeader =
+                responseHeaders.entries.firstOrNull { it.key.equals("Content-Length", true) }?.value
+                    ?: throw IllegalArgumentException("HTTP response missing Content-Length and chunked encoding")
+            val length = lengthHeader.toIntOrNull()
+            require(length != null && length >= 0) { "Invalid Content-Length: $lengthHeader" }
+            reader.readExact(length)
+        }
     inflateZlibOrNull(bodyBytes)?.let { bodyBytes = it }
     return StreamResponse(status, statusText, responseHeaders, bodyBytes)
 }
@@ -107,7 +126,10 @@ suspend fun streamFetch(input: String, init: StreamFetchInit): StreamResponse {
 private val CRLF = "\r\n".encodeToByteArray()
 private val CRLFCRLF = "\r\n\r\n".encodeToByteArray()
 
-private data class ParsedHttpUrl(val host: String, val target: String)
+private data class ParsedHttpUrl(
+    val host: String,
+    val target: String,
+)
 
 private fun parseUrl(input: String): ParsedHttpUrl {
     val s = input
@@ -119,23 +141,27 @@ private fun parseUrl(input: String): ParsedHttpUrl {
     return ParsedHttpUrl(hostPort, path)
 }
 
-private class HttpByteReader(val duplex: ByteDuplex, val abort: Abort?) {
+private class HttpByteReader(
+    val duplex: ByteDuplex,
+    val abort: Abort?,
+) {
     private var buf = ByteArray(0)
 
     private suspend fun pull() {
         abort?.throwIfAborted()
-        val value = coroutineScope {
-            val reader = async { duplex.read(16 * 1024) }
-            abort?.onAbort { reader.cancel() }
-            try {
-                reader.await()
-            } catch (e: CoroutineCancellation) {
-                abort?.throwIfAborted()
-                throw e
+        val value =
+            coroutineScope {
+                val reader = async { duplex.read(16 * 1024) }
+                abort?.onAbort { reader.cancel() }
+                try {
+                    reader.await()
+                } catch (e: CoroutineCancellation) {
+                    abort?.throwIfAborted()
+                    throw e
+                }
             }
-        }
         abort?.throwIfAborted()
-        if (value.isEmpty()) throw IllegalArgumentException("Unexpected end of HTTP stream")
+        require(value.isNotEmpty()) { "Unexpected end of HTTP stream (buffered=${buf.size})" }
         buf = concatBytes(buf, value)
     }
 
@@ -174,7 +200,11 @@ private class HttpByteReader(val duplex: ByteDuplex, val abort: Abort?) {
     }
 }
 
-private fun indexOf(haystack: ByteArray, needle: ByteArray, from: Int = 0): Int {
+private fun indexOf(
+    haystack: ByteArray,
+    needle: ByteArray,
+    from: Int = 0,
+): Int {
     outer@ for (i in from..haystack.size - needle.size) {
         for (j in needle.indices) {
             if (haystack[i + j] != needle[j]) continue@outer

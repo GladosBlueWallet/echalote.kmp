@@ -11,12 +11,16 @@ internal object InflateKt {
         }
     }
 
-    private class BitReader(val src: ByteArray, var i: Int) {
+    private class BitReader(
+        val src: ByteArray,
+        var i: Int,
+    ) {
         var bitBuf = 0
         var bitCnt = 0
+
         fun bits(n: Int): Int {
             while (bitCnt < n) {
-                if (i >= src.size) throw IllegalArgumentException("truncated deflate")
+                require(i < src.size) { "truncated deflate" }
                 bitBuf = bitBuf or (src.u8(i++) shl bitCnt)
                 bitCnt += 8
             }
@@ -25,13 +29,18 @@ internal object InflateKt {
             bitCnt -= n
             return v
         }
+
         fun byteAlign() {
             bitBuf = 0
             bitCnt = 0
         }
     }
 
-    private class Huffman(val counts: IntArray, val symbols: IntArray, val maxBits: Int)
+    private class Huffman(
+        val counts: IntArray,
+        val symbols: IntArray,
+        val maxBits: Int,
+    )
 
     private fun buildHuffman(lengths: IntArray): Huffman {
         val maxBits = lengths.maxOrNull() ?: 0
@@ -52,7 +61,10 @@ internal object InflateKt {
         return Huffman(counts, symbols, maxBits)
     }
 
-    private fun decodeSymbol(r: BitReader, h: Huffman): Int {
+    private fun decodeSymbol(
+        r: BitReader,
+        h: Huffman,
+    ): Int {
         var code = 0
         var first = 0
         var index = 0
@@ -70,25 +82,142 @@ internal object InflateKt {
         throw IllegalArgumentException("bad huffman symbol")
     }
 
-    private val LEN_BASE = intArrayOf(
-        3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
-        35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258,
-    )
-    private val LEN_EXTRA = intArrayOf(
-        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
-        3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
-    )
-    private val DIST_BASE = intArrayOf(
-        1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
-        257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
-    )
-    private val DIST_EXTRA = intArrayOf(
-        0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
-        7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
-    )
+    private val LEN_BASE =
+        intArrayOf(
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            13,
+            15,
+            17,
+            19,
+            23,
+            27,
+            31,
+            35,
+            43,
+            51,
+            59,
+            67,
+            83,
+            99,
+            115,
+            131,
+            163,
+            195,
+            227,
+            258,
+        )
+    private val LEN_EXTRA =
+        intArrayOf(
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            2,
+            3,
+            3,
+            3,
+            3,
+            4,
+            4,
+            4,
+            4,
+            5,
+            5,
+            5,
+            5,
+            0,
+        )
+    private val DIST_BASE =
+        intArrayOf(
+            1,
+            2,
+            3,
+            4,
+            5,
+            7,
+            9,
+            13,
+            17,
+            25,
+            33,
+            49,
+            65,
+            97,
+            129,
+            193,
+            257,
+            385,
+            513,
+            769,
+            1025,
+            1537,
+            2049,
+            3073,
+            4097,
+            6145,
+            8193,
+            12289,
+            16385,
+            24577,
+        )
+    private val DIST_EXTRA =
+        intArrayOf(
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            2,
+            2,
+            3,
+            3,
+            4,
+            4,
+            5,
+            5,
+            6,
+            6,
+            7,
+            7,
+            8,
+            8,
+            9,
+            9,
+            10,
+            10,
+            11,
+            11,
+            12,
+            12,
+            13,
+            13,
+        )
     private val CL_ORDER = intArrayOf(16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15)
 
-    private fun inflateDeflate(src: ByteArray, start: Int): ByteArray {
+    private fun inflateDeflate(
+        src: ByteArray,
+        start: Int,
+    ): ByteArray {
         val r = BitReader(src, start)
         val out = ArrayList<Byte>(src.size * 2)
         while (true) {
@@ -107,19 +236,27 @@ internal object InflateKt {
         return ByteArray(out.size) { out[it] }
     }
 
-    private fun inflateStored(r: BitReader, out: ArrayList<Byte>) {
+    private fun inflateStored(
+        r: BitReader,
+        out: ArrayList<Byte>,
+    ) {
         r.byteAlign()
-        if (r.i + 4 > r.src.size) throw IllegalArgumentException("truncated stored")
+        require(r.i + 4 <= r.src.size) { "truncated stored" }
         val len = r.src.u8(r.i) or (r.src.u8(r.i + 1) shl 8)
         val nlen = r.src.u8(r.i + 2) or (r.src.u8(r.i + 3) shl 8)
         r.i += 4
-        if (len xor 0xffff != nlen) throw IllegalArgumentException("stored nlen mismatch")
+        require(len xor 0xffff == nlen) { "stored nlen mismatch" }
         for (i in 0 until len) {
             out += r.src[r.i++].toByte()
         }
     }
 
-    private fun inflateHuffman(r: BitReader, out: ArrayList<Byte>, lit: Huffman, dist: Huffman) {
+    private fun inflateHuffman(
+        r: BitReader,
+        out: ArrayList<Byte>,
+        lit: Huffman,
+        dist: Huffman,
+    ) {
         while (true) {
             val sym = decodeSymbol(r, lit)
             when {

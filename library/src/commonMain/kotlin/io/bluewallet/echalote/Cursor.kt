@@ -7,7 +7,11 @@ class Cursor(
 ) {
     val remaining: Int get() = end - offset
 
-    fun write(src: ByteArray, srcOff: Int = 0, len: Int = src.size - srcOff) {
+    fun write(
+        src: ByteArray,
+        srcOff: Int = 0,
+        len: Int = src.size - srcOff,
+    ) {
         require(remaining >= len) { "cursor overflow writing $len" }
         src.copyInto(bytes, offset, srcOff, srcOff + len)
         offset += len
@@ -36,7 +40,10 @@ class Cursor(
         writeU8(0)
     }
 
-    fun fill(value: Int, n: Int) {
+    fun fill(
+        value: Int,
+        n: Int,
+    ) {
         require(remaining >= n) { "cursor overflow filling $n" }
         val b = value.toByte()
         for (i in 0 until n) bytes[offset + i] = b
@@ -87,7 +94,7 @@ class Cursor(
     fun readNulled(): ByteArray {
         var i = offset
         while (i < end && bytes[i].toInt() != 0) i++
-        if (i >= end) throw IllegalArgumentException("missing NUL")
+        require(i < end) { "missing NUL" }
         val out = bytes.copyOfRange(offset, i)
         offset = i + 1
         return out
@@ -111,8 +118,11 @@ class Cursor(
     }
 }
 
-class Opaque(val bytes: ByteArray) {
+class Opaque(
+    val bytes: ByteArray,
+) {
     fun size(): Int = bytes.size
+
     fun write(cursor: Cursor) {
         cursor.write(bytes)
     }

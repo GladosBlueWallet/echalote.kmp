@@ -2,7 +2,12 @@ package io.bluewallet.echalote
 
 /** AES-GCM (NIST SP 800-38D) with 12-byte IV. */
 internal object AesGcm {
-    fun encrypt(key: ByteArray, iv: ByteArray, aad: ByteArray, plaintext: ByteArray): Pair<ByteArray, ByteArray> {
+    fun encrypt(
+        key: ByteArray,
+        iv: ByteArray,
+        aad: ByteArray,
+        plaintext: ByteArray,
+    ): Pair<ByteArray, ByteArray> {
         require(iv.size == 12) { "GCM IV must be 12 bytes" }
         val roundKeys = Aes.expandKey(key)
         val h = ByteArray(16)
@@ -21,7 +26,13 @@ internal object AesGcm {
         return ciphertext to tag
     }
 
-    fun decrypt(key: ByteArray, iv: ByteArray, aad: ByteArray, ciphertext: ByteArray, tag: ByteArray): ByteArray {
+    fun decrypt(
+        key: ByteArray,
+        iv: ByteArray,
+        aad: ByteArray,
+        ciphertext: ByteArray,
+        tag: ByteArray,
+    ): ByteArray {
         require(iv.size == 12) { "GCM IV must be 12 bytes" }
         require(tag.size == 16) { "GCM tag must be 16 bytes" }
         val roundKeys = Aes.expandKey(key)
@@ -42,7 +53,12 @@ internal object AesGcm {
         return plaintext
     }
 
-    private fun ctrXor(roundKeys: IntArray, counter: ByteArray, input: ByteArray, output: ByteArray) {
+    private fun ctrXor(
+        roundKeys: IntArray,
+        counter: ByteArray,
+        input: ByteArray,
+        output: ByteArray,
+    ) {
         val block = ByteArray(16)
         var i = 0
         while (i < input.size) {
@@ -64,7 +80,11 @@ internal object AesGcm {
         }
     }
 
-    private fun ghash(h: ByteArray, aad: ByteArray, ciphertext: ByteArray): ByteArray {
+    private fun ghash(
+        h: ByteArray,
+        aad: ByteArray,
+        ciphertext: ByteArray,
+    ): ByteArray {
         var x = ByteArray(16)
         x = ghashBlocks(x, h, aad)
         x = ghashBlocks(x, h, ciphertext)
@@ -75,7 +95,11 @@ internal object AesGcm {
         return gmult(x, h)
     }
 
-    private fun ghashBlocks(start: ByteArray, h: ByteArray, data: ByteArray): ByteArray {
+    private fun ghashBlocks(
+        start: ByteArray,
+        h: ByteArray,
+        data: ByteArray,
+    ): ByteArray {
         var x = start
         var i = 0
         while (i < data.size) {
@@ -89,7 +113,10 @@ internal object AesGcm {
         return x
     }
 
-    private fun gmult(x: ByteArray, y: ByteArray): ByteArray {
+    private fun gmult(
+        x: ByteArray,
+        y: ByteArray,
+    ): ByteArray {
         val z = ByteArray(16)
         val v = y.copyOf()
         for (i in 0 until 16) {
@@ -109,11 +136,18 @@ internal object AesGcm {
         return z
     }
 
-    private fun xor16(a: ByteArray, b: ByteArray) {
+    private fun xor16(
+        a: ByteArray,
+        b: ByteArray,
+    ) {
         for (i in 0 until 16) a[i] = (a[i].toInt() xor b[i].toInt()).toByte()
     }
 
-    private fun putU64be(out: ByteArray, i: Int, v: Long) {
+    private fun putU64be(
+        out: ByteArray,
+        i: Int,
+        v: Long,
+    ) {
         out.putU64be(i, v)
     }
 }

@@ -13,8 +13,14 @@ kotlin {
     jvm()
     androidLibrary {
         namespace = "io.bluewallet.echalote"
-        compileSdk = libs.versions.android.compileSdk.get().toInt()
-        minSdk = libs.versions.android.minSdk.get().toInt()
+        compileSdk =
+            libs.versions.android.compileSdk
+                .get()
+                .toInt()
+        minSdk =
+            libs.versions.android.minSdk
+                .get()
+                .toInt()
 
         withJava()
         withHostTestBuilder {}.configure {}

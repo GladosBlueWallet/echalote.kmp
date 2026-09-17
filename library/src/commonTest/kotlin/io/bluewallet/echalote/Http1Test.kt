@@ -2,6 +2,7 @@ package io.bluewallet.echalote
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertTrue
 
 class Http1Test {
     @Test
@@ -23,13 +24,14 @@ class Http1Test {
 
     @Test
     fun parseHttp1Response_http10_without_content_length_keeps_body() {
-        val raw = (
-            "HTTP/1.0 200 OK\r\n" +
-                "Content-Type: text/plain\r\n" +
-                "Content-Encoding: identity\r\n" +
-                "\r\n" +
-                "network-status-version 3 microdesc\n" +
-                "directory-footer\n"
+        val raw =
+            (
+                "HTTP/1.0 200 OK\r\n" +
+                    "Content-Type: text/plain\r\n" +
+                    "Content-Encoding: identity\r\n" +
+                    "\r\n" +
+                    "network-status-version 3 microdesc\n" +
+                    "directory-footer\n"
             ).encodeToByteArray()
         val res = parseHttp1Response(raw)
         assertEquals(200, res.status)
@@ -41,11 +43,12 @@ class Http1Test {
 
     @Test
     fun parseHttp1Response_respects_content_length() {
-        val raw = (
-            "HTTP/1.1 200 OK\r\n" +
-                "Content-Length: 5\r\n" +
-                "\r\n" +
-                "helloTRAILING"
+        val raw =
+            (
+                "HTTP/1.1 200 OK\r\n" +
+                    "Content-Length: 5\r\n" +
+                    "\r\n" +
+                    "helloTRAILING"
             ).encodeToByteArray()
         val res = parseHttp1Response(raw)
         assertEquals(200, res.status)
@@ -67,13 +70,14 @@ class Http1Test {
 
     @Test
     fun readHttp1Raw_stops_at_content_length_without_waiting_for_eof() {
-        val chunks = ArrayDeque(
-            listOf(
-                "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhe".encodeToByteArray(),
-                "llo".encodeToByteArray(),
-                "SHOULD_NOT_READ".encodeToByteArray(),
-            ),
-        )
+        val chunks =
+            ArrayDeque(
+                listOf(
+                    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhe".encodeToByteArray(),
+                    "llo".encodeToByteArray(),
+                    "SHOULD_NOT_READ".encodeToByteArray(),
+                ),
+            )
         val raw = readHttp1Raw { chunks.removeFirstOrNull() }
         assertEquals("hello", parseHttp1Response(raw).body.decodeToString())
         assertEquals(1, chunks.size)
@@ -81,22 +85,76 @@ class Http1Test {
 
     @Test
     fun readHttp1Raw_without_content_length_reads_until_eof() {
-        val chunks = ArrayDeque(
-            listOf(
-                "HTTP/1.0 200 OK\r\n\r\nnet".encodeToByteArray(),
-                "work".encodeToByteArray(),
-            ),
-        )
+        val chunks =
+            ArrayDeque(
+                listOf(
+                    "HTTP/1.0 200 OK\r\n\r\nnet".encodeToByteArray(),
+                    "work".encodeToByteArray(),
+                ),
+            )
         val raw = readHttp1Raw { chunks.removeFirstOrNull() }
         assertEquals("network", parseHttp1Response(raw).body.decodeToString())
     }
 
     @Test
     fun readHttp1Raw_truncated_content_length_fails() {
-        val chunks = ArrayDeque(
-            listOf("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhe".encodeToByteArray()),
-        )
+        val chunks =
+            ArrayDeque(
+                listOf("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhe".encodeToByteArray()),
+            )
         val err = runCatching { readHttp1Raw { chunks.removeFirstOrNull() } }.exceptionOrNull()
         assertEquals(true, err is IllegalArgumentException)
+    }
+
+    @Test
+    fun readHttp1Raw_rejects_chunked_transfer_encoding() {
+        val chunks =
+            ArrayDeque(
+                listOf(
+                    (
+                        "HTTP/1.1 200 OK\r\n" +
+                            "Transfer-Encoding: chunked\r\n" +
+                            "\r\n" +
+                            "5\r\nhello\r\n0\r\n\r\n"
+                    ).encodeToByteArray(),
+                ),
+            )
+        val err = runCatching { readHttp1Raw { chunks.removeFirstOrNull() } }.exceptionOrNull()
+        assertTrue(err is IllegalArgumentException)
+        assertTrue(err.message?.contains("chunked", ignoreCase = true) == true)
+    }
+
+    @Test
+    fun readHttp1Raw_rejects_invalid_content_length() {
+        val chunks =
+            ArrayDeque(
+                listOf("HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\nbody".encodeToByteArray()),
+            )
+        val err = runCatching { readHttp1Raw { chunks.removeFirstOrNull() } }.exceptionOrNull()
+        assertTrue(err is IllegalArgumentException)
+        assertTrue(err.message?.contains("Content-Length", ignoreCase = true) == true)
+    }
+
+    @Test
+    fun readHttp1Raw_rejects_oversized_content_length() {
+        val tooBig = 16 * 1024 * 1024 + 1
+        val chunks =
+            ArrayDeque(
+                listOf("HTTP/1.1 200 OK\r\nContent-Length: $tooBig\r\n\r\n".encodeToByteArray()),
+            )
+        val err = runCatching { readHttp1Raw { chunks.removeFirstOrNull() } }.exceptionOrNull()
+        assertTrue(err is IllegalArgumentException)
+        assertTrue(err.message?.contains("too large", ignoreCase = true) == true)
+    }
+
+    @Test
+    fun readHttp1Raw_rejects_oversized_close_delimited_body() {
+        val header = "HTTP/1.0 200 OK\r\n\r\n".encodeToByteArray()
+        val err =
+            runCatching {
+                readHttp1Raw(maxBody = 8) { header + ByteArray(9) }
+            }.exceptionOrNull()
+        assertTrue(err is IllegalArgumentException)
+        assertTrue(err.message?.contains("too large", ignoreCase = true) == true)
     }
 }

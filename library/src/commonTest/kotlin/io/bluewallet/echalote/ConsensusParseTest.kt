@@ -6,7 +6,8 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class ConsensusParseTest {
-    private val microdescBody = """
+    private val microdescBody =
+        """
 onion-key
 -----BEGIN RSA PUBLIC KEY-----
 MIGJAoGBALJcqKBDfT41bLkkBvKSMuictvSQjwiV2GUBszYb0zgOZV2D6pfIM6/Z
@@ -15,9 +16,10 @@ MIGJAoGBALJcqKBDfT41bLkkBvKSMuictvSQjwiV2GUBszYb0zgOZV2D6pfIM6/Z
 -----END RSA PUBLIC KEY-----
 ntor-onion-key NaEdxqudourIdG2Zhijv+9QSWS8iEsVq6NUExXah7GM
 id ed25519 uZ0YqbYpBJ8Ts8lomKs8PRlxPFucUJFayt/pWGilkd0
-""".trimIndent()
+        """.trimIndent()
 
-    private val microdescHeads = """
+    private val microdescHeads =
+        """
 network-status-version 3 microdesc
 vote-status consensus
 consensus-method 35
@@ -42,7 +44,7 @@ v Tor 0.4.8.8
 pr Conflux=1 Cons=1-2 Desc=1-2 DirCache=2 FlowCtrl=1-2 HSDir=2 HSIntro=4-5 HSRend=1-2 Link=1-5 LinkAuth=1,3 Microdesc=1-2 Padding=2 Relay=1-4
 w Bandwidth=5800
 directory-footer
-""".trimIndent()
+        """.trimIndent()
 
     @Test
     fun parsesOnionKeyNtorAndIdEd25519() {
@@ -69,17 +71,18 @@ directory-footer
 
     @Test
     fun keepsARouterWhoseVLineIsOmitted() {
-        val text = microdescHeads.replace(
-            "directory-footer",
-            """
-            r gotorDe5 AjWaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 2038-01-01 00:00:00 65.109.87.89 9001 0
-            m ccccccccccccccccccccccccccccccccccccccccccc
-            s Fast Running Stable V2Dir Valid
-            pr Cons=1-2 Desc=1-2 DirCache=2 FlowCtrl=1-2 Link=1-5 LinkAuth=1,3 Microdesc=1-2 Relay=1-4
-            w Bandwidth=100
-            directory-footer
-            """.trimIndent(),
-        )
+        val text =
+            microdescHeads.replace(
+                "directory-footer",
+                """
+                r gotorDe5 AjWaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 2038-01-01 00:00:00 65.109.87.89 9001 0
+                m ccccccccccccccccccccccccccccccccccccccccccc
+                s Fast Running Stable V2Dir Valid
+                pr Cons=1-2 Desc=1-2 DirCache=2 FlowCtrl=1-2 Link=1-5 LinkAuth=1,3 Microdesc=1-2 Relay=1-4
+                w Bandwidth=100
+                directory-footer
+                """.trimIndent(),
+            )
         val c = ConsensusParser.parseOrThrow(text)
         assertEquals(3, c.microdescs.size)
         assertEquals("c0der", c.microdescs[0].nickname)
