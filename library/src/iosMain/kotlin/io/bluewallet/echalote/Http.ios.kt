@@ -81,7 +81,7 @@ actual fun defaultHttpEngine(): HttpEngine {
     val session = NSURLSession.sessionWithConfiguration(NSURLSessionConfiguration.ephemeralSessionConfiguration)
     return HttpEngine { method, url, headers, body, timeoutMs, decompress ->
         if (usesCleartextHttp1(url)) {
-            withContext(Dispatchers.IO) {
+            withContext(Dispatchers.Default) {
                 http1OverTcp(method, url, headers, body, timeoutMs)
             }
         } else {
@@ -172,22 +172,25 @@ private fun setNonBlocking(fd: Int, enabled: Boolean) {
 }
 
 @OptIn(ExperimentalForeignApi::class)
-private fun pollConnected(fd: Int, timeoutMs: Long): Boolean = memScoped {
-    val pfd = alloc<pollfd>()
-    pfd.fd = fd
-    pfd.events = POLLOUT.toShort()
-    pfd.revents = 0
-    while (true) {
-        val n = poll(pfd.ptr, 1.convert(), timeoutMs.coerceAtLeast(1L).toInt())
-        if (n == 0) return@memScoped false
-        if (n < 0) {
-            if (posixErrno() == EINTR) continue
-            return@memScoped false
+private fun pollConnected(fd: Int, timeoutMs: Long): Boolean {
+    memScoped {
+        val pfd = alloc<pollfd>()
+        pfd.fd = fd
+        pfd.events = POLLOUT.toShort()
+        pfd.revents = 0
+        while (true) {
+            val n = poll(pfd.ptr, 1.convert(), timeoutMs.coerceAtLeast(1L).toInt())
+            if (n == 0) return false
+            if (n < 0) {
+                if (posixErrno() == EINTR) continue
+                return false
+            }
+            val revents = pfd.revents.toInt()
+            if (revents and (POLLERR or POLLHUP or POLLNVAL) != 0) return false
+            return revents and POLLOUT != 0
         }
-        val revents = pfd.revents.toInt()
-        if (revents and (POLLERR or POLLHUP or POLLNVAL) != 0) return@memScoped false
-        return@memScoped revents and POLLOUT != 0
     }
+    error("unreachable")
 }
 
 @OptIn(ExperimentalForeignApi::class)
@@ -228,23 +231,27 @@ private fun sendAll(fd: Int, data: ByteArray) {
 @OptIn(ExperimentalForeignApi::class)
 private fun recvHttp1(fd: Int): ByteArray {
     val buf = ByteArray(16 * 1024)
-    return readHttp1Raw {
-        buf.usePinned { pinned ->
-            while (true) {
-                val n = recv(fd, pinned.addressOf(0), buf.size.convert(), 0)
-                when {
-                    n > 0 -> return@readHttp1Raw buf.copyOf(n.toInt())
-                    n.toLong() == 0L -> return@readHttp1Raw null
-                    else -> {
-                        val e = posixErrno()
-                        if (e == EINTR) continue
-                        check(e != EAGAIN && e != EWOULDBLOCK && e != ETIMEDOUT) { "HTTP socket timeout" }
-                        error("recv failed ($e)")
-                    }
+    return readHttp1Raw { recvOnce(fd, buf) }
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun recvOnce(fd: Int, buf: ByteArray): ByteArray? {
+    buf.usePinned { pinned ->
+        while (true) {
+            val n = recv(fd, pinned.addressOf(0), buf.size.convert(), 0)
+            when {
+                n > 0 -> return buf.copyOf(n.toInt())
+                n.toLong() == 0L -> return null
+                else -> {
+                    val e = posixErrno()
+                    if (e == EINTR) continue
+                    check(e != EAGAIN && e != EWOULDBLOCK && e != ETIMEDOUT) { "HTTP socket timeout" }
+                    error("recv failed ($e)")
                 }
             }
         }
     }
+    error("unreachable")
 }
 
 @OptIn(ExperimentalForeignApi::class)
