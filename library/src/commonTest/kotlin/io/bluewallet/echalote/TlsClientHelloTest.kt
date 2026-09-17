@@ -2,6 +2,8 @@ package io.bluewallet.echalote
 
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class TlsClientHelloTest {
@@ -30,6 +32,13 @@ class TlsClientHelloTest {
                 tls.close()
             }
         }
+
+    @Test
+    fun close_notify_is_not_a_tls_pump_error() {
+        assertNull(tlsPumpError(TlsCloseNotify()))
+        val other = TlsAlertError("TLS alert level=2 desc=40")
+        assertEquals(other, tlsPumpError(other))
+    }
 
     private fun indexOfBytes(
         haystack: ByteArray,

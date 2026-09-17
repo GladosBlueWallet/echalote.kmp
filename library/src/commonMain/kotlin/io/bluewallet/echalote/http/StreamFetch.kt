@@ -4,6 +4,9 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.CancellationException as CoroutineCancellation
 
+internal const val TOR_BROWSER_USER_AGENT =
+    "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0"
+
 data class StreamFetchInit(
     val stream: ByteDuplex,
     val abort: Abort? = null,
@@ -74,6 +77,9 @@ suspend fun streamFetch(
     val headers = LinkedHashMap<String, String>()
     if (init.headers.keys.none { it.equals("Host", true) }) headers["Host"] = url.host
     if (init.headers.keys.none { it.equals("Connection", true) }) headers["Connection"] = "close"
+    if (init.headers.keys.none { it.equals("User-Agent", true) }) {
+        headers["User-Agent"] = TOR_BROWSER_USER_AGENT
+    }
     headers.putAll(init.headers)
     val head =
         buildString {

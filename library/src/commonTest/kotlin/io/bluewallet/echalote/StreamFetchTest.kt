@@ -69,6 +69,7 @@ class StreamFetchTest {
             assertTrue(req.startsWith("get /api/ip http/1.1\r\n"))
             assertTrue(req.contains("host: check.torproject.org\r\n"))
             assertTrue(req.contains("connection: close\r\n"))
+            assertTrue(req.contains("user-agent: mozilla/5.0"))
             assertFalse(mock.closed)
         }
 

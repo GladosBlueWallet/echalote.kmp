@@ -24,15 +24,19 @@ private const val HS_SERVER_HELLO_DONE = 14
 private const val HS_CLIENT_KEY_EXCHANGE = 16
 private const val HS_FINISHED = 20
 
-internal class TlsAlertError(
+internal open class TlsAlertError(
     message: String,
 ) : Exception(message)
+
+internal class TlsCloseNotify : TlsAlertError("TLS close_notify")
+
+internal fun tlsPumpError(error: Throwable): Throwable? = if (error is TlsCloseNotify) null else error
 
 private fun throwTlsAlert(body: ByteArray): Nothing {
     val level = if (body.isNotEmpty()) body.u8(0) else -1
     val desc = if (body.size >= 2) body.u8(1) else -1
-    val message = if (desc == 0) "TLS close_notify" else "TLS alert level=$level desc=$desc"
-    throw TlsAlertError(message)
+    if (desc == 0) throw TlsCloseNotify()
+    throw TlsAlertError("TLS alert level=$level desc=$desc")
 }
 
 /**
@@ -336,7 +340,7 @@ private suspend fun TlsClientDuplex.handshakeAndPump(
                     if (frag.isNotEmpty()) app.write(frag)
                 }
             }.onFailure { e ->
-                pumpError = e
+                pumpError = tlsPumpError(e)
                 try {
                     app.close()
                 } catch (_: Throwable) {
