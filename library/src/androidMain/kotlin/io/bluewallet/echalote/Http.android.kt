@@ -5,7 +5,6 @@ import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.net.SocketTimeoutException
 import java.net.URL
 
 actual fun defaultHttpEngine(): HttpEngine = HttpEngine { method, url, headers, body, timeoutMs, decompress ->
@@ -35,20 +34,9 @@ private fun http1OverTcp(
         sock.getOutputStream().flush()
         val input = sock.getInputStream()
         val buf = ByteArray(16 * 1024)
-        var received = false
         val raw = readHttp1Raw {
-            val n = try {
-                input.read(buf)
-            } catch (e: SocketTimeoutException) {
-                if (!received) throw e
-                return@readHttp1Raw null
-            }
-            if (n < 0) {
-                null
-            } else {
-                received = true
-                buf.copyOf(n)
-            }
+            val n = input.read(buf)
+            if (n < 0) null else buf.copyOf(n)
         }
         return parseHttp1Response(raw)
     }

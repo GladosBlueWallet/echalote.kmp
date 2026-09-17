@@ -2,6 +2,7 @@ package io.bluewallet.echalote
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertTrue
 
 class Http1Test {
     @Test
@@ -98,5 +99,53 @@ class Http1Test {
         )
         val err = runCatching { readHttp1Raw { chunks.removeFirstOrNull() } }.exceptionOrNull()
         assertEquals(true, err is IllegalArgumentException)
+    }
+
+    @Test
+    fun readHttp1Raw_rejects_chunked_transfer_encoding() {
+        val chunks = ArrayDeque(
+            listOf(
+                (
+                    "HTTP/1.1 200 OK\r\n" +
+                        "Transfer-Encoding: chunked\r\n" +
+                        "\r\n" +
+                        "5\r\nhello\r\n0\r\n\r\n"
+                    ).encodeToByteArray(),
+            ),
+        )
+        val err = runCatching { readHttp1Raw { chunks.removeFirstOrNull() } }.exceptionOrNull()
+        assertTrue(err is IllegalArgumentException)
+        assertTrue(err.message?.contains("chunked", ignoreCase = true) == true)
+    }
+
+    @Test
+    fun readHttp1Raw_rejects_invalid_content_length() {
+        val chunks = ArrayDeque(
+            listOf("HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\nbody".encodeToByteArray()),
+        )
+        val err = runCatching { readHttp1Raw { chunks.removeFirstOrNull() } }.exceptionOrNull()
+        assertTrue(err is IllegalArgumentException)
+        assertTrue(err.message?.contains("Content-Length", ignoreCase = true) == true)
+    }
+
+    @Test
+    fun readHttp1Raw_rejects_oversized_content_length() {
+        val tooBig = 16 * 1024 * 1024 + 1
+        val chunks = ArrayDeque(
+            listOf("HTTP/1.1 200 OK\r\nContent-Length: $tooBig\r\n\r\n".encodeToByteArray()),
+        )
+        val err = runCatching { readHttp1Raw { chunks.removeFirstOrNull() } }.exceptionOrNull()
+        assertTrue(err is IllegalArgumentException)
+        assertTrue(err.message?.contains("too large", ignoreCase = true) == true)
+    }
+
+    @Test
+    fun readHttp1Raw_rejects_oversized_close_delimited_body() {
+        val header = "HTTP/1.0 200 OK\r\n\r\n".encodeToByteArray()
+        val err = runCatching {
+            readHttp1Raw(maxBody = 8) { header + ByteArray(9) }
+        }.exceptionOrNull()
+        assertTrue(err is IllegalArgumentException)
+        assertTrue(err.message?.contains("too large", ignoreCase = true) == true)
     }
 }

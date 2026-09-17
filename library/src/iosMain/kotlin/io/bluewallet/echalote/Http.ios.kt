@@ -3,6 +3,7 @@ package io.bluewallet.echalote
 import kotlinx.cinterop.CPointer
 import kotlinx.cinterop.CPointerVar
 import kotlinx.cinterop.ExperimentalForeignApi
+import kotlinx.cinterop.IntVar
 import kotlinx.cinterop.addressOf
 import kotlinx.cinterop.alloc
 import kotlinx.cinterop.convert
@@ -26,21 +27,41 @@ import platform.Foundation.setHTTPBody
 import platform.Foundation.setHTTPMethod
 import platform.Foundation.setValue
 import platform.posix.AF_UNSPEC
+import platform.posix.EAGAIN
+import platform.posix.EINPROGRESS
+import platform.posix.EINTR
+import platform.posix.ETIMEDOUT
+import platform.posix.EWOULDBLOCK
+import platform.posix.F_GETFL
+import platform.posix.F_SETFL
 import platform.posix.IPPROTO_TCP
+import platform.posix.O_NONBLOCK
+import platform.posix.POLLERR
+import platform.posix.POLLHUP
+import platform.posix.POLLNVAL
+import platform.posix.POLLOUT
 import platform.posix.SOCK_STREAM
 import platform.posix.SOL_SOCKET
+import platform.posix.SO_ERROR
+import platform.posix.SO_NOSIGPIPE
 import platform.posix.SO_RCVTIMEO
 import platform.posix.SO_SNDTIMEO
 import platform.posix.addrinfo
 import platform.posix.close
 import platform.posix.connect
+import platform.posix.errno
+import platform.posix.fcntl
 import platform.posix.freeaddrinfo
 import platform.posix.getaddrinfo
+import platform.posix.getsockopt
 import platform.posix.memset
+import platform.posix.poll
+import platform.posix.pollfd
 import platform.posix.recv
 import platform.posix.send
 import platform.posix.setsockopt
 import platform.posix.socket
+import platform.posix.socklen_tVar
 import platform.posix.timeval
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -60,7 +81,7 @@ actual fun defaultHttpEngine(): HttpEngine {
     val session = NSURLSession.sessionWithConfiguration(NSURLSessionConfiguration.ephemeralSessionConfiguration)
     return HttpEngine { method, url, headers, body, timeoutMs, decompress ->
         if (usesCleartextHttp1(url)) {
-            withContext(Dispatchers.Default) {
+            withContext(Dispatchers.IO) {
                 http1OverTcp(method, url, headers, body, timeoutMs)
             }
         } else {
@@ -104,9 +125,16 @@ private fun posixConnect(host: String, port: Int, timeoutMs: Long): Int = memSco
             val info = ai.pointed
             val fd = socket(info.ai_family, info.ai_socktype, info.ai_protocol)
             if (fd >= 0) {
-                applySocketTimeouts(fd, timeoutMs)
-                val rc = connect(fd, info.ai_addr, info.ai_addrlen)
-                if (rc == 0) return@memScoped fd
+                try {
+                    disableSigPipe(fd)
+                    if (connectWithTimeout(fd, info, timeoutMs)) {
+                        applySocketTimeouts(fd, timeoutMs)
+                        return@memScoped fd
+                    }
+                } catch (e: Throwable) {
+                    close(fd)
+                    throw e
+                }
                 close(fd)
             }
             ai = info.ai_next
@@ -116,6 +144,62 @@ private fun posixConnect(host: String, port: Int, timeoutMs: Long): Int = memSco
         freeaddrinfo(head)
     }
 }
+
+@OptIn(ExperimentalForeignApi::class)
+private fun disableSigPipe(fd: Int) = memScoped {
+    val one = alloc<IntVar>()
+    one.value = 1
+    check(
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, one.ptr, kotlinx.cinterop.sizeOf<IntVar>().convert()) == 0,
+    ) { "SO_NOSIGPIPE failed" }
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun connectWithTimeout(fd: Int, info: addrinfo, timeoutMs: Long): Boolean {
+    setNonBlocking(fd, true)
+    val rc = connect(fd, info.ai_addr, info.ai_addrlen)
+    val connected = rc == 0 || (posixErrno() == EINPROGRESS && pollConnected(fd, timeoutMs) && socketError(fd) == 0)
+    setNonBlocking(fd, false)
+    return connected
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun setNonBlocking(fd: Int, enabled: Boolean) {
+    val flags = fcntl(fd, F_GETFL, 0)
+    check(flags != -1) { "fcntl F_GETFL failed" }
+    val next = if (enabled) flags or O_NONBLOCK else flags and O_NONBLOCK.inv()
+    check(fcntl(fd, F_SETFL, next) != -1) { "fcntl F_SETFL failed" }
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun pollConnected(fd: Int, timeoutMs: Long): Boolean = memScoped {
+    val pfd = alloc<pollfd>()
+    pfd.fd = fd
+    pfd.events = POLLOUT.toShort()
+    pfd.revents = 0
+    while (true) {
+        val n = poll(pfd.ptr, 1.convert(), timeoutMs.coerceAtLeast(1L).toInt())
+        if (n == 0) return@memScoped false
+        if (n < 0) {
+            if (posixErrno() == EINTR) continue
+            return@memScoped false
+        }
+        val revents = pfd.revents.toInt()
+        if (revents and (POLLERR or POLLHUP or POLLNVAL) != 0) return@memScoped false
+        return@memScoped revents and POLLOUT != 0
+    }
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun socketError(fd: Int): Int = memScoped {
+    val err = alloc<IntVar>()
+    val len = alloc<socklen_tVar>()
+    len.value = kotlinx.cinterop.sizeOf<IntVar>().convert()
+    val rc = getsockopt(fd, SOL_SOCKET, SO_ERROR, err.ptr, len.ptr)
+    if (rc != 0) posixErrno() else err.value
+}
+
+private fun posixErrno(): Int = errno
 
 @OptIn(ExperimentalForeignApi::class)
 private fun applySocketTimeouts(fd: Int, timeoutMs: Long) {
@@ -146,8 +230,19 @@ private fun recvHttp1(fd: Int): ByteArray {
     val buf = ByteArray(16 * 1024)
     return readHttp1Raw {
         buf.usePinned { pinned ->
-            val n = recv(fd, pinned.addressOf(0), buf.size.convert(), 0)
-            if (n <= 0) null else buf.copyOf(n.toInt())
+            while (true) {
+                val n = recv(fd, pinned.addressOf(0), buf.size.convert(), 0)
+                when {
+                    n > 0 -> return@readHttp1Raw buf.copyOf(n.toInt())
+                    n.toLong() == 0L -> return@readHttp1Raw null
+                    else -> {
+                        val e = posixErrno()
+                        if (e == EINTR) continue
+                        check(e != EAGAIN && e != EWOULDBLOCK && e != ETIMEDOUT) { "HTTP socket timeout" }
+                        error("recv failed ($e)")
+                    }
+                }
+            }
         }
     }
 }
