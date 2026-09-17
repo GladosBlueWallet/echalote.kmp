@@ -1,6 +1,9 @@
 package io.bluewallet.echalote
 
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -25,5 +28,17 @@ class ChannelDuplexOrderTest {
             val expect = chunks.flatMap { it.toList() }
             assertEquals(expect.size, got.size)
             assertTrue(got == expect)
+        }
+
+    @Test
+    fun close_delivers_already_enqueued_bytes_to_parked_reader() =
+        runBlocking {
+            val duplex = ChannelDuplex()
+            val pending = async { duplex.read(16) }
+            withTimeout(1_000) {
+                while (!duplex.hasParkedReader()) delay(1)
+            }
+            duplex.enqueueThenMarkClosedAndWake("hello".encodeToByteArray())
+            assertEquals("hello", pending.await().decodeToString())
         }
 }

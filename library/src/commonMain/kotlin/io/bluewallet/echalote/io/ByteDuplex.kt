@@ -47,16 +47,11 @@ fun pairedByteDuplexes(): Pair<ByteDuplex, ByteDuplex> {
 
     fun wake(state: DuplexSide) {
         val waiter = state.waiter ?: return
-        if (state.closed) {
-            state.waiter = null
-            waiter.deferred.complete(ByteArray(0))
-            return
-        }
         val chunk = take(state, waiter.n)
         if (chunk != null) {
             state.waiter = null
             waiter.deferred.complete(chunk)
-        } else if (state.peerClosed) {
+        } else if (state.closed || state.peerClosed) {
             state.waiter = null
             waiter.deferred.complete(ByteArray(0))
         }
@@ -155,15 +150,15 @@ class ChannelDuplex : ByteDuplex {
 
     private fun wake() {
         val w = waiter ?: return
-        if (closed) {
-            waiter = null
-            w.deferred.complete(ByteArray(0))
-            return
-        }
         val chunk = take(w.n)
         if (chunk != null) {
             waiter = null
             w.deferred.complete(chunk)
+            return
+        }
+        if (closed) {
+            waiter = null
+            w.deferred.complete(ByteArray(0))
         }
     }
 
@@ -205,5 +200,15 @@ class ChannelDuplex : ByteDuplex {
         closed = true
         wake()
         onClose?.invoke()
+    }
+
+    internal fun hasParkedReader(): Boolean = waiter != null
+
+    internal suspend fun enqueueThenMarkClosedAndWake(bytes: ByteArray) {
+        mutex.withLock {
+            inbox.addLast(bytes.copyOf())
+            closed = true
+            wake()
+        }
     }
 }

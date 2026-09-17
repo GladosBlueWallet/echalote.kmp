@@ -24,6 +24,17 @@ private const val HS_SERVER_HELLO_DONE = 14
 private const val HS_CLIENT_KEY_EXCHANGE = 16
 private const val HS_FINISHED = 20
 
+internal class TlsAlertError(
+    message: String,
+) : Exception(message)
+
+private fun throwTlsAlert(body: ByteArray): Nothing {
+    val level = if (body.isNotEmpty()) body.u8(0) else -1
+    val desc = if (body.size >= 2) body.u8(1) else -1
+    val message = if (desc == 0) "TLS close_notify" else "TLS alert level=$level desc=$desc"
+    throw TlsAlertError(message)
+}
+
 /**
  * Userspace TLS 1.2 client: ECDHE_RSA_WITH_AES_256_GCM_SHA384, no PKI trust.
  * Exposes the leaf certificate DER for Tor CERTS `sign_to_tls`.
@@ -36,6 +47,8 @@ internal class TlsClientDuplex(
     val outer: ByteDuplex
     val leafCertDer = CompletableDeferred<ByteArray>()
     val ready = CompletableDeferred<Unit>()
+    var pumpError: Throwable? = null
+        internal set
     private val job = SupervisorJob()
     internal val scope = CoroutineScope(job + Dispatchers.Default)
 
@@ -107,11 +120,14 @@ private class TlsEngine(
         val len = hdr.u16be(3)
         require(len in 1..18432) { "bad TLS record length $len" }
         val fragment = transport.readExact(len)
-        if (type == REC_ALERT) {
-            val desc = if (fragment.size >= 2) fragment.u8(1) else -1
-            throw Exception("TLS alert $desc")
+        if (type == REC_ALERT && !encryptedRead) {
+            throwTlsAlert(fragment)
         }
-        return if (encryptedRead) type to open(type, fragment) else type to fragment
+        val body = if (encryptedRead) open(type, fragment) else fragment
+        if (type == REC_ALERT) {
+            throwTlsAlert(body)
+        }
+        return type to body
     }
 
     private fun seal(
@@ -306,27 +322,28 @@ private suspend fun TlsClientDuplex.handshakeAndPump(
 ) {
     val session = runTlsHandshake(transport, hostName)
     leafCertDer.complete(session.leaf)
-    ready.complete(Unit)
     val tls = session.tls
     val incoming =
         scope.launch {
-            try {
+            runCatching {
                 while (true) {
                     val (type, frag) = tls.readRecord()
                     if (type == REC_CCS) continue
                     if (type != REC_APP) {
                         if (type == REC_HS) continue
-                        throw Exception("unexpected TLS record $type")
+                        throw TlsAlertError("unexpected TLS record $type")
                     }
                     if (frag.isNotEmpty()) app.write(frag)
                 }
-            } catch (_: Throwable) {
+            }.onFailure { e ->
+                pumpError = e
                 try {
                     app.close()
                 } catch (_: Throwable) {
                 }
             }
         }
+    ready.complete(Unit)
     try {
         while (true) {
             val chunk = app.read(16 * 1024)
@@ -452,9 +469,20 @@ suspend fun wrapTls(
         throw err
     }
     return object : ByteDuplex {
-        override suspend fun read(n: Int): ByteArray = tls.outer.read(n)
+        override suspend fun read(n: Int): ByteArray {
+            val value = tls.outer.read(n)
+            if (value.isEmpty()) {
+                val err = tls.pumpError
+                if (err != null) throw err
+            }
+            return value
+        }
 
-        override suspend fun write(bytes: ByteArray) = tls.outer.write(bytes)
+        override suspend fun write(bytes: ByteArray) {
+            val err = tls.pumpError
+            if (err != null) throw err
+            tls.outer.write(bytes)
+        }
 
         override fun close() {
             try {

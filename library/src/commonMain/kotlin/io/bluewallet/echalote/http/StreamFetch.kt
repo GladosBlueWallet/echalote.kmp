@@ -155,7 +155,7 @@ private class HttpByteReader(
                 }
             }
         abort?.throwIfAborted()
-        require(value.isNotEmpty()) { "Unexpected end of HTTP stream" }
+        require(value.isNotEmpty()) { "Unexpected end of HTTP stream (buffered=${buf.size})" }
         buf = concatBytes(buf, value)
     }
 
