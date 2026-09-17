@@ -3,7 +3,9 @@
 package io.bluewallet.echalote
 
 /** Unsigned big-endian integer (minimal, for RSA). */
-internal class BigNat private constructor(private val mag: IntArray) {
+internal class BigNat private constructor(
+    private val mag: IntArray,
+) {
     fun toFixedBytes(len: Int): ByteArray {
         val out = ByteArray(len)
         var i = mag.size - 1
@@ -30,7 +32,10 @@ internal class BigNat private constructor(private val mag: IntArray) {
         return 0
     }
 
-    fun modPow(exp: BigNat, mod: BigNat): BigNat {
+    fun modPow(
+        exp: BigNat,
+        mod: BigNat,
+    ): BigNat {
         var result = ONE
         var base = this.mod(mod)
         val e = exp.mag
@@ -208,7 +213,10 @@ class RsaPublicKey private constructor(
     private val e: BigNat,
     private val k: Int,
 ) {
-    fun verifyPkcs1v15Unprefixed(hashed: Memory, signature: Memory): Boolean {
+    fun verifyPkcs1v15Unprefixed(
+        hashed: Memory,
+        signature: Memory,
+    ): Boolean {
         return try {
             if (signature.bytes.size != k) return false
             val s = BigNat.fromBytes(signature.bytes)
@@ -228,7 +236,11 @@ class RsaPublicKey private constructor(
         }
     }
 
-    fun verifyPkcs1v15Digest(digestInfoPrefix: ByteArray, hashed: ByteArray, signature: ByteArray): Boolean {
+    fun verifyPkcs1v15Digest(
+        digestInfoPrefix: ByteArray,
+        hashed: ByteArray,
+        signature: ByteArray,
+    ): Boolean {
         val want = concatBytes(digestInfoPrefix, hashed)
         return verifyPkcs1v15Unprefixed(Memory(want), Memory(signature))
     }
@@ -260,14 +272,24 @@ class RsaPublicKey private constructor(
 object RsaWasm {
     class RsaPublicKey {
         companion object {
-            fun from_public_key_der(input: Memory) = io.bluewallet.echalote.RsaPublicKey.fromPublicKeyDer(input)
-            fun from_pkcs1_der(input: Memory) = io.bluewallet.echalote.RsaPublicKey.fromPkcs1Der(input)
+            fun from_public_key_der(input: Memory) =
+                io.bluewallet.echalote.RsaPublicKey
+                    .fromPublicKeyDer(input)
+
+            fun from_pkcs1_der(input: Memory) =
+                io.bluewallet.echalote.RsaPublicKey
+                    .fromPkcs1Der(input)
         }
     }
+
     fun initBundled() {}
 }
 
-internal class Der(val tag: Int, val body: ByteArray, val raw: ByteArray) {
+internal class Der(
+    val tag: Int,
+    val body: ByteArray,
+    val raw: ByteArray,
+) {
     fun asSequence(): List<Der> {
         require(tag == 0x30) { "expected SEQUENCE, got $tag" }
         return parseAll(body)
@@ -318,7 +340,10 @@ internal class Der(val tag: Int, val body: ByteArray, val raw: ByteArray) {
             return out
         }
 
-        fun parseOne(bytes: ByteArray, start: Int): Pair<Der, Int> {
+        fun parseOne(
+            bytes: ByteArray,
+            start: Int,
+        ): Pair<Der, Int> {
             var i = start
             val tag = bytes.u8(i++)
             var len = bytes.u8(i++)

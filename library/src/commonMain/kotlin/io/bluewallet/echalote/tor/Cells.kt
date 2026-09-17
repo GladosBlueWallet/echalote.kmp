@@ -36,8 +36,12 @@ internal data class RawCell(
     val old: Boolean,
 )
 
-internal fun writeOldCell(circuitId: Int, command: Int, fragment: ByteArray): ByteArray {
-    return if (command == CellCmd.VERSIONS) {
+internal fun writeOldCell(
+    circuitId: Int,
+    command: Int,
+    fragment: ByteArray,
+): ByteArray =
+    if (command == CellCmd.VERSIONS) {
         val out = ByteArray(2 + 1 + 2 + fragment.size)
         val c = Cursor(out)
         c.writeU16(circuitId)
@@ -54,10 +58,13 @@ internal fun writeOldCell(circuitId: Int, command: Int, fragment: ByteArray): By
         c.fill(0, c.remaining)
         out
     }
-}
 
-internal fun writeCell(circuitId: Int, command: Int, fragment: ByteArray): ByteArray {
-    return if (command >= 128) {
+internal fun writeCell(
+    circuitId: Int,
+    command: Int,
+    fragment: ByteArray,
+): ByteArray =
+    if (command >= 128) {
         val out = ByteArray(4 + 1 + 2 + fragment.size)
         val c = Cursor(out)
         c.writeU32(circuitId)
@@ -74,7 +81,6 @@ internal fun writeCell(circuitId: Int, command: Int, fragment: ByteArray): ByteA
         c.fill(0, c.remaining)
         out
     }
-}
 
 internal fun tryReadOldCell(cursor: Cursor): RawCell? {
     if (cursor.remaining < 3) return null
@@ -179,7 +185,10 @@ internal data class DecodedRelay(
     val digest20: ByteArray,
 )
 
-internal fun decodeRelayPayload(payload: ByteArray, targets: List<Target>): DecodedRelay {
+internal fun decodeRelayPayload(
+    payload: ByteArray,
+    targets: List<Target>,
+): DecodedRelay {
     val mem = Memory(payload.copyOf())
     for (target in targets) {
         target.backwardKey.applyKeystream(mem)
@@ -250,7 +259,11 @@ internal fun destroyPayload(reason: Int): ByteArray = byteArrayOf(reason.toByte(
 
 internal fun readDestroy(payload: ByteArray): Int = payload.u8(0)
 
-internal fun extend2Payload(handshakeType: Int, links: List<ByteArray>, data: ByteArray): ByteArray {
+internal fun extend2Payload(
+    handshakeType: Int,
+    links: List<ByteArray>,
+    data: ByteArray,
+): ByteArray {
     val linkBytes = concatBytes(*links.toTypedArray())
     val out = ByteArray(1 + linkBytes.size + 2 + 2 + data.size)
     val c = Cursor(out)
@@ -262,7 +275,10 @@ internal fun extend2Payload(handshakeType: Int, links: List<ByteArray>, data: By
     return out
 }
 
-internal fun extend2LinkIpv4(hostname: String, port: Int): ByteArray {
+internal fun extend2LinkIpv4(
+    hostname: String,
+    port: Int,
+): ByteArray {
     val parts = hostname.split(".")
     val out = ByteArray(1 + 1 + 4 + 2)
     val c = Cursor(out)
@@ -306,19 +322,23 @@ internal fun extend2LinkModernId(fp: ByteArray): ByteArray {
 }
 
 private fun expandIpv6(ip: String): IntArray {
-    val (left, right) = if (ip.contains("::")) {
-        val parts = ip.split("::", limit = 2)
-        parts[0].split(":").filter { it.isNotEmpty() } to parts.getOrElse(1) { "" }.split(":").filter { it.isNotEmpty() }
-    } else {
-        ip.split(":") to emptyList()
-    }
+    val (left, right) =
+        if (ip.contains("::")) {
+            val parts = ip.split("::", limit = 2)
+            parts[0].split(":").filter { it.isNotEmpty() } to parts.getOrElse(1) { "" }.split(":").filter { it.isNotEmpty() }
+        } else {
+            ip.split(":") to emptyList()
+        }
     val out = IntArray(8)
     for (i in left.indices) out[i] = left[i].toInt(16)
     for (i in right.indices) out[8 - right.size + i] = right[i].toInt(16)
     return out
 }
 
-internal fun beginPayload(address: String, flags: Int): ByteArray {
+internal fun beginPayload(
+    address: String,
+    flags: Int,
+): ByteArray {
     val bytes = address.encodeToByteArray()
     val out = ByteArray(bytes.size + 1 + 4)
     val c = Cursor(out)

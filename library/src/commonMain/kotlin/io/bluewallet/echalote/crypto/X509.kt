@@ -12,17 +12,19 @@ internal class X509Certificate(
     fun rsaPublicKey(): RsaPublicKey = RsaPublicKey.fromPublicKeyDer(Memory(spkiDer))
 
     fun verifySelfSigned(): Boolean {
-        val hash = when {
-            equalBytes(signatureOid, OID_SHA256_RSA) -> Sha256.hash(tbsDer)
-            equalBytes(signatureOid, OID_SHA384_RSA) -> Sha384.hash(tbsDer)
-            equalBytes(signatureOid, OID_SHA1_RSA) -> Sha1.hash(tbsDer)
-            else -> return false
-        }
-        val prefix = when {
-            equalBytes(signatureOid, OID_SHA256_RSA) -> RsaPublicKey.SHA256_DIGESTINFO
-            equalBytes(signatureOid, OID_SHA384_RSA) -> RsaPublicKey.SHA384_DIGESTINFO
-            else -> RsaPublicKey.SHA1_DIGESTINFO
-        }
+        val hash =
+            when {
+                equalBytes(signatureOid, OID_SHA256_RSA) -> Sha256.hash(tbsDer)
+                equalBytes(signatureOid, OID_SHA384_RSA) -> Sha384.hash(tbsDer)
+                equalBytes(signatureOid, OID_SHA1_RSA) -> Sha1.hash(tbsDer)
+                else -> return false
+            }
+        val prefix =
+            when {
+                equalBytes(signatureOid, OID_SHA256_RSA) -> RsaPublicKey.SHA256_DIGESTINFO
+                equalBytes(signatureOid, OID_SHA384_RSA) -> RsaPublicKey.SHA384_DIGESTINFO
+                else -> RsaPublicKey.SHA1_DIGESTINFO
+            }
         return rsaPublicKey().verifyPkcs1v15Digest(prefix, hash, signature)
     }
 
@@ -89,8 +91,16 @@ internal class X509Certificate(
     }
 }
 
-internal fun utcEpochMillis(year: Int, month: Int, day: Int, hour: Int, minute: Int, second: Int): Long {
+internal fun utcEpochMillis(
+    year: Int,
+    month: Int,
+    day: Int,
+    hour: Int,
+    minute: Int,
+    second: Int,
+): Long {
     val md = intArrayOf(31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+
     fun leap(y: Int) = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
     var days = 0L
     for (y in 1970 until year) days += if (leap(y)) 366 else 365

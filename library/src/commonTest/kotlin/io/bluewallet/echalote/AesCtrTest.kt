@@ -1,11 +1,11 @@
 package io.bluewallet.echalote
 
+import io.bluewallet.echalote.vectors.AES_CTR_VECTORS_JSON
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
-import io.bluewallet.echalote.vectors.AES_CTR_VECTORS_JSON
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue

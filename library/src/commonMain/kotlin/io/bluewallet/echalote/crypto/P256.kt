@@ -14,20 +14,38 @@ internal object P256 {
     private val EIGHT = BigNat.fromBytes(byteArrayOf(8))
     private val P_MINUS_2 = P.subtract(TWO)
 
-    class Point(val x: BigNat, val y: BigNat, val z: BigNat, val inf: Boolean = false) {
+    class Point(
+        val x: BigNat,
+        val y: BigNat,
+        val z: BigNat,
+        val inf: Boolean = false,
+    ) {
         companion object {
             val INF = Point(BigNat.ZERO, BigNat.ONE, BigNat.ZERO, inf = true)
         }
     }
 
-    fun feAdd(a: BigNat, b: BigNat): BigNat = a.add(b).mod(P)
-    fun feSub(a: BigNat, b: BigNat): BigNat {
+    fun feAdd(
+        a: BigNat,
+        b: BigNat,
+    ): BigNat = a.add(b).mod(P)
+
+    fun feSub(
+        a: BigNat,
+        b: BigNat,
+    ): BigNat {
         val aa = a.mod(P)
         val bb = b.mod(P)
         return if (aa.compare(bb) >= 0) aa.subtract(bb) else aa.add(P).subtract(bb)
     }
-    fun feMul(a: BigNat, b: BigNat): BigNat = a.mul(b).mod(P)
+
+    fun feMul(
+        a: BigNat,
+        b: BigNat,
+    ): BigNat = a.mul(b).mod(P)
+
     fun feSqr(a: BigNat): BigNat = feMul(a, a)
+
     fun feInv(a: BigNat): BigNat = a.modPow(P_MINUS_2, P)
 
     fun toAffine(p: Point): Pair<BigNat, BigNat> {
@@ -54,7 +72,10 @@ internal object P256 {
         return Point(x3, y3, z3)
     }
 
-    fun add(p: Point, q: Point): Point {
+    fun add(
+        p: Point,
+        q: Point,
+    ): Point {
         if (p.inf) return q
         if (q.inf) return p
         val z1z1 = feSqr(p.z)
@@ -77,7 +98,11 @@ internal object P256 {
         return Point(x3, y3, z3)
     }
 
-    fun scalarMult(k: ByteArray, px: BigNat, py: BigNat): Pair<BigNat, BigNat> {
+    fun scalarMult(
+        k: ByteArray,
+        px: BigNat,
+        py: BigNat,
+    ): Pair<BigNat, BigNat> {
         var r = Point.INF
         val base = Point(px, py, BigNat.ONE)
         for (byte in k) {
@@ -101,14 +126,19 @@ internal object P256 {
         }
     }
 
-    fun ecdh(secret: ByteArray, peerUncompressed: ByteArray): ByteArray {
+    fun ecdh(
+        secret: ByteArray,
+        peerUncompressed: ByteArray,
+    ): ByteArray {
         val (x, y) = decodeUncompressed(peerUncompressed)
         val (sx, _) = scalarMult(secret, x, y)
         return sx.toFixedBytes(32)
     }
 
-    fun encodeUncompressed(x: BigNat, y: BigNat): ByteArray =
-        concatBytes(byteArrayOf(0x04), x.toFixedBytes(32), y.toFixedBytes(32))
+    fun encodeUncompressed(
+        x: BigNat,
+        y: BigNat,
+    ): ByteArray = concatBytes(byteArrayOf(0x04), x.toFixedBytes(32), y.toFixedBytes(32))
 
     fun decodeUncompressed(p: ByteArray): Pair<BigNat, BigNat> {
         require(p.size == 65 && p[0].toInt() == 0x04) { "P-256 point must be uncompressed" }

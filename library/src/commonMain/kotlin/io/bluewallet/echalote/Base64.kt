@@ -2,13 +2,17 @@ package io.bluewallet.echalote
 
 object Base64 {
     private val ENC = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".toCharArray()
-    private val DEC = IntArray(256) { -1 }.also { table ->
-        ENC.forEachIndexed { i, c -> table[c.code] = i }
-        table['-'.code] = 62
-        table['_'.code] = 63
-    }
+    private val DEC =
+        IntArray(256) { -1 }.also { table ->
+            ENC.forEachIndexed { i, c -> table[c.code] = i }
+            table['-'.code] = 62
+            table['_'.code] = 63
+        }
 
-    fun encode(bytes: ByteArray, padded: Boolean = true): String {
+    fun encode(
+        bytes: ByteArray,
+        padded: Boolean = true,
+    ): String {
         val out = StringBuilder((bytes.size + 2) / 3 * 4)
         var i = 0
         while (i + 2 < bytes.size) {
@@ -38,11 +42,12 @@ object Base64 {
     fun encodeUnpadded(bytes: ByteArray): String = encode(bytes, padded = false)
 
     fun decode(text: String): ByteArray {
-        val clean = buildString(text.length) {
-            for (c in text) {
-                if (c != '=' && c != '\n' && c != '\r' && c != ' ') append(c)
+        val clean =
+            buildString(text.length) {
+                for (c in text) {
+                    if (c != '=' && c != '\n' && c != '\r' && c != ' ') append(c)
+                }
             }
-        }
         val pad = (4 - (clean.length % 4)) % 4
         val s = clean + "=".repeat(pad)
         val out = ByteArray(s.length / 4 * 3)
@@ -53,8 +58,8 @@ object Base64 {
             val b = DEC[s[i + 1].code]
             val c = if (s[i + 2] == '=') 0 else DEC[s[i + 2].code]
             val d = if (s[i + 3] == '=') 0 else DEC[s[i + 3].code]
-            if (a < 0 || b < 0 || (s[i + 2] != '=' && c < 0) || (s[i + 3] != '=' && d < 0)) {
-                throw IllegalArgumentException("invalid base64")
+            require(a >= 0 && b >= 0 && (s[i + 2] == '=' || c >= 0) && (s[i + 3] == '=' || d >= 0)) {
+                "invalid base64"
             }
             val n = (a shl 18) or (b shl 12) or (c shl 6) or d
             out[o++] = (n ushr 16).toByte()

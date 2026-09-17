@@ -109,53 +109,63 @@ private fun http1OverTcp(
 }
 
 @OptIn(ExperimentalForeignApi::class)
-private fun posixConnect(host: String, port: Int, timeoutMs: Long): Int = memScoped {
-    val hints = alloc<addrinfo>()
-    memset(hints.ptr, 0, kotlinx.cinterop.sizeOf<addrinfo>().convert())
-    hints.ai_family = AF_UNSPEC
-    hints.ai_socktype = SOCK_STREAM
-    hints.ai_protocol = IPPROTO_TCP
-    val result = alloc<CPointerVar<addrinfo>>()
-    val err = getaddrinfo(host, port.toString(), hints.ptr, result.ptr)
-    check(err == 0) { "getaddrinfo failed for $host:$port ($err)" }
-    val head = result.value
-    try {
-        var ai: CPointer<addrinfo>? = head
-        while (ai != null) {
-            val info = ai.pointed
-            val fd = socket(info.ai_family, info.ai_socktype, info.ai_protocol)
-            if (fd >= 0) {
-                try {
-                    disableSigPipe(fd)
-                    if (connectWithTimeout(fd, info, timeoutMs)) {
-                        applySocketTimeouts(fd, timeoutMs)
-                        return@memScoped fd
+private fun posixConnect(
+    host: String,
+    port: Int,
+    timeoutMs: Long,
+): Int =
+    memScoped {
+        val hints = alloc<addrinfo>()
+        memset(hints.ptr, 0, kotlinx.cinterop.sizeOf<addrinfo>().convert())
+        hints.ai_family = AF_UNSPEC
+        hints.ai_socktype = SOCK_STREAM
+        hints.ai_protocol = IPPROTO_TCP
+        val result = alloc<CPointerVar<addrinfo>>()
+        val err = getaddrinfo(host, port.toString(), hints.ptr, result.ptr)
+        check(err == 0) { "getaddrinfo failed for $host:$port ($err)" }
+        val head = result.value
+        try {
+            var ai: CPointer<addrinfo>? = head
+            while (ai != null) {
+                val info = ai.pointed
+                val fd = socket(info.ai_family, info.ai_socktype, info.ai_protocol)
+                if (fd >= 0) {
+                    try {
+                        disableSigPipe(fd)
+                        if (connectWithTimeout(fd, info, timeoutMs)) {
+                            applySocketTimeouts(fd, timeoutMs)
+                            return@memScoped fd
+                        }
+                    } catch (e: Throwable) {
+                        close(fd)
+                        throw e
                     }
-                } catch (e: Throwable) {
                     close(fd)
-                    throw e
                 }
-                close(fd)
+                ai = info.ai_next
             }
-            ai = info.ai_next
+            error("connect failed for $host:$port")
+        } finally {
+            freeaddrinfo(head)
         }
-        error("connect failed for $host:$port")
-    } finally {
-        freeaddrinfo(head)
     }
-}
 
 @OptIn(ExperimentalForeignApi::class)
-private fun disableSigPipe(fd: Int) = memScoped {
-    val one = alloc<IntVar>()
-    one.value = 1
-    check(
-        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, one.ptr, kotlinx.cinterop.sizeOf<IntVar>().convert()) == 0,
-    ) { "SO_NOSIGPIPE failed" }
-}
+private fun disableSigPipe(fd: Int) =
+    memScoped {
+        val one = alloc<IntVar>()
+        one.value = 1
+        check(
+            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, one.ptr, kotlinx.cinterop.sizeOf<IntVar>().convert()) == 0,
+        ) { "SO_NOSIGPIPE failed" }
+    }
 
 @OptIn(ExperimentalForeignApi::class)
-private fun connectWithTimeout(fd: Int, info: addrinfo, timeoutMs: Long): Boolean {
+private fun connectWithTimeout(
+    fd: Int,
+    info: addrinfo,
+    timeoutMs: Long,
+): Boolean {
     setNonBlocking(fd, true)
     val rc = connect(fd, info.ai_addr, info.ai_addrlen)
     val connected = rc == 0 || (posixErrno() == EINPROGRESS && pollConnected(fd, timeoutMs) && socketError(fd) == 0)
@@ -164,7 +174,10 @@ private fun connectWithTimeout(fd: Int, info: addrinfo, timeoutMs: Long): Boolea
 }
 
 @OptIn(ExperimentalForeignApi::class)
-private fun setNonBlocking(fd: Int, enabled: Boolean) {
+private fun setNonBlocking(
+    fd: Int,
+    enabled: Boolean,
+) {
     val flags = fcntl(fd, F_GETFL, 0)
     check(flags != -1) { "fcntl F_GETFL failed" }
     val next = if (enabled) flags or O_NONBLOCK else flags and O_NONBLOCK.inv()
@@ -172,7 +185,10 @@ private fun setNonBlocking(fd: Int, enabled: Boolean) {
 }
 
 @OptIn(ExperimentalForeignApi::class)
-private fun pollConnected(fd: Int, timeoutMs: Long): Boolean {
+private fun pollConnected(
+    fd: Int,
+    timeoutMs: Long,
+): Boolean {
     memScoped {
         val pfd = alloc<pollfd>()
         pfd.fd = fd
@@ -194,18 +210,22 @@ private fun pollConnected(fd: Int, timeoutMs: Long): Boolean {
 }
 
 @OptIn(ExperimentalForeignApi::class)
-private fun socketError(fd: Int): Int = memScoped {
-    val err = alloc<IntVar>()
-    val len = alloc<socklen_tVar>()
-    len.value = kotlinx.cinterop.sizeOf<IntVar>().convert()
-    val rc = getsockopt(fd, SOL_SOCKET, SO_ERROR, err.ptr, len.ptr)
-    if (rc != 0) posixErrno() else err.value
-}
+private fun socketError(fd: Int): Int =
+    memScoped {
+        val err = alloc<IntVar>()
+        val len = alloc<socklen_tVar>()
+        len.value = kotlinx.cinterop.sizeOf<IntVar>().convert()
+        val rc = getsockopt(fd, SOL_SOCKET, SO_ERROR, err.ptr, len.ptr)
+        if (rc != 0) posixErrno() else err.value
+    }
 
 private fun posixErrno(): Int = errno
 
 @OptIn(ExperimentalForeignApi::class)
-private fun applySocketTimeouts(fd: Int, timeoutMs: Long) {
+private fun applySocketTimeouts(
+    fd: Int,
+    timeoutMs: Long,
+) {
     val ms = timeoutMs.coerceAtLeast(1L)
     memScoped {
         val tv = alloc<timeval>()
@@ -217,7 +237,10 @@ private fun applySocketTimeouts(fd: Int, timeoutMs: Long) {
 }
 
 @OptIn(ExperimentalForeignApi::class)
-private fun sendAll(fd: Int, data: ByteArray) {
+private fun sendAll(
+    fd: Int,
+    data: ByteArray,
+) {
     data.usePinned { pinned ->
         var off = 0
         while (off < data.size) {
@@ -235,7 +258,10 @@ private fun recvHttp1(fd: Int): ByteArray {
 }
 
 @OptIn(ExperimentalForeignApi::class)
-private fun recvOnce(fd: Int, buf: ByteArray): ByteArray? {
+private fun recvOnce(
+    fd: Int,
+    buf: ByteArray,
+): ByteArray? {
     buf.usePinned { pinned ->
         while (true) {
             val n = recv(fd, pinned.addressOf(0), buf.size.convert(), 0)
@@ -263,37 +289,40 @@ private suspend fun httpsUrlSession(
     body: ByteArray,
     timeoutMs: Long,
     @Suppress("UNUSED_PARAMETER") decompress: Boolean,
-): HttpResponse = suspendCancellableCoroutine { cont ->
-    val nsUrl = NSURL.URLWithString(url) ?: run {
-        cont.resumeWithException(IllegalArgumentException("bad url $url"))
-        return@suspendCancellableCoroutine
-    }
-    val req = NSMutableURLRequest.requestWithURL(nsUrl)
-    req.setHTTPMethod(method)
-    req.setTimeoutInterval(timeoutMs / 1000.0)
-    for ((k, v) in headers) req.setValue(v, forHTTPHeaderField = k)
-    if (body.isNotEmpty()) {
-        body.usePinned { pinned ->
-            req.setHTTPBody(NSData.create(bytes = pinned.addressOf(0), length = body.size.convert()))
-        }
-    }
-    val task = session.dataTaskWithRequest(req) { data, response, error ->
-        if (error != null) {
-            cont.resumeWithException(Exception(error.localizedDescription))
-            return@dataTaskWithRequest
-        }
-        val http = response as? NSHTTPURLResponse
-        val status = http?.statusCode?.toInt() ?: 0
-        val bytes = data?.toByteArray() ?: ByteArray(0)
-        val hdrs = mutableMapOf<String, String>()
-        val dict = http?.allHeaderFields
-        if (dict != null) {
-            for ((k, v) in dict) {
-                hdrs[k.toString()] = v.toString()
+): HttpResponse =
+    suspendCancellableCoroutine { cont ->
+        val nsUrl =
+            NSURL.URLWithString(url) ?: run {
+                cont.resumeWithException(IllegalArgumentException("bad url $url"))
+                return@suspendCancellableCoroutine
+            }
+        val req = NSMutableURLRequest.requestWithURL(nsUrl)
+        req.setHTTPMethod(method)
+        req.setTimeoutInterval(timeoutMs / 1000.0)
+        for ((k, v) in headers) req.setValue(v, forHTTPHeaderField = k)
+        if (body.isNotEmpty()) {
+            body.usePinned { pinned ->
+                req.setHTTPBody(NSData.create(bytes = pinned.addressOf(0), length = body.size.convert()))
             }
         }
-        cont.resume(HttpResponse(status, bytes, hdrs))
+        val task =
+            session.dataTaskWithRequest(req) { data, response, error ->
+                if (error != null) {
+                    cont.resumeWithException(Exception(error.localizedDescription))
+                    return@dataTaskWithRequest
+                }
+                val http = response as? NSHTTPURLResponse
+                val status = http?.statusCode?.toInt() ?: 0
+                val bytes = data?.toByteArray() ?: ByteArray(0)
+                val hdrs = mutableMapOf<String, String>()
+                val dict = http?.allHeaderFields
+                if (dict != null) {
+                    for ((k, v) in dict) {
+                        hdrs[k.toString()] = v.toString()
+                    }
+                }
+                cont.resume(HttpResponse(status, bytes, hdrs))
+            }
+        cont.invokeOnCancellation { task.cancel() }
+        task.resume()
     }
-    cont.invokeOnCancellation { task.cancel() }
-    task.resume()
-}

@@ -3,7 +3,9 @@ package io.bluewallet.echalote
 /**
  * Curve25519 field + X25519, ported from public-domain TweetNaCl (16×16-bit limbs).
  */
-internal class Gf(val n: LongArray = LongArray(16)) {
+internal class Gf(
+    val n: LongArray = LongArray(16),
+) {
     fun copy(): Gf = Gf(n.copyOf())
 }
 
@@ -17,15 +19,27 @@ internal fun gfCar(o: LongArray) {
     o[0] += c - 1 + 37 * (c - 1)
 }
 
-internal fun gfAdd(o: Gf, a: Gf, b: Gf) {
+internal fun gfAdd(
+    o: Gf,
+    a: Gf,
+    b: Gf,
+) {
     for (i in 0 until 16) o.n[i] = a.n[i] + b.n[i]
 }
 
-internal fun gfSub(o: Gf, a: Gf, b: Gf) {
+internal fun gfSub(
+    o: Gf,
+    a: Gf,
+    b: Gf,
+) {
     for (i in 0 until 16) o.n[i] = a.n[i] - b.n[i]
 }
 
-internal fun gfMul(o: Gf, a: Gf, b: Gf) {
+internal fun gfMul(
+    o: Gf,
+    a: Gf,
+    b: Gf,
+) {
     val t = LongArray(31)
     for (i in 0 until 16) {
         for (j in 0 until 16) t[i + j] += a.n[i] * b.n[j]
@@ -36,9 +50,15 @@ internal fun gfMul(o: Gf, a: Gf, b: Gf) {
     gfCar(o.n)
 }
 
-internal fun gfSqr(o: Gf, a: Gf) = gfMul(o, a, a)
+internal fun gfSqr(
+    o: Gf,
+    a: Gf,
+) = gfMul(o, a, a)
 
-internal fun gfInv(o: Gf, i: Gf) {
+internal fun gfInv(
+    o: Gf,
+    i: Gf,
+) {
     val c = i.copy()
     for (a in 253 downTo 0) {
         gfSqr(c, c)
@@ -47,15 +67,23 @@ internal fun gfInv(o: Gf, i: Gf) {
     for (a in 0 until 16) o.n[a] = c.n[a]
 }
 
-internal fun unpack25519(o: Gf, n: ByteArray) {
+internal fun unpack25519(
+    o: Gf,
+    n: ByteArray,
+) {
     for (i in 0 until 16) o.n[i] = n.u8(2 * i).toLong() + (n.u8(2 * i + 1).toLong() shl 8)
     o.n[15] = o.n[15] and 0x7fff
 }
 
-internal fun pack25519(o: ByteArray, n: Gf) {
+internal fun pack25519(
+    o: ByteArray,
+    n: Gf,
+) {
     val m = Gf()
     val t = n.copy()
-    gfCar(t.n); gfCar(t.n); gfCar(t.n)
+    gfCar(t.n)
+    gfCar(t.n)
+    gfCar(t.n)
     for (j in 0 until 2) {
         m.n[0] = t.n[0] - 0xffed
         for (i in 1 until 15) {
@@ -73,7 +101,11 @@ internal fun pack25519(o: ByteArray, n: Gf) {
     }
 }
 
-internal fun sel25519(p: Gf, q: Gf, b: Int) {
+internal fun sel25519(
+    p: Gf,
+    q: Gf,
+    b: Int,
+) {
     val c = -b.toLong()
     for (i in 0 until 16) {
         val t = c and (p.n[i] xor q.n[i])
@@ -85,13 +117,21 @@ internal fun sel25519(p: Gf, q: Gf, b: Int) {
 private val GF_121665 = Gf(LongArray(16).also { it[0] = 121665 })
 
 internal object X25519 {
-    fun scalarMult(scalar: ByteArray, u: ByteArray): ByteArray {
+    fun scalarMult(
+        scalar: ByteArray,
+        u: ByteArray,
+    ): ByteArray {
         require(scalar.size == 32 && u.size == 32)
         val z = scalar.copyOf()
         z[31] = ((z[31].toInt() and 127) or 64).toByte()
         z[0] = (z[0].toInt() and 248).toByte()
-        val a = Gf(); val b = Gf(); val c = Gf(); val d = Gf()
-        val e = Gf(); val f = Gf(); val x = Gf()
+        val a = Gf()
+        val b = Gf()
+        val c = Gf()
+        val d = Gf()
+        val e = Gf()
+        val f = Gf()
+        val x = Gf()
         unpack25519(x, u)
         for (i in 0 until 16) {
             b.n[i] = x.n[i]

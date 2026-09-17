@@ -34,8 +34,9 @@ internal actual fun fillSecureRandom(bytes: ByteArray) {
 }
 
 @OptIn(ExperimentalForeignApi::class)
-internal actual fun currentEpochMillis(): Long = memScoped {
-    val tv = alloc<timeval>()
-    gettimeofday(tv.ptr, null)
-    tv.tv_sec * 1000L + tv.tv_usec / 1000L
-}
+internal actual fun currentEpochMillis(): Long =
+    memScoped {
+        val tv = alloc<timeval>()
+        gettimeofday(tv.ptr, null)
+        tv.tv_sec * 1000L + tv.tv_usec / 1000L
+    }

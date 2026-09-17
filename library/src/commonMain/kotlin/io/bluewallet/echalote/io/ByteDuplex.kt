@@ -7,7 +7,9 @@ import kotlinx.coroutines.sync.withLock
 interface ByteDuplex {
     /** Return 1..n bytes, or an empty array at EOF. */
     suspend fun read(n: Int): ByteArray
+
     suspend fun write(bytes: ByteArray)
+
     fun close()
 }
 
@@ -28,7 +30,10 @@ fun pairedByteDuplexes(): Pair<ByteDuplex, ByteDuplex> {
     val leftState = DuplexSide()
     val rightState = DuplexSide()
 
-    fun take(state: DuplexSide, n: Int): ByteArray? {
+    fun take(
+        state: DuplexSide,
+        n: Int,
+    ): ByteArray? {
         val chunk = state.inbox.firstOrNull() ?: return null
         return if (chunk.size <= n) {
             state.inbox.removeFirst()
@@ -57,27 +62,29 @@ fun pairedByteDuplexes(): Pair<ByteDuplex, ByteDuplex> {
         }
     }
 
-    fun make(state: DuplexSide, peer: DuplexSide): ByteDuplex =
+    fun make(
+        state: DuplexSide,
+        peer: DuplexSide,
+    ): ByteDuplex =
         object : ByteDuplex {
             override suspend fun read(n: Int): ByteArray {
-                val deferred: CompletableDeferred<ByteArray>? = state.mutex.withLock {
-                    if (state.closed) return ByteArray(0)
-                    val chunk = take(state, n)
-                    if (chunk != null) return chunk
-                    if (state.peerClosed) return ByteArray(0)
-                    check(state.waiter == null) { "concurrent reads are not supported" }
-                    val waiter = Waiter(n, CompletableDeferred())
-                    state.waiter = waiter
-                    waiter.deferred
-                }
+                val deferred: CompletableDeferred<ByteArray>? =
+                    state.mutex.withLock {
+                        if (state.closed) return ByteArray(0)
+                        val chunk = take(state, n)
+                        if (chunk != null) return chunk
+                        if (state.peerClosed) return ByteArray(0)
+                        check(state.waiter == null) { "concurrent reads are not supported" }
+                        val waiter = Waiter(n, CompletableDeferred())
+                        state.waiter = waiter
+                        waiter.deferred
+                    }
                 return deferred?.await() ?: ByteArray(0)
             }
 
             override suspend fun write(bytes: ByteArray) {
                 peer.mutex.withLock {
-                    if (state.closed || peer.closed) {
-                        throw IllegalStateException("cannot write to closed duplex")
-                    }
+                    check(!state.closed && !peer.closed) { "cannot write to closed duplex" }
                     peer.inbox.addLast(bytes.copyOf())
                     wake(peer)
                 }
@@ -100,14 +107,17 @@ internal suspend fun ByteDuplex.readExact(n: Int): ByteArray {
     var off = 0
     while (off < n) {
         val chunk = read(n - off)
-        if (chunk.isEmpty()) throw IllegalStateException("unexpected EOF")
+        check(chunk.isNotEmpty()) { "unexpected EOF" }
         chunk.copyInto(out, off)
         off += chunk.size
     }
     return out
 }
 
-internal suspend fun pipeDuplex(src: ByteDuplex, dst: ByteDuplex) {
+internal suspend fun pipeDuplex(
+    src: ByteDuplex,
+    dst: ByteDuplex,
+) {
     try {
         while (true) {
             val chunk = src.read(16 * 1024)
@@ -173,16 +183,17 @@ class ChannelDuplex : ByteDuplex {
     }
 
     override suspend fun read(n: Int): ByteArray {
-        val deferred: CompletableDeferred<ByteArray>? = mutex.withLock {
-            if (closed && inbox.isEmpty()) return ByteArray(0)
-            val chunk = take(n)
-            if (chunk != null) return chunk
-            if (closed) return ByteArray(0)
-            check(waiter == null) { "concurrent reads are not supported" }
-            val w = Waiter(n, CompletableDeferred())
-            waiter = w
-            w.deferred
-        }
+        val deferred: CompletableDeferred<ByteArray>? =
+            mutex.withLock {
+                if (closed && inbox.isEmpty()) return ByteArray(0)
+                val chunk = take(n)
+                if (chunk != null) return chunk
+                if (closed) return ByteArray(0)
+                check(waiter == null) { "concurrent reads are not supported" }
+                val w = Waiter(n, CompletableDeferred())
+                waiter = w
+                w.deferred
+            }
         return deferred?.await() ?: ByteArray(0)
     }
 

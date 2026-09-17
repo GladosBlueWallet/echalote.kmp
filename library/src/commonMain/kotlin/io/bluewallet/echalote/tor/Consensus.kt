@@ -104,15 +104,17 @@ object ConsensusParser {
                             }
                             val parts = fl.split(" ")
                             i++
-                            val sig = readBlock(lines, i, "-----BEGIN SIGNATURE-----", "-----END SIGNATURE-----")
-                                ?: throw IllegalArgumentException("Missing BEGIN SIGNATURE")
+                            val sig =
+                                readBlock(lines, i, "-----BEGIN SIGNATURE-----", "-----END SIGNATURE-----")
+                                    ?: throw IllegalArgumentException("Missing BEGIN SIGNATURE")
                             i = sig.second
-                            signatures += ConsensusSignature(
-                                algorithm = parts.getOrNull(1) ?: "",
-                                identity = parts.getOrNull(2) ?: "",
-                                signingKeyDigest = parts.getOrNull(3) ?: "",
-                                signature = sig.first,
-                            )
+                            signatures +=
+                                ConsensusSignature(
+                                    algorithm = parts.getOrNull(1) ?: "",
+                                    identity = parts.getOrNull(2) ?: "",
+                                    signingKeyDigest = parts.getOrNull(3) ?: "",
+                                    signature = sig.first,
+                                )
                         }
                         i++
                     }
@@ -146,35 +148,38 @@ object ConsensusParser {
                             sl.startsWith("s ") -> flags = sl.split(" ").drop(1)
                             sl.startsWith("v ") -> ver = sl.substring(2)
                             sl.startsWith("pr ") -> {
-                                entries = sl.split(" ").drop(1).associate {
-                                    val eq = it.indexOf('=')
-                                    if (eq < 0) it to "" else it.substring(0, eq) to it.substring(eq + 1)
-                                }
+                                entries =
+                                    sl.split(" ").drop(1).associate {
+                                        val eq = it.indexOf('=')
+                                        if (eq < 0) it to "" else it.substring(0, eq) to it.substring(eq + 1)
+                                    }
                             }
                             sl.startsWith("w ") -> {
-                                bandwidth = sl.split(" ").drop(1).associate {
-                                    val eq = it.indexOf('=')
-                                    if (eq < 0) it to "" else it.substring(0, eq) to it.substring(eq + 1)
-                                }
+                                bandwidth =
+                                    sl.split(" ").drop(1).associate {
+                                        val eq = it.indexOf('=')
+                                        if (eq < 0) it to "" else it.substring(0, eq) to it.substring(eq + 1)
+                                    }
                             }
                         }
                         i++
                     }
-                    microdescs += MicrodescHead(
-                        nickname = nickname,
-                        identity = identity,
-                        date = date,
-                        hour = hour,
-                        hostname = hostname,
-                        orport = orport,
-                        dirport = dirport,
-                        ipv6 = ipv6,
-                        microdesc = microdesc ?: throw IllegalArgumentException("Missing microdesc"),
-                        flags = flags ?: throw IllegalArgumentException("Missing flags"),
-                        version = ver,
-                        entries = entries ?: throw IllegalArgumentException("Missing entries"),
-                        bandwidth = bandwidth ?: throw IllegalArgumentException("Missing bandwidth"),
-                    )
+                    microdescs +=
+                        MicrodescHead(
+                            nickname = nickname,
+                            identity = identity,
+                            date = date,
+                            hour = hour,
+                            hostname = hostname,
+                            orport = orport,
+                            dirport = dirport,
+                            ipv6 = ipv6,
+                            microdesc = microdesc ?: throw IllegalArgumentException("Missing microdesc"),
+                            flags = flags ?: throw IllegalArgumentException("Missing flags"),
+                            version = ver,
+                            entries = entries ?: throw IllegalArgumentException("Missing entries"),
+                            bandwidth = bandwidth ?: throw IllegalArgumentException("Missing bandwidth"),
+                        )
                 }
             }
             i++
@@ -199,8 +204,9 @@ object ConsensusParser {
         while (i < lines.size) {
             if (lines[i] == "onion-key") {
                 i++
-                val onionKey = readBlock(lines, i, "-----BEGIN RSA PUBLIC KEY-----", "-----END RSA PUBLIC KEY-----")
-                    ?: throw IllegalArgumentException("Missing BEGIN RSA PUBLIC KEY")
+                val onionKey =
+                    readBlock(lines, i, "-----BEGIN RSA PUBLIC KEY-----", "-----END RSA PUBLIC KEY-----")
+                        ?: throw IllegalArgumentException("Missing BEGIN RSA PUBLIC KEY")
                 i = onionKey.second
                 var ntor: String? = null
                 var idEd: String? = null
@@ -216,18 +222,24 @@ object ConsensusParser {
                     }
                     i++
                 }
-                items += MicrodescBody(
-                    onionKey = onionKey.first,
-                    ntorOnionKey = ntor ?: throw IllegalArgumentException("Missing ntor-onion-key"),
-                    idEd25519 = idEd ?: throw IllegalArgumentException("Missing id ed25519"),
-                )
+                items +=
+                    MicrodescBody(
+                        onionKey = onionKey.first,
+                        ntorOnionKey = ntor ?: throw IllegalArgumentException("Missing ntor-onion-key"),
+                        idEd25519 = idEd ?: throw IllegalArgumentException("Missing id ed25519"),
+                    )
             }
             i++
         }
         return items
     }
 
-    private fun readBlock(lines: List<String>, start: Int, begin: String, end: String): Pair<String, Int>? {
+    private fun readBlock(
+        lines: List<String>,
+        start: Int,
+        begin: String,
+        end: String,
+    ): Pair<String, Int>? {
         var i = start
         if (i >= lines.size || lines[i] != begin) return null
         val text = StringBuilder()

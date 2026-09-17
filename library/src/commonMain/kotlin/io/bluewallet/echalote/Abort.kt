@@ -36,13 +36,9 @@ class Abort {
     }
 
     companion object {
-        fun timeout(ms: Long): Abort {
-            val a = Abort()
-            // Caller should abort via coroutine delay; this helper is for tests that
-            // construct a signal they abort themselves.
-            a.also { it.hashCode() }
-            return a
-        }
+        fun timeout(
+            @Suppress("UnusedParameter") ms: Long,
+        ): Abort = Abort()
 
         fun any(vararg signals: Abort): Abort {
             val out = Abort()
@@ -56,9 +52,15 @@ class Abort {
     }
 }
 
-open class CancellationException(message: String, cause: Throwable? = null) : Exception(message, cause)
+open class CancellationException(
+    message: String,
+    cause: Throwable? = null,
+) : Exception(message, cause)
 
-internal suspend fun <T> withAbort(abort: Abort?, block: suspend () -> T): T {
+internal suspend fun <T> withAbort(
+    abort: Abort?,
+    block: suspend () -> T,
+): T {
     abort?.throwIfAborted()
     if (abort == null) return block()
     return coroutineScope {
@@ -73,14 +75,19 @@ internal suspend fun <T> withAbort(abort: Abort?, block: suspend () -> T): T {
     }
 }
 
-internal suspend fun <T> withAbortTimeout(ms: Long, parent: Abort?, block: suspend (Abort) -> T): T {
+internal suspend fun <T> withAbortTimeout(
+    ms: Long,
+    parent: Abort?,
+    block: suspend (Abort) -> T,
+): T {
     val timeout = Abort()
     val linked = if (parent != null) Abort.any(parent, timeout) else timeout
     return coroutineScope {
-        val timer = launch {
-            delay(ms)
-            timeout.abort(Exception("The operation timed out."))
-        }
+        val timer =
+            launch {
+                delay(ms)
+                timeout.abort(Exception("The operation timed out."))
+            }
         try {
             withAbort(linked) { block(linked) }
         } finally {

@@ -6,36 +6,151 @@ package io.bluewallet.echalote
 internal object Ed25519 {
     private val gf0 = Gf()
     private val gf1 = Gf(LongArray(16).also { it[0] = 1 })
-    private val D = gfOf(
-        0x78a3, 0x1359, 0x4dca, 0x75eb, 0xd8ab, 0x4141, 0x0a4d, 0x0070,
-        0xe898, 0x7779, 0x4079, 0x8cc7, 0xfe73, 0x2b6f, 0x6cee, 0x5203,
-    )
-    private val D2 = gfOf(
-        0xf159, 0x26b2, 0x9b94, 0xebd6, 0xb156, 0x8283, 0x149a, 0x00e0,
-        0xd130, 0xeef3, 0x80f2, 0x198e, 0xfce7, 0x56df, 0xd9dc, 0x2406,
-    )
-    private val X = gfOf(
-        0xd51a, 0x8f25, 0x2d60, 0xc956, 0xa7b2, 0x9525, 0xc760, 0x692c,
-        0xdc5c, 0xfdd6, 0xe231, 0xc0a4, 0x53fe, 0xcd6e, 0x36d3, 0x2169,
-    )
-    private val Y = gfOf(
-        0x6658, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666,
-        0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666,
-    )
-    private val I = gfOf(
-        0xa0b0, 0x4a0e, 0x1b27, 0xc4ee, 0xe478, 0xad2f, 0x1806, 0x2f43,
-        0xd7a7, 0x3dfb, 0x0099, 0x2b4d, 0xdf0b, 0x4fc1, 0x2480, 0x2b83,
-    )
-    private val L = longArrayOf(
-        0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
-    )
+    private val D =
+        gfOf(
+            0x78a3,
+            0x1359,
+            0x4dca,
+            0x75eb,
+            0xd8ab,
+            0x4141,
+            0x0a4d,
+            0x0070,
+            0xe898,
+            0x7779,
+            0x4079,
+            0x8cc7,
+            0xfe73,
+            0x2b6f,
+            0x6cee,
+            0x5203,
+        )
+    private val D2 =
+        gfOf(
+            0xf159,
+            0x26b2,
+            0x9b94,
+            0xebd6,
+            0xb156,
+            0x8283,
+            0x149a,
+            0x00e0,
+            0xd130,
+            0xeef3,
+            0x80f2,
+            0x198e,
+            0xfce7,
+            0x56df,
+            0xd9dc,
+            0x2406,
+        )
+    private val X =
+        gfOf(
+            0xd51a,
+            0x8f25,
+            0x2d60,
+            0xc956,
+            0xa7b2,
+            0x9525,
+            0xc760,
+            0x692c,
+            0xdc5c,
+            0xfdd6,
+            0xe231,
+            0xc0a4,
+            0x53fe,
+            0xcd6e,
+            0x36d3,
+            0x2169,
+        )
+    private val Y =
+        gfOf(
+            0x6658,
+            0x6666,
+            0x6666,
+            0x6666,
+            0x6666,
+            0x6666,
+            0x6666,
+            0x6666,
+            0x6666,
+            0x6666,
+            0x6666,
+            0x6666,
+            0x6666,
+            0x6666,
+            0x6666,
+            0x6666,
+        )
+    private val I =
+        gfOf(
+            0xa0b0,
+            0x4a0e,
+            0x1b27,
+            0xc4ee,
+            0xe478,
+            0xad2f,
+            0x1806,
+            0x2f43,
+            0xd7a7,
+            0x3dfb,
+            0x0099,
+            0x2b4d,
+            0xdf0b,
+            0x4fc1,
+            0x2480,
+            0x2b83,
+        )
+    private val L =
+        longArrayOf(
+            0xed,
+            0xd3,
+            0xf5,
+            0x5c,
+            0x1a,
+            0x63,
+            0x12,
+            0x58,
+            0xd6,
+            0x9c,
+            0xf7,
+            0xa2,
+            0xde,
+            0xf9,
+            0xde,
+            0x14,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0x10,
+        )
 
-    private class Pt(val x: Gf = Gf(), val y: Gf = Gf(), val z: Gf = Gf(), val t: Gf = Gf()) {
+    private class Pt(
+        val x: Gf = Gf(),
+        val y: Gf = Gf(),
+        val z: Gf = Gf(),
+        val t: Gf = Gf(),
+    ) {
         fun arr() = arrayOf(x, y, z, t)
     }
 
-    fun verify(publicKey: ByteArray, message: ByteArray, signature: ByteArray): Boolean {
+    fun verify(
+        publicKey: ByteArray,
+        message: ByteArray,
+        signature: ByteArray,
+    ): Boolean {
         if (publicKey.size != 32 || signature.size != 64) return false
         val sm = concatBytes(signature, message)
         val m = sm.copyOf()
@@ -44,11 +159,17 @@ internal object Ed25519 {
 
     private fun gfOf(vararg limbs: Long) = Gf(LongArray(16) { limbs[it] })
 
-    private fun set25519(r: Gf, a: Gf) {
+    private fun set25519(
+        r: Gf,
+        a: Gf,
+    ) {
         a.n.copyInto(r.n)
     }
 
-    private fun pow2523(o: Gf, i: Gf) {
+    private fun pow2523(
+        o: Gf,
+        i: Gf,
+    ) {
         val c = i.copy()
         for (a in 250 downTo 0) {
             gfSqr(c, c)
@@ -57,7 +178,10 @@ internal object Ed25519 {
         c.n.copyInto(o.n)
     }
 
-    private fun neq25519(a: Gf, b: Gf): Boolean {
+    private fun neq25519(
+        a: Gf,
+        b: Gf,
+    ): Boolean {
         val c = ByteArray(32)
         val d = ByteArray(32)
         pack25519(c, a)
@@ -71,9 +195,19 @@ internal object Ed25519 {
         return d[0].toInt() and 1
     }
 
-    private fun add(p: Pt, q: Pt) {
-        val a = Gf(); val b = Gf(); val c = Gf(); val d = Gf()
-        val e = Gf(); val f = Gf(); val g = Gf(); val h = Gf(); val t = Gf()
+    private fun add(
+        p: Pt,
+        q: Pt,
+    ) {
+        val a = Gf()
+        val b = Gf()
+        val c = Gf()
+        val d = Gf()
+        val e = Gf()
+        val f = Gf()
+        val g = Gf()
+        val h = Gf()
+        val t = Gf()
         gfSub(a, p.y, p.x)
         gfSub(t, q.y, q.x)
         gfMul(a, a, t)
@@ -94,15 +228,24 @@ internal object Ed25519 {
         gfMul(p.t, e, h)
     }
 
-    private fun cswap(p: Pt, q: Pt, b: Int) {
+    private fun cswap(
+        p: Pt,
+        q: Pt,
+        b: Int,
+    ) {
         sel25519(p.x, q.x, b)
         sel25519(p.y, q.y, b)
         sel25519(p.z, q.z, b)
         sel25519(p.t, q.t, b)
     }
 
-    private fun pack(r: ByteArray, p: Pt) {
-        val tx = Gf(); val ty = Gf(); val zi = Gf()
+    private fun pack(
+        r: ByteArray,
+        p: Pt,
+    ) {
+        val tx = Gf()
+        val ty = Gf()
+        val zi = Gf()
         gfInv(zi, p.z)
         gfMul(tx, p.x, zi)
         gfMul(ty, p.y, zi)
@@ -110,7 +253,11 @@ internal object Ed25519 {
         r[31] = (r[31].toInt() xor (par25519(tx) shl 7)).toByte()
     }
 
-    private fun scalarmult(p: Pt, q: Pt, s: ByteArray) {
+    private fun scalarmult(
+        p: Pt,
+        q: Pt,
+        s: ByteArray,
+    ) {
         set25519(p.x, gf0)
         set25519(p.y, gf1)
         set25519(p.z, gf1)
@@ -124,7 +271,10 @@ internal object Ed25519 {
         }
     }
 
-    private fun scalarbase(p: Pt, s: ByteArray) {
+    private fun scalarbase(
+        p: Pt,
+        s: ByteArray,
+    ) {
         val q = Pt()
         set25519(q.x, X)
         set25519(q.y, Y)
@@ -133,7 +283,10 @@ internal object Ed25519 {
         scalarmult(p, q, s)
     }
 
-    private fun modL(r: ByteArray, x: LongArray) {
+    private fun modL(
+        r: ByteArray,
+        x: LongArray,
+    ) {
         var carry: Long
         for (i in 63 downTo 32) {
             carry = 0
@@ -167,9 +320,17 @@ internal object Ed25519 {
         modL(r, x)
     }
 
-    private fun unpackneg(r: Pt, p: ByteArray): Boolean {
-        val t = Gf(); val chk = Gf(); val num = Gf()
-        val den = Gf(); val den2 = Gf(); val den4 = Gf(); val den6 = Gf()
+    private fun unpackneg(
+        r: Pt,
+        p: ByteArray,
+    ): Boolean {
+        val t = Gf()
+        val chk = Gf()
+        val num = Gf()
+        val den = Gf()
+        val den2 = Gf()
+        val den4 = Gf()
+        val den6 = Gf()
         set25519(r.z, gf1)
         unpack25519(r.y, p)
         gfSqr(num, r.y)
@@ -197,7 +358,12 @@ internal object Ed25519 {
         return true
     }
 
-    private fun cryptoSignOpen(m: ByteArray, sm: ByteArray, n: Int, pk: ByteArray): Boolean {
+    private fun cryptoSignOpen(
+        m: ByteArray,
+        sm: ByteArray,
+        n: Int,
+        pk: ByteArray,
+    ): Boolean {
         if (n < 64) return false
         val q = Pt()
         if (!unpackneg(q, pk)) return false
