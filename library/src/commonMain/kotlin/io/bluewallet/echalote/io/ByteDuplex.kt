@@ -65,10 +65,9 @@ fun pairedByteDuplexes(): Pair<ByteDuplex, ByteDuplex> {
             override suspend fun read(n: Int): ByteArray {
                 val deferred: CompletableDeferred<ByteArray>? =
                     state.mutex.withLock {
-                        if (state.closed) return ByteArray(0)
                         val chunk = take(state, n)
                         if (chunk != null) return chunk
-                        if (state.peerClosed) return ByteArray(0)
+                        if (state.closed || state.peerClosed) return ByteArray(0)
                         check(state.waiter == null) { "concurrent reads are not supported" }
                         val waiter = Waiter(n, CompletableDeferred())
                         state.waiter = waiter

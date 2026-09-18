@@ -2,6 +2,8 @@ package io.bluewallet.echalote
 
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.CancellationException as CoroutineCancellation
 
 internal const val TOR_BROWSER_USER_AGENT =
@@ -11,6 +13,8 @@ data class StreamFetchInit(
     val stream: ByteDuplex,
     val abort: Abort? = null,
     val headers: Map<String, String> = emptyMap(),
+    val method: String = "GET",
+    val body: ByteArray = ByteArray(0),
 )
 
 data class StreamResponse(
@@ -76,18 +80,24 @@ suspend fun streamFetch(
     val url = parseUrl(input)
     val headers = LinkedHashMap<String, String>()
     if (init.headers.keys.none { it.equals("Host", true) }) headers["Host"] = url.host
-    if (init.headers.keys.none { it.equals("Connection", true) }) headers["Connection"] = "close"
+    if (init.headers.keys.none { it.equals("Connection", true) }) headers["Connection"] = "keep-alive"
     if (init.headers.keys.none { it.equals("User-Agent", true) }) {
         headers["User-Agent"] = TOR_BROWSER_USER_AGENT
     }
     headers.putAll(init.headers)
+    val method = init.method.ifBlank { "GET" }
+    val hasLength = headers.keys.any { it.equals("Content-Length", true) }
+    val needsLength = init.body.isNotEmpty() || method.uppercase() in setOf("POST", "PUT", "PATCH")
+    if (!hasLength && needsLength) {
+        headers["Content-Length"] = init.body.size.toString()
+    }
     val head =
         buildString {
-            append("GET ${url.target} HTTP/1.1\r\n")
+            append("$method ${url.target} HTTP/1.1\r\n")
             for ((k, v) in headers) append("$k: $v\r\n")
             append("\r\n")
         }
-    init.stream.write(head.encodeToByteArray())
+    init.stream.write(concatBytes(head.encodeToByteArray(), init.body))
     // Do not close the duplex here. A full close tears down TLS/Tor reads.
     // The TypeScript client only half-closes the write side; this ByteDuplex
     // has no half-close, and the response is framed by length/chunked.
@@ -126,19 +136,176 @@ suspend fun streamFetch(
 private val CRLF = "\r\n".encodeToByteArray()
 private val CRLFCRLF = "\r\n\r\n".encodeToByteArray()
 
+internal data class HttpsSession(
+    val plaintext: ByteDuplex,
+    val close: () -> Unit,
+)
+
+internal var httpsSessionFactory: (suspend (String, Int, Abort?) -> HttpsSession)? = null
+
+private val httpsLock = Mutex()
+private val httpsSessions = LinkedHashMap<Pair<String, Int>, HttpsSession>()
+
+internal suspend fun resetHttpsSessions() {
+    resetTlsSessionCache()
+    val snapshot =
+        httpsLock.withLock {
+            val values = httpsSessions.values.toList()
+            httpsSessions.clear()
+            values
+        }
+    for (session in snapshot) {
+        try {
+            session.close()
+        } catch (_: Throwable) {
+        }
+    }
+}
+
+suspend fun httpsFetch(
+    url: String,
+    abort: Abort? = null,
+    method: String = "GET",
+    headers: Map<String, String> = emptyMap(),
+    body: ByteArray = ByteArray(0),
+): StreamResponse {
+    val parsed = parseUrl(url)
+    val key = parsed.host.lowercase() to parsed.port
+    var retried = false
+    var last: Throwable? = null
+    while (true) {
+        val session = obtainHttpsSession(key, parsed.host, parsed.port, abort)
+        val first =
+            runCatching {
+                streamFetch(url, StreamFetchInit(session.plaintext, abort, headers, method, body))
+            }
+        keptAlive(key, first)?.let { return it }
+        last = first.exceptionOrNull()
+        val stop =
+            last is CoroutineCancellation ||
+                abort?.aborted == true ||
+                last?.message?.contains("closed duplex") == true
+        if (!stop) {
+            val second =
+                runCatching {
+                    streamFetch(url, StreamFetchInit(session.plaintext, abort, headers, method, body))
+                }
+            keptAlive(key, second)?.let { return it }
+            last = second.exceptionOrNull()
+        }
+        evictHttpsSession(key)
+        forgetDefaultCircuit(parsed.host, parsed.port)
+        if (last is CoroutineCancellation || retried || abort?.aborted == true) break
+        retried = true
+    }
+    throw last ?: Exception("https fetch failed")
+}
+
+private fun keepsAlive(res: StreamResponse): Boolean {
+    val conn =
+        res.headers.entries
+            .firstOrNull { it.key.equals("Connection", true) }
+            ?.value
+    return conn?.contains("keep-alive", ignoreCase = true) == true
+}
+
+private suspend fun keptAlive(
+    key: Pair<String, Int>,
+    result: Result<StreamResponse>,
+): StreamResponse? {
+    val res = result.getOrNull() ?: return null
+    if (!keepsAlive(res)) evictHttpsSession(key)
+    return res
+}
+
+private suspend fun obtainHttpsSession(
+    key: Pair<String, Int>,
+    host: String,
+    port: Int,
+    abort: Abort?,
+): HttpsSession {
+    httpsLock.withLock { httpsSessions[key] }?.let {
+        println("echalote.fetch $host:$port reuse=true")
+        return it
+    }
+    println("echalote.fetch $host:$port reuse=false")
+    val opened = (httpsSessionFactory ?: ::openDefaultHttpsSession).invoke(host, port, abort)
+    return httpsLock.withLock {
+        val existing = httpsSessions[key]
+        if (existing != null) {
+            try {
+                opened.close()
+            } catch (_: Throwable) {
+            }
+            existing
+        } else {
+            httpsSessions[key] = opened
+            opened
+        }
+    }
+}
+
+private suspend fun evictHttpsSession(key: Pair<String, Int>) {
+    val session = httpsLock.withLock { httpsSessions.remove(key) } ?: return
+    try {
+        session.close()
+    } catch (_: Throwable) {
+    }
+}
+
+private suspend fun openDefaultHttpsSession(
+    host: String,
+    port: Int,
+    abort: Abort?,
+): HttpsSession {
+    val tcp = defaultExitDialer().dial(host, port, abort)
+    val tls =
+        runCatching { wrapTls(tcp.outer, host, abort) }.getOrElse { err ->
+            try {
+                tcp.close()
+            } catch (_: Throwable) {
+            }
+            forgetDefaultCircuit(host, port)
+            throw err
+        }
+    return HttpsSession(tls) {
+        try {
+            tls.close()
+        } catch (_: Throwable) {
+        }
+        try {
+            tcp.close()
+        } catch (_: Throwable) {
+        }
+    }
+}
+
 private data class ParsedHttpUrl(
     val host: String,
+    val port: Int,
     val target: String,
 )
 
 private fun parseUrl(input: String): ParsedHttpUrl {
     val s = input
     val schemeEnd = s.indexOf("://")
+    val scheme = if (schemeEnd >= 0) s.substring(0, schemeEnd).lowercase() else "https"
     val rest = if (schemeEnd >= 0) s.substring(schemeEnd + 3) else s
     val slash = rest.indexOf('/')
     val hostPort = if (slash < 0) rest else rest.substring(0, slash)
     val path = if (slash < 0) "/" else rest.substring(slash)
-    return ParsedHttpUrl(hostPort, path)
+    val defaultPort = if (scheme == "http") 80 else 443
+    val split = hostPort.lastIndexOf(':')
+    val host: String
+    val port: Int
+    if (split > 0 && !hostPort.startsWith("[")) {
+        host = hostPort.substring(0, split)
+        port = hostPort.substring(split + 1).toIntOrNull() ?: defaultPort
+    } else {
+        host = hostPort.trimStart('[').trimEnd(']')
+        port = defaultPort
+    }
+    return ParsedHttpUrl(host, port, path)
 }
 
 private class HttpByteReader(

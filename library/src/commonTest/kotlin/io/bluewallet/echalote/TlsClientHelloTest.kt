@@ -34,6 +34,22 @@ class TlsClientHelloTest {
         }
 
     @Test
+    fun wrapTls_timesOutIfServerSilent() =
+        runTest {
+            val (pub, priv) = pairedByteDuplexes()
+            try {
+                val ex =
+                    kotlin.test.assertFails {
+                        wrapTls(pub, "example.com", Abort())
+                    }
+                assertTrue(ex.message?.contains("timed out", ignoreCase = true) == true)
+            } finally {
+                pub.close()
+                priv.close()
+            }
+        }
+
+    @Test
     fun close_notify_is_not_a_tls_pump_error() {
         assertNull(tlsPumpError(TlsCloseNotify()))
         val other = TlsAlertError("TLS alert level=2 desc=40")

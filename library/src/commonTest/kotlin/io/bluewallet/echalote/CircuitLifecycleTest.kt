@@ -24,6 +24,18 @@ class CircuitLifecycleTest {
     }
 
     @Test
+    fun clientStreamIdsStayOdd() {
+        var id = 0
+        val seen =
+            (1..8).map {
+                id = nextClientStreamId(id)
+                id
+            }
+        assertEquals(listOf(1, 3, 5, 7, 9, 11, 13, 15), seen)
+        assertTrue(seen.all { it % 2 == 1 })
+    }
+
+    @Test
     fun destroyIsIdempotent() {
         val tor = SecretTorClientDuplex()
         try {
