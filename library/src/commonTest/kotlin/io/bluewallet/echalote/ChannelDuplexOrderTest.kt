@@ -42,3 +42,15 @@ class ChannelDuplexOrderTest {
             assertEquals("hello", pending.await().decodeToString())
         }
 }
+
+class PairedByteDuplexTest {
+    @Test
+    fun close_does_not_drop_queued_bytes() =
+        kotlinx.coroutines.test.runTest {
+            val (left, right) = pairedByteDuplexes()
+            right.write("hello".encodeToByteArray())
+            left.close()
+            assertEquals("hello", left.read(16).decodeToString())
+            assertEquals(0, left.read(16).size)
+        }
+}

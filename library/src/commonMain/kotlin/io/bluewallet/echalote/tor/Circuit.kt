@@ -3,6 +3,8 @@ package io.bluewallet.echalote
 open class Circuit(
     val id: Int,
 ) {
+    open val isClosed: Boolean get() = false
+
     open suspend fun close() {}
 
     open suspend fun extendOrThrow(
@@ -21,6 +23,8 @@ open class Circuit(
 internal class LiveCircuit(
     internal val secret: SecretCircuit,
 ) : Circuit(secret.id) {
+    override val isClosed: Boolean get() = secret.closed != null
+
     override suspend fun close() = secret.close()
 
     override suspend fun extendOrThrow(
@@ -36,13 +40,19 @@ internal class LiveCircuit(
     ): TorStreamDuplex = secret.openOrThrow(hostname, port, wait, abort)
 }
 
+internal fun nextClientStreamId(previous: Int): Int {
+    val next = if (previous <= 0) 1 else previous + 2
+    if (next > 0xffff) error("tor stream id space exhausted")
+    return next
+}
+
 internal class SecretCircuit(
     val id: Int,
     val tor: SecretTorClientDuplex,
 ) {
     val targets = ArrayList<Target>()
     val streams = LinkedHashMap<Int, SecretTorStreamDuplex>()
-    private var nextStreamId = 1
+    private var lastStreamId = 0
     var closed: Any? = null
 
     fun onCloseOrError(reason: Any?) {
@@ -84,8 +94,7 @@ internal class SecretCircuit(
         val reqBytes = ByteArray(request.size())
         request.write(Cursor(reqBytes))
         val extend = extend2Payload(2, links, reqBytes)
-        val payload = encodeRelayPayload(RelayCmd.EXTEND2, 0, extend, targets, early = true)
-        tor.send(writeCell(id, CellCmd.RELAY_EARLY, payload))
+        tor.sendRelay(this, RelayCmd.EXTEND2, 0, extend, early = true)
         val respBytes = tor.relayExtended2.wait(abort) { it.first === this }.second
         val response = NtorResponse.read(Cursor(respBytes))
         val sharedXy = X25519.scalarMult(secret, response.publicY)
@@ -118,11 +127,11 @@ internal class SecretCircuit(
         abort: Abort? = null,
     ): TorStreamDuplex {
         if (closed != null) throw (closed as? Throwable) ?: DestroyedError(0)
-        val stream = SecretTorStreamDuplex("external", nextStreamId++, this)
+        lastStreamId = nextClientStreamId(lastStreamId)
+        val stream = SecretTorStreamDuplex("external", lastStreamId, this)
         streams[stream.id] = stream
         val begin = beginPayload("$hostname:$port", beginFlagsPreferred())
-        val payload = encodeRelayPayload(RelayCmd.BEGIN, stream.id, begin, targets, early = false)
-        tor.send(writeCell(id, CellCmd.RELAY, payload))
+        tor.sendRelay(this, RelayCmd.BEGIN, stream.id, begin)
         if (wait) stream.waitConnected(abort)
         return stream.asPublic {}
     }

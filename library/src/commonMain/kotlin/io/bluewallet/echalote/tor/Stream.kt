@@ -17,15 +17,7 @@ internal class SecretTorStreamDuplex(
     init {
         duplex.onWrite = { bytes ->
             for (chunk in Cursor(bytes).split(RELAY_DATA_LEN)) {
-                val payload =
-                    encodeRelayPayload(
-                        RelayCmd.DATA,
-                        id,
-                        chunk,
-                        circuit.targets,
-                        early = false,
-                    )
-                circuit.tor.send(writeCell(circuit.id, CellCmd.RELAY, payload))
+                circuit.tor.sendRelay(circuit, RelayCmd.DATA, id, chunk)
                 packageWindow--
             }
         }
@@ -34,8 +26,7 @@ internal class SecretTorStreamDuplex(
                 val end = byteArrayOf(6)
                 circuit.tor.scope.launch {
                     try {
-                        val payload = encodeRelayPayload(RelayCmd.END, id, end, circuit.targets, early = false)
-                        circuit.tor.send(writeCell(circuit.id, CellCmd.RELAY, payload))
+                        circuit.tor.sendRelay(circuit, RelayCmd.END, id, end)
                     } catch (_: Throwable) {
                     }
                 }
@@ -76,17 +67,9 @@ internal class SecretTorStreamDuplex(
         delivery--
         if (delivery == 450) {
             delivery = 500
-            val payload =
-                encodeRelayPayload(
-                    RelayCmd.SENDME,
-                    id,
-                    ByteArray(0),
-                    circuit.targets,
-                    early = false,
-                )
             circuit.tor.scope.launch {
                 try {
-                    circuit.tor.send(writeCell(circuit.id, CellCmd.RELAY, payload))
+                    circuit.tor.sendRelay(circuit, RelayCmd.SENDME, id, ByteArray(0))
                 } catch (_: Throwable) {
                 }
             }

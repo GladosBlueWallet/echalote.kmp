@@ -110,6 +110,20 @@ internal class SecretTorClientDuplex {
         writeLock.withLock { tls.outer.write(bytes) }
     }
 
+    suspend fun sendRelay(
+        circuit: SecretCircuit,
+        rcommand: Int,
+        streamId: Int,
+        fragment: ByteArray,
+        early: Boolean = false,
+    ) {
+        writeLock.withLock {
+            val payload = encodeRelayPayload(rcommand, streamId, fragment, circuit.targets, early)
+            val cmd = if (early) CellCmd.RELAY_EARLY else CellCmd.RELAY
+            tls.outer.write(writeCell(circuit.id, cmd, payload))
+        }
+    }
+
     fun close() {
         if (closed != null) return
         closed = true
@@ -221,8 +235,7 @@ internal class SecretTorClientDuplex {
                 if (exit.delivery == 900) {
                     exit.delivery = 1000
                     val sendme = sendmeCircuitPayload(relay.digest20)
-                    val payload = encodeRelayPayload(RelayCmd.SENDME, 0, sendme, circ.targets, early = false)
-                    send(writeCell(circ.id, CellCmd.RELAY, payload))
+                    sendRelay(circ, RelayCmd.SENDME, 0, sendme)
                 }
                 stream.onIncomingData(relay.fragment)
                 relayData.emit(circ to (stream to relay.fragment))

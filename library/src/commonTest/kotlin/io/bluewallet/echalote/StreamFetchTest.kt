@@ -68,8 +68,37 @@ class StreamFetchTest {
             val req = mock.requestText().lowercase()
             assertTrue(req.startsWith("get /api/ip http/1.1\r\n"))
             assertTrue(req.contains("host: check.torproject.org\r\n"))
-            assertTrue(req.contains("connection: close\r\n"))
+            assertTrue(req.contains("connection: keep-alive\r\n"))
             assertTrue(req.contains("user-agent: mozilla/5.0"))
+            assertFalse(mock.closed)
+        }
+
+    @Test
+    fun postsJsonBodyWithContentLength() =
+        runTest {
+            val reply = """{"ok":true}"""
+            val mock =
+                MockDuplex(
+                    listOf(utf8("HTTP/1.1 200 OK\r\nContent-Length: ${reply.length}\r\n\r\n$reply")),
+                )
+            val payload = """{"a":1}""".encodeToByteArray()
+            val res =
+                streamFetch(
+                    "https://api.rocketx.exchange/v1/quote",
+                    StreamFetchInit(
+                        mock,
+                        method = "POST",
+                        headers = mapOf("Content-Type" to "application/json"),
+                        body = payload,
+                    ),
+                )
+            assertEquals(200, res.status)
+            assertEquals(reply, res.text())
+            val req = mock.requestText()
+            assertTrue(req.startsWith("POST /v1/quote HTTP/1.1\r\n"))
+            assertTrue(req.contains("Content-Type: application/json"))
+            assertTrue(req.contains("Content-Length: ${payload.size}"))
+            assertTrue(req.contains("\r\n\r\n{\"a\":1}"))
             assertFalse(mock.closed)
         }
 

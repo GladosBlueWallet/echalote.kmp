@@ -9,6 +9,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 internal const val TLS_ECDHE_RSA_AES256_GCM_SHA384 = 0xC030
+internal const val TLS_HANDSHAKE_TIMEOUT_MS = 20_000L
 private const val TLS_VERSION = 0x0303
 private const val REC_CCS = 20
 private const val REC_ALERT = 21
@@ -176,147 +177,297 @@ private data class TlsSession(
     val tls: TlsEngine,
 )
 
+private sealed class TlsNext {
+    data class Handshake(
+        val type: Int,
+        val body: ByteArray,
+        val raw: ByteArray,
+    ) : TlsNext()
+
+    data object Ccs : TlsNext()
+}
+
 private suspend fun runTlsHandshake(
     transport: ByteDuplex,
     hostName: String?,
 ): TlsSession {
+    val cached = hostName?.takeIf { it.isNotEmpty() }?.let { lookupTlsSession(it) }
     val tls = TlsEngine(transport)
     val hs = HandshakeBuf(tls)
     val clientRandom = secureRandom(32)
-    val clientHello = buildClientHello(clientRandom, hostName)
+    val clientHello = buildClientHello(clientRandom, hostName, cached)
     hs.transcript = concatBytes(hs.transcript, clientHello)
     tls.writeRecord(REC_HS, clientHello)
+    println("echalote.tls $hostName hello-sent")
 
-    var serverRandom = ByteArray(0)
-    var leaf = ByteArray(0)
-    var peerPoint = ByteArray(0)
-    var ecdheParams = ByteArray(0)
-    var sigHash = 0
-    var signature = ByteArray(0)
-    var ems = false
-    var gotHelloDone = false
-    while (!gotHelloDone) {
-        val (type, body, raw) = hs.next()
-        hs.transcript = concatBytes(hs.transcript, raw)
-        when (type) {
-            HS_SERVER_HELLO -> {
-                require(body.size >= 34) { "short ServerHello" }
-                serverRandom = body.copyOfRange(2, 34)
-                var o = 34
-                val sidLen = body.u8(o)
-                o += 1 + sidLen
-                val suite = body.u16be(o)
-                o += 2
-                require(suite == TLS_ECDHE_RSA_AES256_GCM_SHA384) { "unexpected cipher $suite" }
-                o += 1
-                if (o + 2 <= body.size) {
-                    val extLen = body.u16be(o)
-                    o += 2
-                    val end = o + extLen
-                    while (o + 4 <= end) {
-                        val et = body.u16be(o)
-                        val el = body.u16be(o + 2)
-                        o += 4
-                        if (et == 0x0017) ems = true
-                        o += el
-                    }
-                }
-            }
-            HS_CERTIFICATE -> {
-                require(body.size >= 3) { "short Certificate" }
-                var o = 3
-                val certLen = (body.u8(o) shl 16) or body.u16be(o + 1)
-                o += 3
-                leaf = body.copyOfRange(o, o + certLen)
-            }
-            HS_SERVER_KEY_EXCHANGE -> {
-                require(body[0].toInt() == 3) { "expected named_curve" }
-                require(body.u16be(1) == 0x0017) { "expected secp256r1" }
-                val plen = body.u8(3)
-                peerPoint = body.copyOfRange(4, 4 + plen)
-                ecdheParams = body.copyOfRange(0, 4 + plen)
-                var o = 4 + plen
-                sigHash = body.u8(o)
-                o += 1
-                val sigId = body.u8(o)
-                o += 1
-                require(sigId == 1) { "expected RSA signature" }
-                val slen = body.u16be(o)
-                o += 2
-                signature = body.copyOfRange(o, o + slen)
-            }
-            HS_SERVER_HELLO_DONE -> gotHelloDone = true
-            HS_NEW_SESSION_TICKET, HS_CERTIFICATE_STATUS -> {}
-            else -> throw Exception("unexpected handshake type $type")
-        }
+    val (helloType, helloBody, helloRaw) = hs.next()
+    require(helloType == HS_SERVER_HELLO) { "expected ServerHello" }
+    hs.transcript = concatBytes(hs.transcript, helloRaw)
+    val hello = parseServerHello(helloBody)
+    val next = hs.nextOrCcs()
+    val flow = TlsHandshake(tls, hs, hostName, clientRandom)
+    val resume = cached
+    val abbreviated =
+        next is TlsNext.Ccs ||
+            (next is TlsNext.Handshake && next.type == HS_NEW_SESSION_TICKET)
+    return if (resume != null && abbreviated) {
+        println("echalote.tls $hostName resume=true")
+        flow.finishResume(resume, hello, next)
+    } else {
+        println("echalote.tls $hostName resume=false")
+        flow.finishFull(hello, next)
     }
-    require(leaf.isNotEmpty() && peerPoint.isNotEmpty()) { "incomplete TLS handshake" }
-    val x509 = X509Certificate.parse(leaf)
-    val signed = concatBytes(clientRandom, serverRandom, ecdheParams)
-    val (hash, prefix) =
-        when (sigHash) {
-            4 -> Sha256.hash(signed) to RsaPublicKey.SHA256_DIGESTINFO
-            5 -> Sha384.hash(signed) to RsaPublicKey.SHA384_DIGESTINFO
-            2 -> Sha1.hash(signed) to RsaPublicKey.SHA1_DIGESTINFO
-            else -> throw Exception("unsupported TLS signature hash $sigHash")
-        }
-    require(x509.rsaPublicKey().verifyPkcs1v15Digest(prefix, hash, signature)) {
-        "TLS ServerKeyExchange signature failed"
+}
+
+private class FullServerAuth {
+    var leaf: ByteArray = ByteArray(0)
+    var peerPoint: ByteArray = ByteArray(0)
+    var ecdheParams: ByteArray = ByteArray(0)
+    var sigHash: Int = 0
+    var signature: ByteArray = ByteArray(0)
+    var ticket: ByteArray = ByteArray(0)
+    var lifetime: Long = 0L
+}
+
+private class TlsHandshake(
+    val tls: TlsEngine,
+    val hs: HandshakeBuf,
+    val hostName: String?,
+    val clientRandom: ByteArray,
+) {
+    fun installKeys(
+        master: ByteArray,
+        serverRandom: ByteArray,
+    ) {
+        val keyBlock = tlsPrfSha384(master, "key expansion", concatBytes(serverRandom, clientRandom), 72)
+        tls.writeKey = keyBlock.copyOfRange(0, 32)
+        tls.readKey = keyBlock.copyOfRange(32, 64)
+        tls.writeIv = keyBlock.copyOfRange(64, 68)
+        tls.readIv = keyBlock.copyOfRange(68, 72)
     }
 
-    val (secret, public) = P256.generateKeyPair()
-    val premaster = P256.ecdh(secret, peerPoint)
-    val cke = handshakeMessage(HS_CLIENT_KEY_EXCHANGE, concatBytes(byteArrayOf(public.size.toByte()), public))
-    hs.transcript = concatBytes(hs.transcript, cke)
-    tls.writeRecord(REC_HS, cke)
+    fun keepSession(
+        master: ByteArray,
+        sessionId: ByteArray,
+        ticket: ByteArray,
+        ems: Boolean,
+        lifetime: Long,
+    ) {
+        val host = hostName ?: return
+        if (host.isEmpty() || (ticket.isEmpty() && sessionId.isEmpty())) return
+        storeTlsResumption(
+            TlsResumption(
+                host = host,
+                master = master,
+                sessionId = sessionId,
+                ticket = ticket,
+                ems = ems,
+                expiresAtMs = tlsResumeExpiryMs(lifetime),
+            ),
+        )
+        println("echalote.tls $host ticket=${ticket.size} sid=${sessionId.size}")
+    }
 
-    val sessionHash = Sha384.hash(hs.transcript)
-    val master =
-        if (ems) {
-            tlsPrfSha384(premaster, "extended master secret", sessionHash, 48)
-        } else {
-            tlsPrfSha384(premaster, "master secret", concatBytes(clientRandom, serverRandom), 48)
+    suspend fun finishResume(
+        cached: TlsResumption,
+        hello: ParsedServerHello,
+        first: TlsNext,
+    ): TlsSession {
+        if (cached.ems != hello.ems) {
+            hostName?.let { forgetTlsSession(it) }
+            error("TLS resume EMS mismatch")
         }
-    val keyBlock = tlsPrfSha384(master, "key expansion", concatBytes(serverRandom, clientRandom), 72)
-    tls.writeKey = keyBlock.copyOfRange(0, 32)
-    tls.readKey = keyBlock.copyOfRange(32, 64)
-    tls.writeIv = keyBlock.copyOfRange(64, 68)
-    tls.readIv = keyBlock.copyOfRange(68, 72)
-
-    tls.writeRecord(REC_CCS, byteArrayOf(1))
-    tls.encryptedWrite = true
-    tls.writeSeq = 0
-
-    val clientFinished = tlsPrfSha384(master, "client finished", Sha384.hash(hs.transcript), 12)
-    val fin = handshakeMessage(HS_FINISHED, clientFinished)
-    hs.transcript = concatBytes(hs.transcript, fin)
-    tls.writeRecord(REC_HS, fin)
-
-    var gotCcs = false
-    var serverOk = false
-    while (!serverOk) {
+        installKeys(cached.master, hello.serverRandom)
+        var ticket = cached.ticket
+        var lifetime = 0L
+        when (first) {
+            is TlsNext.Handshake -> {
+                require(first.type == HS_NEW_SESSION_TICKET) { "expected NewSessionTicket on resume" }
+                hs.transcript = concatBytes(hs.transcript, first.raw)
+                val parsed = parseNewSessionTicket(first.body)
+                ticket = parsed.ticket
+                lifetime = parsed.lifetimeHintSec
+                val (rtype, frag) = tls.readRecord()
+                require(rtype == REC_CCS && frag.contentEquals(byteArrayOf(1))) { "expected CCS after ticket" }
+                tls.encryptedRead = true
+                tls.readSeq = 0
+            }
+            is TlsNext.Ccs -> {
+                tls.encryptedRead = true
+                tls.readSeq = 0
+            }
+        }
         val (rtype, frag) = tls.readRecord()
-        if (rtype == REC_CCS) {
-            require(frag.contentEquals(byteArrayOf(1)))
-            tls.encryptedRead = true
-            tls.readSeq = 0
-            gotCcs = true
-            continue
-        }
-        if (rtype == REC_HS && !gotCcs) {
-            val (_, _, raw) = parseHandshake(frag)
-            hs.transcript = concatBytes(hs.transcript, raw)
-            continue
-        }
-        require(gotCcs && rtype == REC_HS) { "expected encrypted Finished" }
+        require(rtype == REC_HS) { "expected server Finished" }
         val (ht, hb, raw) = parseHandshake(frag)
         require(ht == HS_FINISHED) { "expected Finished, got $ht" }
-        val expect = tlsPrfSha384(master, "server finished", Sha384.hash(hs.transcript), 12)
-        require(equalBytes(hb, expect)) { "TLS server Finished mismatch" }
+        val expect = tlsPrfSha384(cached.master, "server finished", Sha384.hash(hs.transcript), 12)
+        if (!equalBytes(hb, expect)) {
+            hostName?.let { forgetTlsSession(it) }
+            error("TLS server Finished mismatch")
+        }
         hs.transcript = concatBytes(hs.transcript, raw)
-        serverOk = true
+        tls.writeRecord(REC_CCS, byteArrayOf(1))
+        tls.encryptedWrite = true
+        tls.writeSeq = 0
+        val clientFinished = tlsPrfSha384(cached.master, "client finished", Sha384.hash(hs.transcript), 12)
+        tls.writeRecord(REC_HS, handshakeMessage(HS_FINISHED, clientFinished))
+        val sid = if (hello.sessionId.isNotEmpty()) hello.sessionId else cached.sessionId
+        keepSession(cached.master, sid, ticket, cached.ems, lifetime)
+        return TlsSession(ByteArray(0), tls)
     }
-    return TlsSession(leaf, tls)
+
+    suspend fun finishFull(
+        hello: ParsedServerHello,
+        first: TlsNext,
+    ): TlsSession {
+        val auth = readFullServerAuth(first)
+        verifyServerKeyExchange(auth, hello)
+        val master = sendClientKeyExchange(auth, hello)
+        readServerFinished(auth, master)
+        keepSession(master, hello.sessionId, auth.ticket, hello.ems, auth.lifetime)
+        return TlsSession(auth.leaf, tls)
+    }
+
+    private suspend fun readFullServerAuth(first: TlsNext): FullServerAuth {
+        require(first is TlsNext.Handshake) { "expected Certificate after ServerHello" }
+        val auth = FullServerAuth()
+        var type = first.type
+        var body = first.body
+        var raw = first.raw
+        var gotHelloDone = false
+        while (true) {
+            hs.transcript = concatBytes(hs.transcript, raw)
+            when (type) {
+                HS_CERTIFICATE -> takeCertificate(auth, body)
+                HS_SERVER_KEY_EXCHANGE -> takeServerKeyExchange(auth, body)
+                HS_SERVER_HELLO_DONE -> gotHelloDone = true
+                HS_NEW_SESSION_TICKET -> {
+                    val parsed = parseNewSessionTicket(body)
+                    auth.ticket = parsed.ticket
+                    auth.lifetime = parsed.lifetimeHintSec
+                }
+                HS_CERTIFICATE_STATUS -> {}
+                else -> error("unexpected handshake type $type")
+            }
+            if (gotHelloDone) break
+            val n = hs.next()
+            type = n.first
+            body = n.second
+            raw = n.third
+        }
+        require(auth.leaf.isNotEmpty() && auth.peerPoint.isNotEmpty()) { "incomplete TLS handshake" }
+        return auth
+    }
+
+    private fun takeCertificate(
+        auth: FullServerAuth,
+        body: ByteArray,
+    ) {
+        require(body.size >= 3) { "short Certificate" }
+        var o = 3
+        val certLen = (body.u8(o) shl 16) or body.u16be(o + 1)
+        o += 3
+        auth.leaf = body.copyOfRange(o, o + certLen)
+    }
+
+    private fun takeServerKeyExchange(
+        auth: FullServerAuth,
+        body: ByteArray,
+    ) {
+        require(body[0].toInt() == 3) { "expected named_curve" }
+        require(body.u16be(1) == 0x0017) { "expected secp256r1" }
+        val plen = body.u8(3)
+        auth.peerPoint = body.copyOfRange(4, 4 + plen)
+        auth.ecdheParams = body.copyOfRange(0, 4 + plen)
+        var o = 4 + plen
+        auth.sigHash = body.u8(o)
+        o += 1
+        val sigId = body.u8(o)
+        o += 1
+        require(sigId == 1) { "expected RSA signature" }
+        val slen = body.u16be(o)
+        o += 2
+        auth.signature = body.copyOfRange(o, o + slen)
+    }
+
+    private fun verifyServerKeyExchange(
+        auth: FullServerAuth,
+        hello: ParsedServerHello,
+    ) {
+        val x509 = X509Certificate.parse(auth.leaf)
+        val signed = concatBytes(clientRandom, hello.serverRandom, auth.ecdheParams)
+        val (hash, prefix) =
+            when (auth.sigHash) {
+                4 -> Sha256.hash(signed) to RsaPublicKey.SHA256_DIGESTINFO
+                5 -> Sha384.hash(signed) to RsaPublicKey.SHA384_DIGESTINFO
+                2 -> Sha1.hash(signed) to RsaPublicKey.SHA1_DIGESTINFO
+                else -> error("unsupported TLS signature hash ${auth.sigHash}")
+            }
+        require(x509.rsaPublicKey().verifyPkcs1v15Digest(prefix, hash, auth.signature)) {
+            "TLS ServerKeyExchange signature failed"
+        }
+    }
+
+    private suspend fun sendClientKeyExchange(
+        auth: FullServerAuth,
+        hello: ParsedServerHello,
+    ): ByteArray {
+        val (secret, public) = P256.generateKeyPair()
+        val premaster = P256.ecdh(secret, auth.peerPoint)
+        val cke = handshakeMessage(HS_CLIENT_KEY_EXCHANGE, concatBytes(byteArrayOf(public.size.toByte()), public))
+        hs.transcript = concatBytes(hs.transcript, cke)
+        tls.writeRecord(REC_HS, cke)
+        val sessionHash = Sha384.hash(hs.transcript)
+        val master =
+            if (hello.ems) {
+                tlsPrfSha384(premaster, "extended master secret", sessionHash, 48)
+            } else {
+                tlsPrfSha384(premaster, "master secret", concatBytes(clientRandom, hello.serverRandom), 48)
+            }
+        installKeys(master, hello.serverRandom)
+        tls.writeRecord(REC_CCS, byteArrayOf(1))
+        tls.encryptedWrite = true
+        tls.writeSeq = 0
+        val clientFinished = tlsPrfSha384(master, "client finished", Sha384.hash(hs.transcript), 12)
+        val fin = handshakeMessage(HS_FINISHED, clientFinished)
+        hs.transcript = concatBytes(hs.transcript, fin)
+        tls.writeRecord(REC_HS, fin)
+        return master
+    }
+
+    private suspend fun readServerFinished(
+        auth: FullServerAuth,
+        master: ByteArray,
+    ) {
+        var gotCcs = false
+        var serverOk = false
+        while (!serverOk) {
+            val (rtype, frag) = tls.readRecord()
+            if (rtype == REC_CCS) {
+                require(frag.contentEquals(byteArrayOf(1)))
+                tls.encryptedRead = true
+                tls.readSeq = 0
+                gotCcs = true
+            } else if (rtype == REC_HS && !gotCcs) {
+                val (ht, hb, hraw) = parseHandshake(frag)
+                hs.transcript = concatBytes(hs.transcript, hraw)
+                if (ht == HS_NEW_SESSION_TICKET) {
+                    val parsed = parseNewSessionTicket(hb)
+                    auth.ticket = parsed.ticket
+                    auth.lifetime = parsed.lifetimeHintSec
+                }
+            } else {
+                require(gotCcs && rtype == REC_HS) { "expected encrypted Finished" }
+                val (ht, hb, fraw) = parseHandshake(frag)
+                require(ht == HS_FINISHED) { "expected Finished, got $ht" }
+                val expect = tlsPrfSha384(master, "server finished", Sha384.hash(hs.transcript), 12)
+                require(equalBytes(hb, expect)) { "TLS server Finished mismatch" }
+                hs.transcript = concatBytes(hs.transcript, fraw)
+                serverOk = true
+            }
+        }
+    }
 }
 
 private suspend fun TlsClientDuplex.handshakeAndPump(
@@ -327,36 +478,38 @@ private suspend fun TlsClientDuplex.handshakeAndPump(
     val session = runTlsHandshake(transport, hostName)
     leafCertDer.complete(session.leaf)
     val tls = session.tls
-    val incoming =
-        scope.launch {
-            runCatching {
-                while (true) {
-                    val (type, frag) = tls.readRecord()
-                    if (type == REC_CCS) continue
-                    if (type != REC_APP) {
-                        if (type == REC_HS) continue
-                        throw TlsAlertError("unexpected TLS record $type")
-                    }
-                    if (frag.isNotEmpty()) app.write(frag)
+
+    suspend fun pumpIncoming() {
+        runCatching {
+            while (true) {
+                val (type, frag) = tls.readRecord()
+                if (type == REC_CCS) continue
+                if (type != REC_APP) {
+                    if (type == REC_HS) continue
+                    throw TlsAlertError("unexpected TLS record $type")
                 }
-            }.onFailure { e ->
-                pumpError = tlsPumpError(e)
-                try {
-                    app.close()
-                } catch (_: Throwable) {
-                }
+                if (frag.isNotEmpty()) app.write(frag)
+            }
+        }.onFailure { e ->
+            pumpError = tlsPumpError(e)
+            try {
+                app.close()
+            } catch (_: Throwable) {
             }
         }
+    }
     ready.complete(Unit)
+    var incoming: kotlinx.coroutines.Job? = null
     try {
         while (true) {
             val chunk = app.read(16 * 1024)
             if (chunk.isEmpty()) break
             tls.writeRecord(REC_APP, chunk)
+            if (incoming == null) incoming = scope.launch { pumpIncoming() }
         }
     } catch (_: Throwable) {
     } finally {
-        incoming.cancel()
+        incoming?.cancel()
         try {
             transport.close()
         } catch (_: Throwable) {
@@ -385,6 +538,31 @@ private class HandshakeBuf(
         require(type == REC_HS) { "expected handshake record, got $type" }
         buf = concatBytes(buf, frag)
     }
+
+    suspend fun nextOrCcs(): TlsNext {
+        while (!hasCompleteHandshake()) {
+            val (type, frag) = tls.readRecord()
+            if (type == REC_CCS) return TlsNext.Ccs
+            require(type == REC_HS) { "expected handshake or CCS, got $type" }
+            buf = concatBytes(buf, frag)
+        }
+        val (ht, body, raw) = takeHandshake()
+        return TlsNext.Handshake(ht, body, raw)
+    }
+
+    private fun hasCompleteHandshake(): Boolean {
+        if (buf.size < 4) return false
+        val len = (buf.u8(1) shl 16) or buf.u16be(2)
+        return buf.size >= 4 + len
+    }
+
+    private fun takeHandshake(): Triple<Int, ByteArray, ByteArray> {
+        val len = (buf.u8(1) shl 16) or buf.u16be(2)
+        val raw = buf.copyOfRange(0, 4 + len)
+        buf = buf.copyOfRange(4 + len, buf.size)
+        val (t, b, _) = parseHandshake(raw)
+        return Triple(t, b, raw)
+    }
 }
 
 private fun parseHandshake(raw: ByteArray): Triple<Int, ByteArray, ByteArray> {
@@ -410,6 +588,7 @@ private fun handshakeMessage(
 private fun buildClientHello(
     random: ByteArray,
     hostName: String?,
+    resume: TlsResumption? = null,
 ): ByteArray {
     val sni =
         if (hostName.isNullOrEmpty()) {
@@ -419,6 +598,9 @@ private fun buildClientHello(
             val nameEntry = concatBytes(byteArrayOf(0), u16(host.size), host)
             tlsExt(0x0000, concatBytes(u16(nameEntry.size), nameEntry))
         }
+    val ticket = resume?.ticket ?: ByteArray(0)
+    val sid =
+        if (resume != null && ticket.isEmpty()) resume.sessionId else ByteArray(0)
     val exts =
         concatBytes(
             sni,
@@ -433,12 +615,14 @@ private fun buildClientHello(
             tlsExt(0x000b, byteArrayOf(1, 0)),
             tlsExt(0x0017, ByteArray(0)),
             tlsExt(0xff01, byteArrayOf(0)),
+            tlsExt(TLS_SESSION_TICKET_EXT, ticket),
         )
     val body =
         concatBytes(
             u16(TLS_VERSION),
             random,
-            byteArrayOf(0),
+            byteArrayOf(sid.size.toByte()),
+            sid,
             u16(2),
             u16(TLS_ECDHE_RSA_AES256_GCM_SHA384),
             byteArrayOf(1, 0),
@@ -467,8 +651,9 @@ suspend fun wrapTls(
 ): ByteDuplex {
     val tls = TlsClientDuplex(hostName, transport)
     try {
-        withAbort(abort) { tls.ready.await() }
+        withAbortTimeout(TLS_HANDSHAKE_TIMEOUT_MS, abort) { _ -> tls.ready.await() }
     } catch (err: Throwable) {
+        hostName.takeIf { it.isNotEmpty() }?.let { forgetTlsSession(it) }
         tls.close()
         throw err
     }

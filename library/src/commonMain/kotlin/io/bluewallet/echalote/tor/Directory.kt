@@ -117,7 +117,44 @@ data class ExitDialerOptions(
     val circuitAttempts: Int = 3,
     val circuitRace: Int = 2,
     val http: HttpEngine? = null,
+    val maxCircuitAgeMs: Long = 0,
+) {
+    internal var hooks: ExitDialerHooks = ExitDialerHooks()
+}
+
+internal class ExitDialerHooks(
+    val nowMs: () -> Long = { currentEpochMillis() },
+    val ensureTor: (suspend (Abort) -> TorClientDuplex)? = null,
+    val makeCircuit: (suspend (TorClientDuplex, Abort) -> Circuit)? = null,
 )
+
+private class CachedCircuit(
+    val circuit: Circuit,
+    val createdAtMs: Long,
+)
+
+private val defaultDialerMutex = Mutex()
+private var defaultDialer: ExitDialer? = null
+
+internal suspend fun defaultExitDialer(): ExitDialer =
+    defaultDialerMutex.withLock {
+        defaultDialer ?: createExitDialer().also { defaultDialer = it }
+    }
+
+internal suspend fun resetDefaultExitDialer() {
+    resetHttpsSessions()
+    defaultDialerMutex.withLock {
+        defaultDialer?.dispose()
+        defaultDialer = null
+    }
+}
+
+internal suspend fun forgetDefaultCircuit(
+    host: String,
+    port: Int,
+) {
+    defaultDialerMutex.withLock { defaultDialer }?.forgetCircuit(host, port)
+}
 
 interface ExitDialer {
     suspend fun dial(
@@ -127,6 +164,12 @@ interface ExitDialer {
     ): TorStreamDuplex
 
     suspend fun dispose()
+
+    suspend fun forgetCircuit(
+        host: String,
+        port: Int,
+    ) {
+    }
 }
 
 class TorStreamDuplex(
@@ -465,16 +508,34 @@ suspend fun fetchMicrodesc(
 }
 
 fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDialer {
+    val hooks = options.hooks
     val engine = options.http ?: defaultHttpEngine()
     val job = kotlinx.coroutines.SupervisorJob()
     val scope = kotlinx.coroutines.CoroutineScope(job + kotlinx.coroutines.Dispatchers.Default)
     val torLock = Mutex()
+    val circuitLock = Mutex()
+    val circuits = LinkedHashMap<Pair<String, Int>, CachedCircuit>()
     var tor: TorClientDuplex? = null
     var meekStream: BatchedFetchStream? = null
     var ready: kotlinx.coroutines.Deferred<Unit>? = null
     var disposed = false
 
+    fun cacheKey(
+        host: String,
+        port: Int,
+    ) = host.lowercase() to port
+
     fun resetTor() {
+        val snapshot = circuits.values.toList()
+        circuits.clear()
+        for (cached in snapshot) {
+            scope.launch {
+                try {
+                    cached.circuit.close()
+                } catch (_: Throwable) {
+                }
+            }
+        }
         try {
             tor?.close()
         } catch (_: Throwable) {
@@ -497,59 +558,70 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
         return Exception("tor $stage: ${err.message ?: err}$causeMsg", err)
     }
 
+    fun beginBootstrap(signal: Abort) =
+        scope.async {
+            val meek = createMeekStream(options.meekUrl, engine)
+            val client = TorClientDuplex()
+            meekStream = meek
+            try {
+                scope.launch {
+                    try {
+                        pipeDuplex(meek.duplex, client.inner)
+                    } catch (_: Throwable) {
+                    }
+                    if (tor === client) resetTor()
+                }
+                scope.launch {
+                    try {
+                        pipeDuplex(client.inner, meek.duplex)
+                    } catch (_: Throwable) {
+                    }
+                    if (tor === client) resetTor()
+                }
+                meek.start()
+                client.waitOrThrow(signal)
+                tor = client
+            } catch (err: Throwable) {
+                try {
+                    meek.error(err)
+                } catch (_: Throwable) {
+                }
+                try {
+                    client.close()
+                } catch (_: Throwable) {
+                }
+                meekStream = null
+                ready = null
+                throw wrap("bootstrap", err)
+            }
+        }
+
     suspend fun ensureTor(signal: Abort): TorClientDuplex {
         if (disposed) throw Exception("exit dialer disposed")
         signal.throwIfAborted()
+        val hook = hooks.ensureTor
+        if (hook != null) {
+            if (tor?.closed != null) tor = null
+            val hooked = tor ?: hook(signal).also { tor = it }
+            return hooked
+        }
         val boot =
             torLock.withLock {
                 if (disposed) throw Exception("exit dialer disposed")
                 if (tor?.closed != null) resetTor()
-                tor?.let { return it }
-                if (ready == null) {
-                    ready =
-                        scope.async {
-                            val meek = createMeekStream(options.meekUrl, engine)
-                            val client = TorClientDuplex()
-                            meekStream = meek
-                            try {
-                                scope.launch {
-                                    try {
-                                        pipeDuplex(meek.duplex, client.inner)
-                                    } catch (_: Throwable) {
-                                    }
-                                    if (tor === client) resetTor()
-                                }
-                                scope.launch {
-                                    try {
-                                        pipeDuplex(client.inner, meek.duplex)
-                                    } catch (_: Throwable) {
-                                    }
-                                    if (tor === client) resetTor()
-                                }
-                                meek.start()
-                                client.waitOrThrow(signal)
-                                tor = client
-                            } catch (err: Throwable) {
-                                try {
-                                    meek.error(err)
-                                } catch (_: Throwable) {
-                                }
-                                try {
-                                    client.close()
-                                } catch (_: Throwable) {
-                                }
-                                meekStream = null
-                                ready = null
-                                throw wrap("bootstrap", err)
-                            }
-                        }
+                if (tor != null) {
+                    null
+                } else {
+                    if (ready == null) ready = beginBootstrap(signal)
+                    ready
                 }
-                ready!!
             }
-        try {
-            withAbort(signal) { boot.await() }
-        } catch (err: Throwable) {
-            throw if (err is Exception && err.message?.startsWith("tor ") == true) err else wrap("bootstrap", err)
+        if (boot != null) {
+            try {
+                withAbort(signal) { boot.await() }
+            } catch (err: Throwable) {
+                throw if (err is Exception && err.message?.startsWith("tor ") == true) err else wrap("bootstrap", err)
+            }
         }
         return tor ?: throw Exception("tor client failed to start")
     }
@@ -558,6 +630,7 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
         client: TorClientDuplex,
         signal: Abort,
     ): Circuit {
+        if (hooks.makeCircuit != null) return hooks.makeCircuit.invoke(client, signal)
         try {
             return buildExitCircuit(
                 client,
@@ -574,6 +647,49 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
         }
     }
 
+    suspend fun evictCircuit(key: Pair<String, Int>) {
+        val cached = circuits.remove(key) ?: return
+        try {
+            cached.circuit.close()
+        } catch (_: Throwable) {
+        }
+    }
+
+    suspend fun obtainCircuit(
+        client: TorClientDuplex,
+        signal: Abort,
+        key: Pair<String, Int>,
+    ): Circuit =
+        circuitLock.withLock {
+            val cached = circuits[key]
+            if (cached != null) {
+                val stale =
+                    options.maxCircuitAgeMs > 0L &&
+                        hooks.nowMs() - cached.createdAtMs >= options.maxCircuitAgeMs
+                if (!stale && !cached.circuit.isClosed) return@withLock cached.circuit
+                evictCircuit(key)
+            }
+            var used = client
+            val built =
+                try {
+                    makeExitCircuit(used, signal)
+                } catch (err: Throwable) {
+                    if (hooks.makeCircuit == null && isTransientCircuitError(err) && !signal.aborted) {
+                        resetTor()
+                        used = ensureTor(signal)
+                        makeExitCircuit(used, signal)
+                    } else {
+                        throw if (err is Exception && err.message?.startsWith("tor ") == true) {
+                            err
+                        } else {
+                            wrap("extend circuit", err)
+                        }
+                    }
+                }
+            circuits[key] = CachedCircuit(built, hooks.nowMs())
+            built
+        }
+
     return object : ExitDialer {
         override suspend fun dial(
             host: String,
@@ -582,40 +698,38 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
         ): TorStreamDuplex {
             if (disposed) throw Exception("exit dialer disposed")
             val signal = abort ?: Abort()
-            var client = ensureTor(signal)
-            var circuit: Circuit
-            try {
-                circuit = makeExitCircuit(client, signal)
-            } catch (err: Throwable) {
-                if (isTransientCircuitError(err) && !signal.aborted) {
-                    resetTor()
-                    client = ensureTor(signal)
-                    circuit = makeExitCircuit(client, signal)
-                } else {
-                    throw if (err is Exception && err.message?.startsWith("tor ") == true) err else wrap("extend circuit", err)
-                }
-            }
-            try {
-                val stream =
-                    withAbortTimeout(options.openTimeoutMs, signal) { linked ->
-                        circuit.openOrThrow(host, port, wait = true, abort = linked)
-                    }
-                return TorStreamDuplex(stream.outer) {
-                    stream.close()
-                    scope.launch {
-                        try {
-                            circuit.close()
-                        } catch (_: Throwable) {
-                        }
-                    }
-                }
-            } catch (err: Throwable) {
+            val key = cacheKey(host, port)
+            var retried = false
+            while (true) {
+                val client = ensureTor(signal)
+                val cached = circuitLock.withLock { circuits[key] }
+                val cacheHit = cached != null && !cached.circuit.isClosed
+                val circuit = obtainCircuit(client, signal, key)
+                println(
+                    "echalote.dial $host:$port retry=$retried cacheHit=$cacheHit circ=${circuit.id} " +
+                        "torClosed=${client.closed != null}",
+                )
                 try {
-                    circuit.close()
-                } catch (_: Throwable) {
+                    val stream =
+                        withAbortTimeout(options.openTimeoutMs, signal) { linked ->
+                            circuit.openOrThrow(host, port, wait = true, abort = linked)
+                        }
+                    println("echalote.open-ok $host:$port circ=${circuit.id}")
+                    return TorStreamDuplex(stream.outer) { stream.close() }
+                } catch (err: Throwable) {
+                    println("echalote.open-fail $host:$port circ=${circuit.id} ${err.message}")
+                    circuitLock.withLock { evictCircuit(key) }
+                    if (retried || signal.aborted) throw wrap("open $host:$port", err)
+                    retried = true
                 }
-                throw wrap("open $host:$port", err)
             }
+        }
+
+        override suspend fun forgetCircuit(
+            host: String,
+            port: Int,
+        ) {
+            circuitLock.withLock { evictCircuit(cacheKey(host, port)) }
         }
 
         override suspend fun dispose() {
@@ -710,6 +824,12 @@ object Echalote {
 
     fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()) = io.bluewallet.echalote.createExitDialer(options)
 
+    suspend fun dial(
+        host: String,
+        port: Int,
+        abort: Abort? = null,
+    ) = defaultExitDialer().dial(host, port, abort)
+
     fun createMeekStream(url: String = io.bluewallet.echalote.DEFAULT_MEEK_URL) = io.bluewallet.echalote.createMeekStream(url)
 
     fun initBundledCrypto() = io.bluewallet.echalote.initBundledCrypto()
@@ -731,6 +851,14 @@ object Echalote {
         url: String,
         init: StreamFetchInit,
     ) = io.bluewallet.echalote.streamFetch(url, init)
+
+    suspend fun fetch(
+        url: String,
+        abort: Abort? = null,
+        method: String = "GET",
+        headers: Map<String, String> = emptyMap(),
+        body: ByteArray = ByteArray(0),
+    ) = io.bluewallet.echalote.httpsFetch(url, abort, method, headers, body)
 
     suspend fun wrapTls(
         transport: ByteDuplex,
