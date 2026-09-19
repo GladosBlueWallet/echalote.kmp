@@ -7,6 +7,7 @@ import java.net.URL
 
 actual fun defaultHttpEngine(): HttpEngine =
     HttpEngine { method, url, headers, body, timeoutMs, decompress ->
+        val onDownload = http1ProgressSink()
         withContext(Dispatchers.IO) {
             val conn =
                 (URL(url).openConnection() as HttpURLConnection).apply {
@@ -33,7 +34,8 @@ actual fun defaultHttpEngine(): HttpEngine =
                         0
                     }
                 val stream = if (status in 200..299) conn.inputStream else conn.errorStream
-                val bytes = stream?.readBytes() ?: ByteArray(0)
+                val tick = if (status in 200..299) onDownload else null
+                val bytes = readStreamProgress(stream, conn.contentLength, tick)
                 val hdrs = mutableMapOf<String, String>()
                 for ((k, vs) in conn.headerFields) {
                     if (k != null && vs != null && vs.isNotEmpty()) hdrs[k] = vs.joinToString(", ")
@@ -44,3 +46,23 @@ actual fun defaultHttpEngine(): HttpEngine =
             }
         }
     }
+
+private fun readStreamProgress(
+    stream: java.io.InputStream?,
+    contentLength: Int,
+    onDownload: ((Int, Int?) -> Unit)?,
+): ByteArray {
+    if (stream == null) return ByteArray(0)
+    val total = contentLength.takeIf { it > 0 }
+    val out = java.io.ByteArrayOutputStream(total ?: 16 * 1024)
+    val buf = ByteArray(16 * 1024)
+    var received = 0
+    while (true) {
+        val n = stream.read(buf)
+        if (n < 0) break
+        out.write(buf, 0, n)
+        received += n
+        onDownload?.invoke(received, total)
+    }
+    return out.toByteArray()
+}

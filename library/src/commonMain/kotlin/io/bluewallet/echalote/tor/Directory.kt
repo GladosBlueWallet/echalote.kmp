@@ -431,6 +431,10 @@ val CONSENSUS_MIRRORS = AUTHORITY_HOSTS.map { "http://$it/tor/status-vote/curren
 private var cachedConsensus: Pair<Long, Consensus>? = null
 private const val CACHE_MS = 30 * 60 * 1000L
 
+internal fun resetCachedConsensus() {
+    cachedConsensus = null
+}
+
 fun sha256Base64Unpadded(bytes: ByteArray): String = Base64.encodeUnpadded(Sha256.hash(bytes))
 
 suspend fun fetchMicrodescConsensus(
@@ -440,8 +444,11 @@ suspend fun fetchMicrodescConsensus(
     concurrency: Int = 3,
     engine: HttpEngine = defaultHttpEngine(),
 ): Consensus {
+    val progress = fetchProgress()
+    progress?.report(FetchStage.DOWNLOADING_DIRECTORY)
     val cached = cachedConsensus
     if (!force && cached != null && currentEpochMillis() - cached.first < CACHE_MS) {
+        progress?.report(FetchStage.DOWNLOADING_DIRECTORY, 1.0)
         return cached.second
     }
     val shuffled = mirrors.toMutableList().also { it.shuffle() }
@@ -462,6 +469,7 @@ suspend fun fetchMicrodescConsensus(
             signal = signal,
         )
     cachedConsensus = currentEpochMillis() to consensus
+    progress?.report(FetchStage.DOWNLOADING_DIRECTORY, 1.0)
     return consensus
 }
 
@@ -482,6 +490,8 @@ suspend fun fetchMicrodesc(
         urls += "http://${head.hostname}:${head.dirport}/tor/micro/d/$dig.z"
         urls += "http://${head.hostname}:${head.dirport}/tor/micro/d/$dig"
     }
+    val progress = fetchProgress()
+    progress?.report(FetchStage.FETCHING_RELAY_INFO)
     try {
         return fetchFirstOk(
             urls,
@@ -500,7 +510,7 @@ suspend fun fetchMicrodesc(
             },
             concurrency = concurrency,
             signal = signal,
-        )
+        ).also { progress?.report(FetchStage.FETCHING_RELAY_INFO, 1.0) }
     } catch (err: Throwable) {
         if (signal.aborted) throw signal.reason ?: err
         throw Exception("no microdesc URL succeeded", err)
@@ -558,51 +568,58 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
         return Exception("tor $stage: ${err.message ?: err}$causeMsg", err)
     }
 
-    fun beginBootstrap(signal: Abort) =
-        scope.async {
-            val meek = createMeekStream(options.meekUrl, engine)
-            val client = TorClientDuplex()
-            meekStream = meek
-            try {
-                scope.launch {
-                    try {
-                        pipeDuplex(meek.duplex, client.inner)
-                    } catch (_: Throwable) {
-                    }
-                    if (tor === client) resetTor()
-                }
-                scope.launch {
-                    try {
-                        pipeDuplex(client.inner, meek.duplex)
-                    } catch (_: Throwable) {
-                    }
-                    if (tor === client) resetTor()
-                }
-                meek.start()
-                client.waitOrThrow(signal)
-                tor = client
-            } catch (err: Throwable) {
+    fun beginBootstrap(
+        signal: Abort,
+        progress: FetchProgressReporter?,
+    ) = scope.async {
+        progress?.report(FetchStage.CONNECTING)
+        val meek = createMeekStream(options.meekUrl, engine)
+        val client = TorClientDuplex()
+        meekStream = meek
+        try {
+            scope.launch {
                 try {
-                    meek.error(err)
+                    pipeDuplex(meek.duplex, client.inner)
                 } catch (_: Throwable) {
                 }
-                try {
-                    client.close()
-                } catch (_: Throwable) {
-                }
-                meekStream = null
-                ready = null
-                throw wrap("bootstrap", err)
+                if (tor === client) resetTor()
             }
+            scope.launch {
+                try {
+                    pipeDuplex(client.inner, meek.duplex)
+                } catch (_: Throwable) {
+                }
+                if (tor === client) resetTor()
+            }
+            meek.start()
+            client.waitOrThrow(signal)
+            progress?.report(FetchStage.CONNECTING, 1.0)
+            tor = client
+        } catch (err: Throwable) {
+            try {
+                meek.error(err)
+            } catch (_: Throwable) {
+            }
+            try {
+                client.close()
+            } catch (_: Throwable) {
+            }
+            meekStream = null
+            ready = null
+            throw wrap("bootstrap", err)
         }
+    }
 
     suspend fun ensureTor(signal: Abort): TorClientDuplex {
         if (disposed) throw Exception("exit dialer disposed")
         signal.throwIfAborted()
+        val progress = fetchProgress()
+        progress?.report(FetchStage.CONNECTING)
         val hook = hooks.ensureTor
         if (hook != null) {
             if (tor?.closed != null) tor = null
             val hooked = tor ?: hook(signal).also { tor = it }
+            progress?.report(FetchStage.CONNECTING, 1.0)
             return hooked
         }
         val boot =
@@ -612,7 +629,7 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
                 if (tor != null) {
                     null
                 } else {
-                    if (ready == null) ready = beginBootstrap(signal)
+                    if (ready == null) ready = beginBootstrap(signal, progress)
                     ready
                 }
             }
@@ -623,6 +640,7 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
                 throw if (err is Exception && err.message?.startsWith("tor ") == true) err else wrap("bootstrap", err)
             }
         }
+        progress?.report(FetchStage.CONNECTING, 1.0)
         return tor ?: throw Exception("tor client failed to start")
     }
 
@@ -705,6 +723,8 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
                 val cached = circuitLock.withLock { circuits[key] }
                 val cacheHit = cached != null && !cached.circuit.isClosed
                 val circuit = obtainCircuit(client, signal, key)
+                val progress = fetchProgress()
+                progress?.report(FetchStage.OPENING_CONNECTION)
                 println(
                     "echalote.dial $host:$port retry=$retried cacheHit=$cacheHit circ=${circuit.id} " +
                         "torClosed=${client.closed != null}",
@@ -714,6 +734,7 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
                         withAbortTimeout(options.openTimeoutMs, signal) { linked ->
                             circuit.openOrThrow(host, port, wait = true, abort = linked)
                         }
+                    progress?.report(FetchStage.OPENING_CONNECTION, 0.5)
                     println("echalote.open-ok $host:$port circ=${circuit.id}")
                     return TorStreamDuplex(stream.outer) { stream.close() }
                 } catch (err: Throwable) {
@@ -767,6 +788,7 @@ internal suspend fun buildExitCircuitOnce(
     signal: Abort,
     options: BuildOnceOptions,
 ): Circuit {
+    val progress = fetchProgress()
     val engine = options.http ?: defaultHttpEngine()
     val circuit = client.createOrThrow(signal)
     try {
@@ -791,7 +813,9 @@ internal suspend fun buildExitCircuitOnce(
             throw Exception("tor consensus missing usable relays (middles=${middles.size} exits=${exits.size})")
         }
         val middleFull = pickExtendable(middles, signal, options.pickTries, engine)
+        progress?.report(FetchStage.BUILDING_CIRCUIT)
         withAbortTimeout(options.extendTimeoutMs, signal) { circuit.extendOrThrow(middleFull, it) }
+        progress?.report(FetchStage.BUILDING_CIRCUIT, 0.5)
         val exitFull =
             pickExtendable(
                 exits.filter { it.identity != middleFull.identity },
@@ -800,6 +824,7 @@ internal suspend fun buildExitCircuitOnce(
                 engine,
             )
         withAbortTimeout(options.extendTimeoutMs, signal) { circuit.extendOrThrow(exitFull, it) }
+        progress?.report(FetchStage.BUILDING_CIRCUIT, 1.0)
         return circuit
     } catch (err: Throwable) {
         try {
@@ -858,7 +883,8 @@ object Echalote {
         method: String = "GET",
         headers: Map<String, String> = emptyMap(),
         body: ByteArray = ByteArray(0),
-    ) = io.bluewallet.echalote.httpsFetch(url, abort, method, headers, body)
+        onProgress: FetchProgressListener? = null,
+    ) = io.bluewallet.echalote.httpsFetch(url, abort, method, headers, body, onProgress)
 
     suspend fun wrapTls(
         transport: ByteDuplex,

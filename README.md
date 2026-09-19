@@ -29,6 +29,20 @@ stream.close()
 dialer.dispose()
 ```
 
+Cold start (first GET/POST) can take tens of seconds. Pass `onProgress` to show a percent and a stage:
+
+```kotlin
+val response = Echalote.fetch(
+    url = "https://check.torproject.org/api/ip",
+    method = "GET",
+    onProgress = { percent, stage ->
+        // percent is 0..100 and never goes backwards
+        // stage is text such as "Downloading directory"
+        // may run off the main thread; hop to UI if you update a view
+    },
+)
+```
+
 Directory consensus/microdescriptors are fetched over **clearnet HTTP** (same as the original). The Tor link TLS to the guard runs in userspace over meek (`TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`, no root CA check; the leaf certificate DER is used for CERTS `sign_to_tls`).
 
 ## Coordinates
