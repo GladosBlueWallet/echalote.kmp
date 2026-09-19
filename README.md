@@ -29,7 +29,7 @@ stream.close()
 dialer.dispose()
 ```
 
-Cold start (first GET/POST) can take tens of seconds. Pass `onProgress` to show a percent and a stage:
+Cold start (first GET/POST or `dial`) can take tens of seconds. Pass `onProgress` to show a percent and a stage:
 
 ```kotlin
 val response = Echalote.fetch(
@@ -40,6 +40,11 @@ val response = Echalote.fetch(
         // stage is text such as "Downloading directory"
         // may run off the main thread; hop to UI if you update a view
     },
+)
+val stream = Echalote.dial(
+    host = "seed.example",
+    port = 8333,
+    onProgress = { percent, stage -> },
 )
 ```
 
