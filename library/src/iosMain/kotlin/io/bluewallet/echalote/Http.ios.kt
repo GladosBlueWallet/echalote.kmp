@@ -80,9 +80,10 @@ private fun NSData.toByteArray(): ByteArray {
 actual fun defaultHttpEngine(): HttpEngine {
     val session = NSURLSession.sessionWithConfiguration(NSURLSessionConfiguration.ephemeralSessionConfiguration)
     return HttpEngine { method, url, headers, body, timeoutMs, decompress ->
+        val onDownload = http1ProgressSink()
         if (usesCleartextHttp1(url)) {
             withContext(Dispatchers.Default) {
-                http1OverTcp(method, url, headers, body, timeoutMs)
+                http1OverTcp(method, url, headers, body, timeoutMs, onDownload)
             }
         } else {
             httpsUrlSession(session, method, url, headers, body, timeoutMs, decompress)
@@ -97,12 +98,13 @@ private fun http1OverTcp(
     headers: Map<String, String>,
     body: ByteArray,
     timeoutMs: Long,
+    onDownload: ((Int, Int?) -> Unit)?,
 ): HttpResponse {
     val parsed = parseHttpUrl(url)
     val fd = posixConnect(parsed.host, parsed.port, timeoutMs)
     try {
         sendAll(fd, buildHttp1Request(method, parsed, headers, body))
-        return parseHttp1Response(recvHttp1(fd))
+        return parseHttp1Response(recvHttp1(fd, onDownload))
     } finally {
         close(fd)
     }
@@ -252,9 +254,12 @@ private fun sendAll(
 }
 
 @OptIn(ExperimentalForeignApi::class)
-private fun recvHttp1(fd: Int): ByteArray {
+private fun recvHttp1(
+    fd: Int,
+    onDownload: ((Int, Int?) -> Unit)?,
+): ByteArray {
     val buf = ByteArray(16 * 1024)
-    return readHttp1Raw { recvOnce(fd, buf) }
+    return readHttp1Raw(onDownload = onDownload) { recvOnce(fd, buf) }
 }
 
 @OptIn(ExperimentalForeignApi::class)

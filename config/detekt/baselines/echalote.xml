@@ -14,7 +14,7 @@
     <ID>CyclomaticComplexMethod:Directory.kt$suspend fun &lt;T, R&gt; fetchFirstOk( items: List&lt;T&gt;, worker: suspend (T, Abort) -&gt; R, concurrency: Int = 4, signal: Abort = Abort(), ): R</ID>
     <ID>CyclomaticComplexMethod:Directory.kt$suspend fun raceFirstCircuit( raceCount: Int, build: suspend (Abort) -&gt; Circuit, signal: Abort = Abort(), ): Circuit</ID>
     <ID>CyclomaticComplexMethod:Hash.kt$Sha512$fun hash( data: ByteArray, bits384: Boolean = false, ): ByteArray</ID>
-    <ID>CyclomaticComplexMethod:Http1.kt$fun readHttp1Raw( maxBody: Int = MAX_HTTP1_BODY, read: () -&gt; ByteArray?, ): ByteArray</ID>
+    <ID>CyclomaticComplexMethod:Http1.kt$fun readHttp1Raw( maxBody: Int = MAX_HTTP1_BODY, onDownload: ((received: Int, total: Int?) -&gt; Unit)? = null, read: () -&gt; ByteArray?, ): ByteArray</ID>
     <ID>CyclomaticComplexMethod:StreamFetch.kt$StreamResponse$fun jsonObject(): Map&lt;String, String&gt;</ID>
     <ID>CyclomaticComplexMethod:StreamFetch.kt$suspend fun streamFetch( input: String, init: StreamFetchInit, ): StreamResponse</ID>
     <ID>CyclomaticComplexMethod:TlsClient.kt$private suspend fun TlsClientDuplex.handshakeAndPump( transport: ByteDuplex, app: ByteDuplex, hostName: String?, )</ID>
@@ -35,7 +35,10 @@
     <ID>LongMethod:Hash.kt$Sha256$fun hash(data: ByteArray): ByteArray</ID>
     <ID>LongMethod:Hash.kt$Sha512$fun hash( data: ByteArray, bits384: Boolean = false, ): ByteArray</ID>
     <ID>LongMethod:TlsClient.kt$private suspend fun runTlsHandshake( transport: ByteDuplex, hostName: String?, ): TlsSession</ID>
-    <ID>LongParameterList:Http.android.kt$( method: String, url: String, headers: Map&lt;String, String&gt;, body: ByteArray, timeoutMs: Long, decompress: Boolean, )</ID>
+    <ID>LongParameterList:Directory.kt$Echalote$( url: String, abort: Abort? = null, method: String = "GET", headers: Map&lt;String, String&gt; = emptyMap(), body: ByteArray = ByteArray(0), onProgress: FetchProgressListener? = null, )</ID>
+    <ID>LongParameterList:Http.android.kt$( method: String, url: String, headers: Map&lt;String, String&gt;, body: ByteArray, timeoutMs: Long, onDownload: ((Int, Int?) -&gt; Unit)?, )</ID>
+    <ID>LongParameterList:Http.android.kt$( method: String, url: String, headers: Map&lt;String, String&gt;, body: ByteArray, timeoutMs: Long, decompress: Boolean, onDownload: ((Int, Int?) -&gt; Unit)?, )</ID>
+    <ID>LongParameterList:Http.ios.kt$( method: String, url: String, headers: Map&lt;String, String&gt;, body: ByteArray, timeoutMs: Long, onDownload: ((Int, Int?) -&gt; Unit)?, )</ID>
     <ID>LongParameterList:Http.ios.kt$( session: NSURLSession, method: String, url: String, headers: Map&lt;String, String&gt;, body: ByteArray, timeoutMs: Long, @Suppress("UNUSED_PARAMETER") decompress: Boolean, )</ID>
     <ID>LongParameterList:Http.kt$( method: String, url: String, headers: Map&lt;String, String&gt; = emptyMap(), body: ByteArray = ByteArray(0), timeoutMs: Long = 30_000, decompress: Boolean = true, )</ID>
     <ID>LongParameterList:Http.kt$HttpEngine$( method: String, url: String, headers: Map&lt;String, String&gt;, body: ByteArray, timeoutMs: Long, decompress: Boolean, )</ID>
@@ -51,7 +54,7 @@
     <ID>NestedBlockDepth:Consensus.kt$ConsensusParser$fun parseMicrodescOrThrow(text: String): List&lt;MicrodescBody&gt;</ID>
     <ID>NestedBlockDepth:Consensus.kt$ConsensusParser$fun parseOrThrow(text: String): Consensus</ID>
     <ID>NestedBlockDepth:Directory.kt$BatchedFetchStream$private suspend fun loop()</ID>
-    <ID>NestedBlockDepth:Http1.kt$fun readHttp1Raw( maxBody: Int = MAX_HTTP1_BODY, read: () -&gt; ByteArray?, ): ByteArray</ID>
+    <ID>NestedBlockDepth:Http1.kt$fun readHttp1Raw( maxBody: Int = MAX_HTTP1_BODY, onDownload: ((received: Int, total: Int?) -&gt; Unit)? = null, read: () -&gt; ByteArray?, ): ByteArray</ID>
     <ID>NestedBlockDepth:Inflate.android.kt$internal actual fun inflateZlibOrNull(input: ByteArray): ByteArray?</ID>
     <ID>NestedBlockDepth:Inflate.jvm.kt$internal actual fun inflateZlibOrNull(input: ByteArray): ByteArray?</ID>
     <ID>NestedBlockDepth:TlsClient.kt$private suspend fun runTlsHandshake( transport: ByteDuplex, hostName: String?, ): TlsSession</ID>
@@ -84,7 +87,7 @@
     <ID>ThrowsCount:Directory.kt$suspend fun fetchMicrodesc( head: MicrodescHead, signal: Abort = Abort(), authorityHosts: List&lt;String&gt; = AUTHORITY_HOSTS, concurrency: Int = 4, engine: HttpEngine = defaultHttpEngine(), ): Microdesc</ID>
     <ID>ThrowsCount:Directory.kt$suspend fun fetchMicrodescConsensus( signal: Abort = Abort(), mirrors: List&lt;String&gt; = CONSENSUS_MIRRORS, force: Boolean = false, concurrency: Int = 3, engine: HttpEngine = defaultHttpEngine(), ): Consensus</ID>
     <ID>ThrowsCount:Directory.kt$suspend fun raceFirstCircuit( raceCount: Int, build: suspend (Abort) -&gt; Circuit, signal: Abort = Abort(), ): Circuit</ID>
-    <ID>ThrowsCount:Http1.kt$fun readHttp1Raw( maxBody: Int = MAX_HTTP1_BODY, read: () -&gt; ByteArray?, ): ByteArray</ID>
+    <ID>ThrowsCount:Http1.kt$fun readHttp1Raw( maxBody: Int = MAX_HTTP1_BODY, onDownload: ((received: Int, total: Int?) -&gt; Unit)? = null, read: () -&gt; ByteArray?, ): ByteArray</ID>
     <ID>TooGenericExceptionCaught:Client.kt$SecretTorClientDuplex$e: Throwable</ID>
     <ID>TooGenericExceptionCaught:Directory.kt$&lt;no name provided&gt;$err: Throwable</ID>
     <ID>TooGenericExceptionCaught:Directory.kt$BatchedFetchStream$e: Throwable</ID>

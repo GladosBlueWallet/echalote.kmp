@@ -118,4 +118,41 @@ class HttpsFetchTest {
                 httpsSessionFactory = null
             }
         }
+
+    @Test
+    fun reportsMonotonicProgressAndFinishesAt100() =
+        runTest {
+            val body = "x".repeat(80)
+            val header = "HTTP/1.1 200 OK\r\nContent-Length: 80\r\nConnection: keep-alive\r\n\r\n"
+            val stream =
+                ScriptedDuplex(
+                    listOf(
+                        (header + body.substring(0, 30)).encodeToByteArray(),
+                        body.substring(30).encodeToByteArray(),
+                    ),
+                )
+            httpsSessionFactory = { _, _, _ -> HttpsSession(stream) { stream.close() } }
+            val events = ArrayList<Pair<Int, String>>()
+            try {
+                resetHttpsSessions()
+                val res =
+                    httpsFetch("https://example.com/data") { percent, stage ->
+                        events += percent to stage
+                    }
+                assertEquals(200, res.status)
+            } finally {
+                resetHttpsSessions()
+                httpsSessionFactory = null
+            }
+            assertTrue(events.isNotEmpty())
+            assertEquals(0, events.first().first)
+            assertEquals("Starting", events.first().second)
+            assertTrue(events.any { it.second == "Sending request" })
+            val downloads = events.filter { it.second == "Downloading response" }
+            assertTrue(downloads.size >= 2, "expected incremental download ticks, got $events")
+            assertTrue(downloads.first().first < downloads.last().first)
+            assertEquals(100, events.last().first)
+            assertEquals("Done", events.last().second)
+            assertTrue(events.zipWithNext().all { it.first.first <= it.second.first })
+        }
 }

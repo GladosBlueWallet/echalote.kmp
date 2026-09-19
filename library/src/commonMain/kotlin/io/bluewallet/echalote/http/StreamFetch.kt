@@ -4,6 +4,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.CancellationException as CoroutineCancellation
 
 internal const val TOR_BROWSER_USER_AGENT =
@@ -97,6 +98,7 @@ suspend fun streamFetch(
             for ((k, v) in headers) append("$k: $v\r\n")
             append("\r\n")
         }
+    val progress = fetchProgress()
     init.stream.write(concatBytes(head.encodeToByteArray(), init.body))
     // Do not close the duplex here. A full close tears down TLS/Tor reads.
     // The TypeScript client only half-closes the write side; this ByteDuplex
@@ -118,6 +120,7 @@ suspend fun streamFetch(
         responseHeaders[line.substring(0, colon).trim()] = line.substring(colon + 1).trim()
     }
     val transfer = responseHeaders.entries.firstOrNull { it.key.equals("Transfer-Encoding", true) }?.value
+    progress?.report(FetchStage.DOWNLOADING_RESPONSE)
     var bodyBytes =
         if (transfer != null && transfer.lowercase().contains("chunked")) {
             reader.readChunkedBody()
@@ -127,8 +130,11 @@ suspend fun streamFetch(
                     ?: throw IllegalArgumentException("HTTP response missing Content-Length and chunked encoding")
             val length = lengthHeader.toIntOrNull()
             require(length != null && length >= 0) { "Invalid Content-Length: $lengthHeader" }
-            reader.readExact(length)
+            reader.readExact(length) { have ->
+                progress?.downloadBytes(FetchStage.DOWNLOADING_RESPONSE, have, length)
+            }
         }
+    progress?.report(FetchStage.DOWNLOADING_RESPONSE, 1.0)
     inflateZlibOrNull(bodyBytes)?.let { bodyBytes = it }
     return StreamResponse(status, statusText, responseHeaders, bodyBytes)
 }
@@ -162,43 +168,56 @@ internal suspend fun resetHttpsSessions() {
     }
 }
 
+@Suppress("LongParameterList")
 suspend fun httpsFetch(
     url: String,
     abort: Abort? = null,
     method: String = "GET",
     headers: Map<String, String> = emptyMap(),
     body: ByteArray = ByteArray(0),
+    onProgress: FetchProgressListener? = null,
 ): StreamResponse {
-    val parsed = parseUrl(url)
-    val key = parsed.host.lowercase() to parsed.port
-    var retried = false
-    var last: Throwable? = null
-    while (true) {
-        val session = obtainHttpsSession(key, parsed.host, parsed.port, abort)
-        val first =
-            runCatching {
-                streamFetch(url, StreamFetchInit(session.plaintext, abort, headers, method, body))
-            }
-        keptAlive(key, first)?.let { return it }
-        last = first.exceptionOrNull()
-        val stop =
-            last is CoroutineCancellation ||
-                abort?.aborted == true ||
-                last?.message?.contains("closed duplex") == true
-        if (!stop) {
-            val second =
+    val reporter = FetchProgressReporter(onProgress)
+    return withContext(FetchProgressContext(reporter)) {
+        reporter.report(FetchStage.STARTING)
+        val parsed = parseUrl(url)
+        val key = parsed.host.lowercase() to parsed.port
+        var retried = false
+        var last: Throwable? = null
+        while (true) {
+            val session = obtainHttpsSession(key, parsed.host, parsed.port, abort)
+            reporter.report(FetchStage.SENDING_REQUEST)
+            val first =
                 runCatching {
                     streamFetch(url, StreamFetchInit(session.plaintext, abort, headers, method, body))
                 }
-            keptAlive(key, second)?.let { return it }
-            last = second.exceptionOrNull()
+            keptAlive(key, first)?.let {
+                reporter.report(FetchStage.DONE)
+                return@withContext it
+            }
+            last = first.exceptionOrNull()
+            val stop =
+                last is CoroutineCancellation ||
+                    abort?.aborted == true ||
+                    last?.message?.contains("closed duplex") == true
+            if (!stop) {
+                val second =
+                    runCatching {
+                        streamFetch(url, StreamFetchInit(session.plaintext, abort, headers, method, body))
+                    }
+                keptAlive(key, second)?.let {
+                    reporter.report(FetchStage.DONE)
+                    return@withContext it
+                }
+                last = second.exceptionOrNull()
+            }
+            evictHttpsSession(key)
+            forgetDefaultCircuit(parsed.host, parsed.port)
+            if (last is CoroutineCancellation || retried || abort?.aborted == true) break
+            retried = true
         }
-        evictHttpsSession(key)
-        forgetDefaultCircuit(parsed.host, parsed.port)
-        if (last is CoroutineCancellation || retried || abort?.aborted == true) break
-        retried = true
+        throw last ?: Exception("https fetch failed")
     }
-    throw last ?: Exception("https fetch failed")
 }
 
 private fun keepsAlive(res: StreamResponse): Boolean {
@@ -268,6 +287,7 @@ private suspend fun openDefaultHttpsSession(
             forgetDefaultCircuit(host, port)
             throw err
         }
+    fetchProgress()?.report(FetchStage.OPENING_CONNECTION, 1.0)
     return HttpsSession(tls) {
         try {
             tls.close()
@@ -344,8 +364,15 @@ private class HttpByteReader(
         }
     }
 
-    suspend fun readExact(n: Int): ByteArray {
-        while (buf.size < n) pull()
+    suspend fun readExact(
+        n: Int,
+        onHave: ((Int) -> Unit)? = null,
+    ): ByteArray {
+        onHave?.invoke(buf.size.coerceAtMost(n))
+        while (buf.size < n) {
+            pull()
+            onHave?.invoke(buf.size.coerceAtMost(n))
+        }
         val out = buf.copyOfRange(0, n)
         buf = buf.copyOfRange(n, buf.size)
         return out

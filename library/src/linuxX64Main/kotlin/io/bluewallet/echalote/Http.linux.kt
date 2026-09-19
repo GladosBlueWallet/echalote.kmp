@@ -28,6 +28,7 @@ import platform.posix.socket
 @OptIn(ExperimentalForeignApi::class)
 actual fun defaultHttpEngine(): HttpEngine =
     HttpEngine { method, url, headers, body, timeoutMs, _ ->
+        val onDownload = http1ProgressSink()
         if (!usesCleartextHttp1(url)) {
             throw UnsupportedOperationException("linuxX64 default HttpEngine is HTTP-only; inject an engine for HTTPS meek")
         }
@@ -46,7 +47,7 @@ actual fun defaultHttpEngine(): HttpEngine =
 
                 sendAll(fd, buildHttp1Request(method, parsed, headers, body))
 
-                val raw = recvHttp1(fd)
+                val raw = recvHttp1(fd, onDownload)
                 return@memScoped parseHttp1Response(raw)
             } finally {
                 close(fd)
@@ -79,9 +80,12 @@ private fun sendAll(
 }
 
 @OptIn(ExperimentalForeignApi::class)
-private fun recvHttp1(fd: Int): ByteArray {
+private fun recvHttp1(
+    fd: Int,
+    onDownload: ((Int, Int?) -> Unit)?,
+): ByteArray {
     val buf = ByteArray(16 * 1024)
-    return readHttp1Raw {
+    return readHttp1Raw(onDownload = onDownload) {
         buf.usePinned { pinned ->
             val n = recv(fd, pinned.addressOf(0), buf.size.convert(), 0)
             if (n <= 0) null else buf.copyOf(n.toInt())

@@ -69,6 +69,46 @@ class Http1Test {
     }
 
     @Test
+    fun readHttp1Raw_reports_body_bytes_when_content_length_is_known() {
+        val chunks =
+            ArrayDeque(
+                listOf(
+                    "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nab".encodeToByteArray(),
+                    "cd".encodeToByteArray(),
+                    "efgh".encodeToByteArray(),
+                ),
+            )
+        val ticks = ArrayList<Pair<Int, Int?>>()
+        val raw =
+            readHttp1Raw(onDownload = { received, total -> ticks.add(Pair(received, total)) }) {
+                chunks.removeFirstOrNull()
+            }
+        assertEquals("abcdefgh", parseHttp1Response(raw).body.decodeToString())
+        assertEquals(3, ticks.size)
+        assertEquals(2, ticks[0].first)
+        assertEquals(8, ticks[0].second)
+        assertEquals(4, ticks[1].first)
+        assertEquals(8, ticks[1].second)
+        assertEquals(8, ticks[2].first)
+        assertEquals(8, ticks[2].second)
+    }
+
+    @Test
+    fun readHttp1Raw_does_not_report_download_for_error_status() {
+        val chunks =
+            ArrayDeque(
+                listOf("HTTP/1.1 404 Not Found\r\nContent-Length: 8\r\n\r\nabcdefgh".encodeToByteArray()),
+            )
+        val ticks = ArrayList<Pair<Int, Int?>>()
+        val raw =
+            readHttp1Raw(onDownload = { received, total -> ticks.add(Pair(received, total)) }) {
+                chunks.removeFirstOrNull()
+            }
+        assertEquals(404, parseHttp1Response(raw).status)
+        assertEquals(0, ticks.size)
+    }
+
+    @Test
     fun readHttp1Raw_stops_at_content_length_without_waiting_for_eof() {
         val chunks =
             ArrayDeque(

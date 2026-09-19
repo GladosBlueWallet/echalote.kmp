@@ -108,6 +108,7 @@ fun http1MessageComplete(raw: ByteArray): Boolean {
 
 fun readHttp1Raw(
     maxBody: Int = MAX_HTTP1_BODY,
+    onDownload: ((received: Int, total: Int?) -> Unit)? = null,
     read: () -> ByteArray?,
 ): ByteArray {
     val chunks = ArrayList<ByteArray>()
@@ -128,24 +129,36 @@ fun readHttp1Raw(
         if (transfer != null && transfer.contains("chunked", ignoreCase = true)) {
             throw IllegalArgumentException("chunked Transfer-Encoding is not supported")
         }
+        val status =
+            headers
+                .decodeToString()
+                .substringBefore("\r\n")
+                .split(" ")
+                .getOrNull(1)
+                ?.toIntOrNull() ?: 0
+        val tick = if (status in 200..299) onDownload else null
         val length = parseHttp1ContentLength(http1HeaderValue(headers, "Content-Length"), maxBody)
         var haveBody = soFar.size - headerEnd - 4
         if (length == null) {
             require(haveBody <= maxBody) { "HTTP body too large" }
+            tick?.invoke(haveBody, null)
             while (true) {
                 val more = read() ?: break
                 if (more.isEmpty()) continue
                 haveBody += more.size
                 require(haveBody <= maxBody) { "HTTP body too large" }
                 chunks += more
+                tick?.invoke(haveBody, null)
             }
             return concatBytes(*chunks.toTypedArray())
         }
+        tick?.invoke(haveBody.coerceAtMost(length), length)
         while (haveBody < length) {
             val more = read() ?: throw IllegalArgumentException("truncated HTTP body")
             if (more.isEmpty()) continue
             chunks += more
             haveBody += more.size
+            tick?.invoke(haveBody.coerceAtMost(length), length)
         }
         return concatBytes(*chunks.toTypedArray())
     }
