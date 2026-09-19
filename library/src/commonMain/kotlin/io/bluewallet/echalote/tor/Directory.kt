@@ -11,6 +11,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 const val DEFAULT_MEEK_URL = "https://1603026938.rsc.cdn77.org/"
 
@@ -161,6 +162,7 @@ interface ExitDialer {
         host: String,
         port: Int,
         abort: Abort? = null,
+        onProgress: FetchProgressListener? = null,
     ): TorStreamDuplex
 
     suspend fun dispose()
@@ -713,36 +715,47 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
             host: String,
             port: Int,
             abort: Abort?,
+            onProgress: FetchProgressListener?,
         ): TorStreamDuplex {
-            if (disposed) throw Exception("exit dialer disposed")
-            val signal = abort ?: Abort()
-            val key = cacheKey(host, port)
-            var retried = false
-            while (true) {
-                val client = ensureTor(signal)
-                val cached = circuitLock.withLock { circuits[key] }
-                val cacheHit = cached != null && !cached.circuit.isClosed
-                val circuit = obtainCircuit(client, signal, key)
-                val progress = fetchProgress()
-                progress?.report(FetchStage.OPENING_CONNECTION)
-                println(
-                    "echalote.dial $host:$port retry=$retried cacheHit=$cacheHit circ=${circuit.id} " +
-                        "torClosed=${client.closed != null}",
-                )
-                try {
-                    val stream =
-                        withAbortTimeout(options.openTimeoutMs, signal) { linked ->
-                            circuit.openOrThrow(host, port, wait = true, abort = linked)
-                        }
-                    progress?.report(FetchStage.OPENING_CONNECTION, 0.5)
-                    println("echalote.open-ok $host:$port circ=${circuit.id}")
-                    return TorStreamDuplex(stream.outer) { stream.close() }
-                } catch (err: Throwable) {
-                    println("echalote.open-fail $host:$port circ=${circuit.id} ${err.message}")
-                    circuitLock.withLock { evictCircuit(key) }
-                    if (retried || signal.aborted) throw wrap("open $host:$port", err)
-                    retried = true
+            suspend fun open(): TorStreamDuplex {
+                if (disposed) throw Exception("exit dialer disposed")
+                val signal = abort ?: Abort()
+                val key = cacheKey(host, port)
+                var retried = false
+                while (true) {
+                    val client = ensureTor(signal)
+                    val cached = circuitLock.withLock { circuits[key] }
+                    val cacheHit = cached != null && !cached.circuit.isClosed
+                    val circuit = obtainCircuit(client, signal, key)
+                    val progress = fetchProgress()
+                    progress?.report(FetchStage.OPENING_CONNECTION)
+                    println(
+                        "echalote.dial $host:$port retry=$retried cacheHit=$cacheHit circ=${circuit.id} " +
+                            "torClosed=${client.closed != null}",
+                    )
+                    try {
+                        val stream =
+                            withAbortTimeout(options.openTimeoutMs, signal) { linked ->
+                                circuit.openOrThrow(host, port, wait = true, abort = linked)
+                            }
+                        progress?.report(FetchStage.OPENING_CONNECTION, 0.5)
+                        println("echalote.open-ok $host:$port circ=${circuit.id}")
+                        return TorStreamDuplex(stream.outer) { stream.close() }
+                    } catch (err: Throwable) {
+                        println("echalote.open-fail $host:$port circ=${circuit.id} ${err.message}")
+                        circuitLock.withLock { evictCircuit(key) }
+                        if (retried || signal.aborted) throw wrap("open $host:$port", err)
+                        retried = true
+                    }
                 }
+            }
+            if (onProgress == null) return open()
+            val reporter = FetchProgressReporter(onProgress)
+            return withContext(FetchProgressContext(reporter)) {
+                reporter.report(FetchStage.STARTING)
+                val stream = open()
+                reporter.report(FetchStage.DONE)
+                stream
             }
         }
 
@@ -853,7 +866,8 @@ object Echalote {
         host: String,
         port: Int,
         abort: Abort? = null,
-    ) = defaultExitDialer().dial(host, port, abort)
+        onProgress: FetchProgressListener? = null,
+    ) = defaultExitDialer().dial(host, port, abort, onProgress)
 
     fun createMeekStream(url: String = io.bluewallet.echalote.DEFAULT_MEEK_URL) = io.bluewallet.echalote.createMeekStream(url)
 

@@ -226,4 +226,31 @@ class ExitDialerCircuitReuseTest {
                 dialer.dispose()
             }
         }
+
+    @Test
+    fun reportsMonotonicProgressAndFinishesAt100() =
+        runTest {
+            val events = ArrayList<Pair<Int, String>>()
+            val dialer =
+                createExitDialer(
+                    options { _, _ -> RecordingCircuit(1) },
+                )
+            try {
+                val stream =
+                    dialer.dial("example.com", 443) { percent, stage ->
+                        events += percent to stage
+                    }
+                stream.close()
+            } finally {
+                dialer.dispose()
+            }
+            assertTrue(events.isNotEmpty(), "got $events")
+            assertEquals(0, events.first().first)
+            assertEquals("Starting", events.first().second)
+            assertTrue(events.any { it.second == "Connecting" }, "got $events")
+            assertTrue(events.any { it.second == "Opening connection" }, "got $events")
+            assertEquals(100, events.last().first)
+            assertEquals("Done", events.last().second)
+            assertTrue(events.zipWithNext().all { it.first.first <= it.second.first }, "got $events")
+        }
 }
