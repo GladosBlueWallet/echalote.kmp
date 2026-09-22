@@ -127,9 +127,7 @@ suspend fun streamFetch(
         if (name.equals("Content-Length", true)) contentLengths += value
         responseHeaders[name] = value
     }
-    if (contentLengths.map { it.trim() }.distinct().size > 1) {
-        throw IllegalArgumentException("conflicting Content-Length")
-    }
+    require(contentLengths.map { it.trim() }.distinct().size <= 1) { "conflicting Content-Length" }
     val transfer = responseHeaders.entries.firstOrNull { it.key.equals("Transfer-Encoding", true) }?.value
     progress?.report(FetchStage.DOWNLOADING_RESPONSE)
     var bodyBytes =
@@ -148,9 +146,8 @@ suspend fun streamFetch(
                 reader.readUntilEof { have ->
                     progress?.downloadBytes(FetchStage.DOWNLOADING_RESPONSE, have, null)
                 }
-            } else if (lengthHeader == null) {
-                throw IllegalArgumentException("HTTP response missing Content-Length and chunked encoding")
             } else {
+                require(lengthHeader != null) { "HTTP response missing Content-Length and chunked encoding" }
                 val length = lengthHeader.toLongOrNull()
                 require(length != null && length >= 0) { "Invalid Content-Length: $lengthHeader" }
                 require(length <= MAX_HTTP1_BODY) { "HTTP body too large: $length" }
@@ -185,12 +182,12 @@ private fun decodeContentEncoding(
             .firstOrNull { it.key.equals("Content-Encoding", true) }
             ?.value
             ?.lowercase()
-            ?: return body
-    if (encoding == "identity" || encoding.isEmpty()) return body
-    if (encoding.contains("deflate") || encoding.contains("zlib")) {
-        return inflateZlibOrNull(body) ?: throw IllegalArgumentException("bad zlib body")
+    return when {
+        encoding == null || encoding == "identity" || encoding.isEmpty() -> body
+        encoding.contains("deflate") || encoding.contains("zlib") ->
+            inflateZlibOrNull(body) ?: error("bad zlib body")
+        else -> error("unsupported Content-Encoding: $encoding")
     }
-    throw IllegalArgumentException("unsupported Content-Encoding: $encoding")
 }
 
 private val CRLF = "\r\n".encodeToByteArray()

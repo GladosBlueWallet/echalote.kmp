@@ -278,7 +278,9 @@ internal fun parseConsensusTime(text: String): Long {
 }
 
 internal fun Consensus.ensureFresh(now: Long = currentEpochMillis()) {
-    val after = validAfterMillis ?: throw Exception("consensus missing valid-after")
-    val until = validUntilMillis ?: throw Exception("consensus missing valid-until")
-    if (now < after || now > until) throw Exception("consensus outside its validity window")
+    val after = validAfterMillis
+    val until = validUntilMillis
+    check(after != null && until != null && now >= after && now <= until) {
+        "consensus outside its validity window"
+    }
 }

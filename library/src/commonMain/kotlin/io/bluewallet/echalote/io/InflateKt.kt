@@ -3,20 +3,21 @@ package io.bluewallet.echalote
 /** Pure Kotlin zlib/deflate inflater (RFC 1950/1951) for native targets. */
 internal object InflateKt {
     fun inflateZlibOrNull(input: ByteArray): ByteArray? {
-        if (input.size < 6) return null
-        val cmf = input.u8(0)
-        val flg = input.u8(1)
-        if (cmf and 0x0f != 8) return null
-        if ((cmf * 256 + flg) % 31 != 0) return null
-        if (flg and 0x20 != 0) return null
-        return try {
-            val (out, end) = inflateDeflate(input, 2)
-            if (end + 4 > input.size) return null
-            val expect = input.u32be(end).toLong() and 0xffffffffL
-            if (expect != adler32(out)) return null
-            out
-        } catch (_: Exception) {
+        val headerOk =
+            input.size >= 6 &&
+                input.u8(0) and 0x0f == 8 &&
+                (input.u8(0) * 256 + input.u8(1)) % 31 == 0 &&
+                input.u8(1) and 0x20 == 0
+        return if (!headerOk) {
             null
+        } else {
+            try {
+                val (out, end) = inflateDeflate(input, 2)
+                val expect = if (end + 4 <= input.size) input.u32be(end).toLong() and 0xffffffffL else null
+                if (expect != null && expect == adler32(out)) out else null
+            } catch (_: Exception) {
+                null
+            }
         }
     }
 

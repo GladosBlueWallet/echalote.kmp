@@ -669,7 +669,7 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
                         tor != null
                     }
                 }
-            if (!installed) throw Exception("tor connection closed")
+            check(installed) { "tor connection closed" }
         } catch (err: Throwable) {
             try {
                 meek.error(err)
@@ -828,7 +828,7 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
                         }
                     if (!installed) {
                         scope.launch { runCatching { built.close() } }
-                        throw Exception("circuit build was reset")
+                        error("circuit build was reset")
                     }
                     flight.deferred.complete(built)
                     return built
@@ -946,7 +946,13 @@ internal suspend fun buildExitCircuitOnce(
                 mirrors = options.consensusUrls ?: CONSENSUS_MIRRORS,
                 engine = engine,
             )
-        val guardId = (circuit as? LiveCircuit)?.secret?.targets?.firstOrNull()?.relayidRsa
+        val guardId =
+            (circuit as? LiveCircuit)
+                ?.secret
+                ?.targets
+                ?.firstOrNull()
+                ?.relayidRsa
+
         fun notGuard(head: MicrodescHead): Boolean {
             if (guardId == null) return true
             return !equalBytes(Base64.decode(head.identity), guardId)

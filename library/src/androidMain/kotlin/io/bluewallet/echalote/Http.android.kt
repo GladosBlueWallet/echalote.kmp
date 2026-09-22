@@ -102,7 +102,7 @@ private fun readStreamProgress(
         if (n < 0) break
         out.write(buf, 0, n)
         received += n
-        if (received > MAX_HTTP1_BODY) throw IllegalArgumentException("HTTP body too large")
+        require(received <= MAX_HTTP1_BODY) { "HTTP body too large" }
         onDownload?.invoke(received, total)
     }
     return out.toByteArray()

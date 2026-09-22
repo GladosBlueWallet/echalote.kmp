@@ -74,9 +74,7 @@ fun parseHttp1Response(raw: ByteArray): HttpResponse {
             headers[name] = value
         }
     }
-    if (contentLengths.map { it.trim() }.distinct().size > 1) {
-        throw IllegalArgumentException("conflicting Content-Length")
-    }
+    require(contentLengths.map { it.trim() }.distinct().size <= 1) { "conflicting Content-Length" }
     val length = contentLengths.firstOrNull()?.toIntOrNull()
     val sliced = if (length != null) body.copyOf(minOf(length, body.size)) else body
     return HttpResponse(status, sliced, headers)
@@ -112,8 +110,8 @@ fun http1HeaderValue(
         if (c <= 0) continue
         if (line.substring(0, c).trim().equals(name, ignoreCase = true)) {
             val value = line.substring(c + 1).trim()
-            if (found != null && name.equals("Content-Length", true) && found != value) {
-                throw IllegalArgumentException("conflicting Content-Length")
+            require(found == null || !name.equals("Content-Length", true) || found == value) {
+                "conflicting Content-Length"
             }
             if (found == null) found = value
         }

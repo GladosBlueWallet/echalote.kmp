@@ -25,10 +25,11 @@ internal class SecretTorStreamDuplex(
             }
         }
         duplex.onRead = { n ->
-            val owed = circuit.tor.gate.withLock {
-                bufferedBytes = (bufferedBytes - n).coerceAtLeast(0)
-                takeOwedSendmes()
-            }
+            val owed =
+                circuit.tor.gate.withLock {
+                    bufferedBytes = (bufferedBytes - n).coerceAtLeast(0)
+                    takeOwedSendmes()
+                }
             if (owed > 0) launchStreamSendmes(owed)
         }
         duplex.onClose = {

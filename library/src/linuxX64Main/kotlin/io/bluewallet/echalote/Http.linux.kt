@@ -102,7 +102,7 @@ private fun sendAll(
             val n = send(fd, pinned.addressOf(off), (data.size - off).convert(), MSG_NOSIGNAL)
             if (n < 0) {
                 if (errno == EINTR) continue
-                error("send failed (${errno})")
+                error("send failed ($errno)")
             }
             check(n > 0) { "send failed" }
             off += n.toInt()
@@ -116,22 +116,29 @@ private fun recvHttp1(
     onDownload: ((Int, Int?) -> Unit)?,
 ): ByteArray {
     val buf = ByteArray(16 * 1024)
-    return readHttp1Raw(onDownload = onDownload) {
-        buf.usePinned { pinned ->
-            while (true) {
-                val n = recv(fd, pinned.addressOf(0), buf.size.convert(), 0)
-                when {
-                    n > 0 -> return@usePinned buf.copyOf(n.toInt())
-                    n.toLong() == 0L -> return@usePinned null
-                    else -> {
-                        val err = errno
-                        if (err == EINTR) continue
-                        if (err == EAGAIN || err == EWOULDBLOCK || err == ETIMEDOUT) {
-                            error("HTTP socket timeout")
-                        }
-                        error("recv failed ($err)")
-                    }
+    return readHttp1Raw(onDownload = onDownload) { recvOnce(fd, buf) }
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun recvOnce(
+    fd: Int,
+    buf: ByteArray,
+): ByteArray? {
+    while (true) {
+        val n =
+            buf.usePinned { pinned ->
+                recv(fd, pinned.addressOf(0), buf.size.convert(), 0)
+            }
+        when {
+            n > 0 -> return buf.copyOf(n.toInt())
+            n.toLong() == 0L -> return null
+            else -> {
+                val err = errno
+                if (err == EINTR) continue
+                if (err == EAGAIN || err == EWOULDBLOCK || err == ETIMEDOUT) {
+                    error("HTTP socket timeout")
                 }
+                error("recv failed ($err)")
             }
         }
     }

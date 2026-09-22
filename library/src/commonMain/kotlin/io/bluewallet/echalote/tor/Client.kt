@@ -203,10 +203,17 @@ internal class SecretTorClientDuplex {
         circuit: SecretCircuit,
         streamId: Int,
     ): Boolean {
-        if (closed != null) throw Exception("tor connection closed")
-        if (circuit.closed != null) throw (circuit.closed as? Throwable) ?: DestroyedError(0)
-        val stream = circuit.streams[streamId] ?: throw UnknownStreamError()
-        val exit = circuit.targets.lastOrNull() ?: throw InvalidTorStateError()
+        val reason =
+            when {
+                closed != null -> IllegalStateException("tor connection closed")
+                circuit.closed != null -> (circuit.closed as? Throwable) ?: DestroyedError(0)
+                circuit.streams[streamId] == null -> UnknownStreamError()
+                circuit.targets.isEmpty() -> InvalidTorStateError()
+                else -> null
+            }
+        if (reason != null) throw reason
+        val stream = circuit.streams.getValue(streamId)
+        val exit = circuit.targets.last()
         return stream.packageWindow > 0 && exit.packageWindow > 0
     }
 

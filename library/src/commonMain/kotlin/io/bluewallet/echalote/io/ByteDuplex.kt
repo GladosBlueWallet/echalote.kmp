@@ -45,17 +45,11 @@ private fun take(
 }
 
 private fun ready(state: DuplexSide): Ready? {
-    val waiter = state.waiter ?: return null
-    val chunk = take(state, waiter.n)
-    if (chunk != null) {
-        state.waiter = null
-        return Ready(waiter.deferred, chunk)
-    }
-    if (state.closed || state.peerClosed) {
-        state.waiter = null
-        return Ready(waiter.deferred, ByteArray(0))
-    }
-    return null
+    val waiter = state.waiter
+    val chunk = if (waiter != null) take(state, waiter.n) else null
+    val done = chunk != null || (waiter != null && (state.closed || state.peerClosed))
+    if (done && waiter != null) state.waiter = null
+    return if (done && waiter != null) Ready(waiter.deferred, chunk ?: ByteArray(0)) else null
 }
 
 private fun deliver(
@@ -196,17 +190,11 @@ class ChannelDuplex : ByteDuplex {
     }
 
     private fun ready(): Ready? {
-        val w = waiter ?: return null
-        val chunk = take(w.n)
-        if (chunk != null) {
-            waiter = null
-            return Ready(w.deferred, chunk)
-        }
-        if (terminal != null || closed) {
-            waiter = null
-            return Ready(w.deferred, ByteArray(0))
-        }
-        return null
+        val w = waiter
+        val chunk = if (w != null) take(w.n) else null
+        val done = chunk != null || (w != null && (terminal != null || closed))
+        if (done) waiter = null
+        return if (done && w != null) Ready(w.deferred, chunk ?: ByteArray(0)) else null
     }
 
     suspend fun enqueue(bytes: ByteArray) {
