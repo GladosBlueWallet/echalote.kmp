@@ -304,6 +304,7 @@ private suspend fun httpsUrlSession(
         val req = NSMutableURLRequest.requestWithURL(nsUrl)
         req.setHTTPMethod(method)
         req.setTimeoutInterval(timeoutMs / 1000.0)
+        if (!decompress) req.setValue("identity", forHTTPHeaderField = "Accept-Encoding")
         for ((k, v) in headers) req.setValue(v, forHTTPHeaderField = k)
         if (body.isNotEmpty()) {
             body.usePinned { pinned ->
@@ -312,6 +313,7 @@ private suspend fun httpsUrlSession(
         }
         val task =
             session.dataTaskWithRequest(req) { data, response, error ->
+                if (!cont.isActive) return@dataTaskWithRequest
                 if (error != null) {
                     cont.resumeWithException(Exception(error.localizedDescription))
                     return@dataTaskWithRequest
@@ -319,6 +321,10 @@ private suspend fun httpsUrlSession(
                 val http = response as? NSHTTPURLResponse
                 val status = http?.statusCode?.toInt() ?: 0
                 val bytes = data?.toByteArray() ?: ByteArray(0)
+                if (bytes.size > MAX_HTTP1_BODY) {
+                    cont.resumeWithException(IllegalArgumentException("HTTP body too large"))
+                    return@dataTaskWithRequest
+                }
                 val hdrs = mutableMapOf<String, String>()
                 val dict = http?.allHeaderFields
                 if (dict != null) {

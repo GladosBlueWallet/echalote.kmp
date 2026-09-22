@@ -9,21 +9,36 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 internal class Emitter<T> {
+    private val lock = SpinLock()
     private val listeners = ArrayList<(T) -> Unit>()
+    private val pending = ArrayList<CompletableDeferred<T>>()
+    private var failure: Throwable? = null
 
     fun on(fn: (T) -> Unit): () -> Unit {
-        listeners += fn
-        return {
-            listeners.remove(fn)
-        }
+        lock.withLock { listeners += fn }
+        return { lock.withLock { listeners.remove(fn) } }
     }
 
     fun emit(value: T) {
-        for (l in listeners.toList()) {
+        val copy = lock.withLock { listeners.toList() }
+        for (l in copy) {
             try {
                 l(value)
             } catch (_: Throwable) {
             }
+        }
+    }
+
+    fun fail(reason: Throwable) {
+        val waiters =
+            lock.withLock {
+                if (failure == null) failure = reason
+                val copy = pending.toList()
+                pending.clear()
+                copy
+            }
+        for (d in waiters) {
+            if (!d.isCompleted) d.completeExceptionally(reason)
         }
     }
 
@@ -32,14 +47,21 @@ internal class Emitter<T> {
         pred: (T) -> Boolean = { true },
     ): T {
         val done = CompletableDeferred<T>()
-        val off =
-            on { v ->
-                if (pred(v) && !done.isCompleted) done.complete(v)
-            }
+        val listener: (T) -> Unit = { v ->
+            if (pred(v) && !done.isCompleted) done.complete(v)
+        }
+        lock.withLock {
+            failure?.let { throw it }
+            pending += done
+            listeners += listener
+        }
         return try {
             withAbort(abort) { done.await() }
         } finally {
-            off()
+            lock.withLock {
+                listeners.remove(listener)
+                pending.remove(done)
+            }
         }
     }
 }
@@ -78,7 +100,8 @@ internal class SecretTorClientDuplex {
     val tls = TlsClientDuplex()
     val inner: ByteDuplex get() = tls.inner
     val circuits = LinkedHashMap<Int, SecretCircuit>()
-    val circuitsLock = Mutex()
+    val gate = SpinLock()
+    private val windowWaiters = ArrayList<CompletableDeferred<Unit>>()
     var state: TorState = TorState.None
     var closed: Any? = null
     val createdFast = Emitter<Pair<SecretCircuit, Pair<ByteArray, ByteArray>>>()
@@ -92,6 +115,7 @@ internal class SecretTorClientDuplex {
     val closeEvent = Emitter<Unit>()
     val errorEvent = Emitter<Throwable>()
     private val writeLock = Mutex()
+    private val dataLock = Mutex()
     private val job = SupervisorJob()
     internal val scope = CoroutineScope(job + Dispatchers.Default)
 
@@ -117,28 +141,131 @@ internal class SecretTorClientDuplex {
         fragment: ByteArray,
         early: Boolean = false,
     ) {
+        if (rcommand == RelayCmd.DATA) {
+            sendData(circuit, streamId, fragment, early)
+        } else {
+            writeRelay(circuit, rcommand, streamId, fragment, early, false)
+        }
+    }
+
+    private suspend fun sendData(
+        circuit: SecretCircuit,
+        streamId: Int,
+        fragment: ByteArray,
+        early: Boolean,
+    ) {
+        while (true) {
+            val waiter = parkUntilWindow(circuit, streamId)
+            if (waiter != null) {
+                try {
+                    waiter.await()
+                } finally {
+                    gate.withLock { windowWaiters.remove(waiter) }
+                }
+                continue
+            }
+            val sent =
+                dataLock.withLock {
+                    val record =
+                        gate.withLock {
+                            if (!dataWindowOpen(circuit, streamId)) return@withLock null
+                            val stream = circuit.streams.getValue(streamId)
+                            val exit = circuit.targets.last()
+                            val mark = exit.packageWindow % 100 == 1
+                            stream.packageWindow--
+                            exit.packageWindow--
+                            mark
+                        }
+                    if (record == null) {
+                        false
+                    } else {
+                        writeRelay(circuit, RelayCmd.DATA, streamId, fragment, early, record)
+                        true
+                    }
+                }
+            if (sent) return
+        }
+    }
+
+    private fun parkUntilWindow(
+        circuit: SecretCircuit,
+        streamId: Int,
+    ): CompletableDeferred<Unit>? =
+        gate.withLock {
+            if (dataWindowOpen(circuit, streamId)) {
+                null
+            } else {
+                CompletableDeferred<Unit>().also { windowWaiters += it }
+            }
+        }
+
+    private fun dataWindowOpen(
+        circuit: SecretCircuit,
+        streamId: Int,
+    ): Boolean {
+        if (closed != null) throw Exception("tor connection closed")
+        if (circuit.closed != null) throw (circuit.closed as? Throwable) ?: DestroyedError(0)
+        val stream = circuit.streams[streamId] ?: throw UnknownStreamError()
+        val exit = circuit.targets.lastOrNull() ?: throw InvalidTorStateError()
+        return stream.packageWindow > 0 && exit.packageWindow > 0
+    }
+
+    private suspend fun writeRelay(
+        circuit: SecretCircuit,
+        rcommand: Int,
+        streamId: Int,
+        fragment: ByteArray,
+        early: Boolean,
+        recordDigest: Boolean,
+    ) {
         writeLock.withLock {
-            val payload = encodeRelayPayload(rcommand, streamId, fragment, circuit.targets, early)
+            val targets = gate.withLock { circuit.targets.toList() }
+            val (payload, digest) =
+                encodeRelayPayload(rcommand, streamId, fragment, targets, early, recordDigest)
+            if (digest != null) {
+                gate.withLock { targets.last().digests += digest }
+            }
             val cmd = if (early) CellCmd.RELAY_EARLY else CellCmd.RELAY
             tls.outer.write(writeCell(circuit.id, cmd, payload))
         }
     }
 
+    internal fun drainWindowWaiters(): List<CompletableDeferred<Unit>> {
+        val copy = windowWaiters.toList()
+        windowWaiters.clear()
+        return copy
+    }
+
+    internal fun wakeWindowWaiters() {
+        val waiters = gate.withLock { drainWindowWaiters() }
+        for (w in waiters) w.complete(Unit)
+    }
+
+    private fun failWaits(reason: Throwable) {
+        if (!handshaked.isCompleted) handshaked.completeExceptionally(reason)
+        createdFast.fail(reason)
+        relayExtended2.fail(reason)
+        relayConnected.fail(reason)
+        wakeWindowWaiters()
+    }
+
     fun close() {
         if (closed != null) return
         closed = true
+        val reason = Exception("tor connection closed")
+        failWaits(reason)
+        closeEvent.emit(Unit)
         job.cancel()
         tls.close()
-        closeEvent.emit(Unit)
     }
 
     fun error(reason: Throwable) {
         if (closed != null) return
         closed = reason
+        failWaits(reason)
+        errorEvent.emit(reason)
         job.cancel()
         tls.close()
-        errorEvent.emit(reason)
-        handshaked.completeExceptionally(reason)
     }
 
     suspend fun waitOrThrow(abort: Abort? = null) {
@@ -198,7 +325,7 @@ internal class SecretTorClientDuplex {
                 }
             }
             is TorState.Handshaked -> {
-                val circ = if (cell.circuitId != 0) circuits[cell.circuitId] else null
+                val circ = if (cell.circuitId != 0) gate.withLock { circuits[cell.circuitId] } else null
                 when (cell.command) {
                     CellCmd.CREATED_FAST -> {
                         if (circ != null) createdFast.emit(circ to readCreatedFast(cell.payload))
@@ -212,8 +339,14 @@ internal class SecretTorClientDuplex {
                     }
                     CellCmd.RELAY -> {
                         if (circ == null) return
-                        val relay = decodeRelayPayload(cell.payload, circ.targets)
-                        onRelay(circ, relay)
+                        try {
+                            val hops = gate.withLock { circ.targets.toList() }
+                            onRelay(circ, decodeRelayPayload(cell.payload, hops))
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
+                        } catch (e: Throwable) {
+                            circ.onCloseOrError(e)
+                        }
                     }
                 }
             }
@@ -224,48 +357,92 @@ internal class SecretTorClientDuplex {
         circ: SecretCircuit,
         relay: DecodedRelay,
     ) {
-        val stream = if (relay.streamId != 0) circ.streams[relay.streamId] else null
+        val stream =
+            if (relay.streamId != 0) gate.withLock { circ.streams[relay.streamId] } else null
         when (relay.rcommand) {
-            RelayCmd.EXTENDED2 -> relayExtended2.emit(circ to readExtended2(relay.fragment))
-            RelayCmd.CONNECTED -> if (stream != null) relayConnected.emit(circ to stream)
-            RelayCmd.DATA -> {
-                if (stream == null) return
-                val exit = circ.targets.last()
-                exit.delivery--
-                if (exit.delivery == 900) {
-                    exit.delivery = 1000
-                    val sendme = sendmeCircuitPayload(relay.digest20)
-                    sendRelay(circ, RelayCmd.SENDME, 0, sendme)
+            RelayCmd.EXTENDED2 -> {
+                if (!relay.fromEndpoint()) {
+                    circ.onCloseOrError(InvalidRelayCellDigestError())
+                    return
                 }
-                stream.onIncomingData(relay.fragment)
-                relayData.emit(circ to (stream to relay.fragment))
+                relayExtended2.emit(circ to readExtended2(relay.fragment))
             }
-            RelayCmd.END ->
-                if (stream != null) {
-                    circ.streams.remove(stream.id)
-                    relayEnd.emit(circ to (stream to readRelayEnd(relay.fragment)))
+            RelayCmd.CONNECTED -> {
+                if (!relay.fromEndpoint()) {
+                    circ.onCloseOrError(InvalidRelayCellDigestError())
+                    return
                 }
+                if (stream != null) relayConnected.emit(circ to stream)
+            }
+            RelayCmd.DATA -> {
+                if (!relay.fromEndpoint()) {
+                    circ.onCloseOrError(InvalidRelayCellDigestError())
+                    return
+                }
+                val sendme =
+                    gate.withLock {
+                        val exit = circ.targets.getOrNull(relay.hop) ?: return@withLock null
+                        exit.delivery--
+                        if (exit.delivery == 900) {
+                            exit.delivery = 1000
+                            relay.digest20
+                        } else {
+                            null
+                        }
+                    }
+                if (sendme != null) {
+                    sendRelay(circ, RelayCmd.SENDME, 0, sendmeCircuitPayload(sendme))
+                }
+                if (stream != null) {
+                    stream.onIncomingData(relay.fragment)
+                    relayData.emit(circ to (stream to relay.fragment))
+                }
+            }
+            RelayCmd.END -> {
+                if (!relay.fromEndpoint() || stream == null) return
+                val waiters =
+                    gate.withLock {
+                        circ.streams.remove(stream.id)
+                        drainWindowWaiters()
+                    }
+                for (w in waiters) w.complete(Unit)
+                relayEnd.emit(circ to (stream to readRelayEnd(relay.fragment)))
+            }
             RelayCmd.DROP -> {}
             RelayCmd.TRUNCATED -> {
-                if (circ.targets.isNotEmpty()) circ.targets.removeLast()
+                if (!relay.fromEndpoint()) {
+                    circ.onCloseOrError(InvalidRelayCellDigestError())
+                    return
+                }
+                gate.withLock {
+                    if (circ.targets.isNotEmpty()) circ.targets.removeLast()
+                }
                 val reason = if (relay.fragment.isNotEmpty()) relay.fragment.u8(0) else 0
                 relayTruncated.emit(circ to reason)
             }
             RelayCmd.SENDME -> {
-                if (stream == null) {
-                    val (version, frag) = readSendmeCircuit(relay.fragment)
-                    val exit = circ.targets.last()
-                    if (version == 0) {
-                        exit.packageWindow += 100
-                    } else if (version == 1) {
-                        val digest = Cursor(frag).read(20)
-                        val expect = if (exit.digests.isNotEmpty()) exit.digests.removeAt(0) else null
-                        if (expect == null || !equalBytes(digest, expect)) throw InvalidRelaySendmeCellDigestError()
-                        exit.packageWindow += 100
-                    }
-                } else {
-                    stream.packageWindow += 50
+                if (relay.streamId != 0) {
+                    if (!relay.fromEndpoint() || stream == null) return
+                    val waiters =
+                        gate.withLock {
+                            stream.packageWindow += 50
+                            drainWindowWaiters()
+                        }
+                    for (w in waiters) w.complete(Unit)
+                    return
                 }
+                val (version, frag) = readSendmeCircuit(relay.fragment)
+                if (version != 1 || frag.size != 20) throw InvalidRelaySendmeCellDigestError()
+                val digest = frag.copyOf(20)
+                val waiters =
+                    gate.withLock {
+                        val hop = circ.targets.getOrNull(relay.hop) ?: throw InvalidRelaySendmeCellDigestError()
+                        val expect = if (hop.digests.isNotEmpty()) hop.digests.removeAt(0) else null
+                        if (expect == null || !equalBytes(digest, expect)) throw InvalidRelaySendmeCellDigestError()
+                        hop.packageWindow += 100
+                        drainWindowWaiters()
+                    }
+                for (w in waiters) w.complete(Unit)
             }
         }
     }
@@ -274,7 +451,7 @@ internal class SecretTorClientDuplex {
         waitOrThrow(abort)
         val st = state as? TorState.Handshaked ?: throw InvalidTorStateError()
         val circuit =
-            circuitsLock.withLock {
+            gate.withLock {
                 var id = 0
                 do {
                     abort?.throwIfAborted()
@@ -286,23 +463,31 @@ internal class SecretTorClientDuplex {
                 circuits[id] = secret
                 secret
             }
-        val material = secureRandom(20)
-        send(writeCell(circuit.id, CellCmd.CREATE_FAST, createFastPayload(material)))
-        val created = createdFast.wait(abort) { it.first === circuit }
-        val k0 = concatBytes(material, created.second.first)
-        val result = KDFTorResult.computeOrThrow(k0)
-        if (!equalBytes(result.keyHash, created.second.second)) throw InvalidKdfKeyHashError()
-        val forwardDigest = Sha1.Hasher().update(result.forwardDigest)
-        val backwardDigest = Sha1.Hasher().update(result.backwardDigest)
-        val target =
-            Target(
-                st.identity,
-                forwardDigest,
-                backwardDigest,
-                Aes128Ctr128BEKey(Memory(result.forwardKey), Memory(ByteArray(16))),
-                Aes128Ctr128BEKey(Memory(result.backwardKey), Memory(ByteArray(16))),
-            )
-        circuit.targets += target
-        return LiveCircuit(circuit)
+        try {
+            val material = secureRandom(20)
+            send(writeCell(circuit.id, CellCmd.CREATE_FAST, createFastPayload(material)))
+            val created = createdFast.wait(abort) { it.first === circuit }
+            val k0 = concatBytes(material, created.second.first)
+            val result = KDFTorResult.computeOrThrow(k0)
+            if (!equalBytes(result.keyHash, created.second.second)) throw InvalidKdfKeyHashError()
+            val forwardDigest = Sha1.Hasher().update(result.forwardDigest)
+            val backwardDigest = Sha1.Hasher().update(result.backwardDigest)
+            val target =
+                Target(
+                    st.identity,
+                    forwardDigest,
+                    backwardDigest,
+                    Aes128Ctr128BEKey(Memory(result.forwardKey), Memory(ByteArray(16))),
+                    Aes128Ctr128BEKey(Memory(result.backwardKey), Memory(ByteArray(16))),
+                )
+            gate.withLock { circuit.targets += target }
+            return LiveCircuit(circuit)
+        } catch (err: Throwable) {
+            try {
+                circuit.close()
+            } catch (_: Throwable) {
+            }
+            throw err
+        }
     }
 }

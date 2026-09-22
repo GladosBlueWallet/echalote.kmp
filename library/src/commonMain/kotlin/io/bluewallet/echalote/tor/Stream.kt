@@ -2,6 +2,8 @@ package io.bluewallet.echalote
 
 import kotlinx.coroutines.launch
 
+private const val STREAM_SENDME_BUFFER = 10 * RELAY_DATA_LEN
+
 internal class SecretTorStreamDuplex(
     val type: String,
     val id: Int,
@@ -11,6 +13,8 @@ internal class SecretTorStreamDuplex(
     val connected = kotlinx.coroutines.CompletableDeferred<Unit>()
     var delivery = 500
     var packageWindow = 500
+    private var bufferedBytes = 0
+    private var sendmesOwed = 0
     private var cleaned = false
     private val offs = ArrayList<() -> Unit>()
 
@@ -18,8 +22,14 @@ internal class SecretTorStreamDuplex(
         duplex.onWrite = { bytes ->
             for (chunk in Cursor(bytes).split(RELAY_DATA_LEN)) {
                 circuit.tor.sendRelay(circuit, RelayCmd.DATA, id, chunk)
-                packageWindow--
             }
+        }
+        duplex.onRead = { n ->
+            val owed = circuit.tor.gate.withLock {
+                bufferedBytes = (bufferedBytes - n).coerceAtLeast(0)
+                takeOwedSendmes()
+            }
+            if (owed > 0) launchStreamSendmes(owed)
         }
         duplex.onClose = {
             if (circuit.closed == null) {
@@ -30,7 +40,9 @@ internal class SecretTorStreamDuplex(
                     } catch (_: Throwable) {
                     }
                 }
-                packageWindow--
+                circuit.tor.gate.withLock {
+                    if (packageWindow > 0) packageWindow--
+                }
             }
             cleanup()
         }
@@ -64,31 +76,64 @@ internal class SecretTorStreamDuplex(
 
     /** Must run on the cell reader. A per-cell launch can reorder RELAY_DATA. */
     suspend fun onIncomingData(data: ByteArray) {
-        delivery--
-        if (delivery == 450) {
-            delivery = 500
-            circuit.tor.scope.launch {
+        val owed =
+            circuit.tor.gate.withLock {
+                delivery--
+                bufferedBytes += data.size
+                if (delivery == 450) {
+                    delivery = 500
+                    sendmesOwed++
+                }
+                takeOwedSendmes()
+            }
+        duplex.enqueue(data)
+        if (owed > 0) launchStreamSendmes(owed)
+    }
+
+    private fun takeOwedSendmes(): Int {
+        if (sendmesOwed == 0 || bufferedBytes >= STREAM_SENDME_BUFFER) return 0
+        val n = sendmesOwed
+        sendmesOwed = 0
+        return n
+    }
+
+    private fun launchStreamSendmes(count: Int) {
+        circuit.tor.scope.launch {
+            repeat(count) {
                 try {
                     circuit.tor.sendRelay(circuit, RelayCmd.SENDME, id, ByteArray(0))
                 } catch (_: Throwable) {
                 }
             }
         }
-        duplex.enqueue(data)
     }
 
     fun fail(reason: Throwable?) {
+        val err = reason ?: Exception("tor connection closed")
+        if (!connected.isCompleted) connected.completeExceptionally(err)
         if (reason != null) {
             duplex.error(reason)
         } else {
-            circuit.tor.scope.launch { duplex.close() }
+            // Close here. Launching onto the client scope loses the wakeup when close() cancels that scope.
+            duplex.close()
         }
         cleanup()
     }
 
     private fun cleanup() {
-        if (cleaned) return
-        cleaned = true
+        val run =
+            circuit.tor.gate.withLock {
+                if (cleaned) {
+                    false
+                } else {
+                    cleaned = true
+                    circuit.streams.remove(id)
+                    true
+                }
+            }
+        if (!run) return
+        circuit.tor.wakeWindowWaiters()
+        if (!connected.isCompleted) connected.completeExceptionally(Exception("tor stream closed"))
         for (off in offs) {
             try {
                 off()
@@ -96,7 +141,6 @@ internal class SecretTorStreamDuplex(
             }
         }
         offs.clear()
-        circuit.streams.remove(id)
     }
 
     fun asPublic(onClose: () -> Unit): TorStreamDuplex =

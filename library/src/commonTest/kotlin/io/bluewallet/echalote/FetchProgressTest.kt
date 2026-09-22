@@ -7,6 +7,7 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFails
 import kotlin.test.assertTrue
 
 class FetchProgressTest {
@@ -136,9 +137,9 @@ class FetchProgressTest {
                 network-status-version 3 microdesc
                 vote-status consensus
                 consensus-method 35
-                valid-after 2026-08-07 07:00:00
-                fresh-until 2026-08-07 08:00:00
-                valid-until 2026-08-07 10:00:00
+                valid-after 2000-01-01 00:00:00
+                fresh-until 2100-01-01 00:00:00
+                valid-until 2100-01-01 00:00:00
                 voting-delay 300 300
                 known-flags Authority BadExit Exit Fast Guard HSDir MiddleOnly NoEdConsensus Running Stable StaleDesc V2Dir Valid
                 r c0der AjUfyI0L8G9s3lRSZWZB5hGdvX4 2038-01-01 00:00:00 95.216.20.80 8080 0
@@ -171,4 +172,46 @@ class FetchProgressTest {
             assertEquals(15, directory.first().first)
             assertEquals(45, directory.last().first)
         }
+
+    @Test
+    fun fetchMicrodescConsensusRejectsExpiredDocument() =
+        runTest {
+            val text =
+                """
+                network-status-version 3 microdesc
+                vote-status consensus
+                consensus-method 35
+                valid-after 2020-01-01 00:00:00
+                fresh-until 2020-01-01 01:00:00
+                valid-until 2020-01-01 03:00:00
+                r c0der AjUfyI0L8G9s3lRSZWZB5hGdvX4 2038-01-01 00:00:00 95.216.20.80 8080 0
+                m mkHw/LD1moosjemRD+GqSqXzzK1kOvK3ZwTsCPGJIFs
+                s Fast Guard Running Stable V2Dir Valid
+                pr Link=1-5
+                w Bandwidth=1
+                directory-footer
+                """.trimIndent()
+            val engine = HttpEngine { _, _, _, _, _, _ -> HttpResponse(200, text.encodeToByteArray()) }
+            try {
+                val err =
+                    assertFails {
+                        fetchMicrodescConsensus(
+                            force = true,
+                            mirrors = listOf("http://127.0.0.1/consensus"),
+                            engine = engine,
+                        )
+                    }
+                assertTrue(err.message?.contains("validity") == true, err.message)
+            } finally {
+                resetCachedConsensus()
+            }
+        }
+
+    @Test
+    fun randomIndexUsesMoreThanOneByte() {
+        val seen = HashSet<Int>()
+        repeat(4000) { seen += randomIndex(300) }
+        assertTrue(seen.all { it in 0 until 300 })
+        assertTrue(seen.any { it >= 256 }, "index stayed inside a single random byte: $seen")
+    }
 }

@@ -448,6 +448,7 @@ internal fun hkdfSha256(
     info: ByteArray,
     length: Int,
 ): ByteArray {
+    require(length in 0..8160) { "HKDF-SHA256 length must be 0..8160" }
     val prk = hmacSha256(salt, ikm)
     val n = (length + 31) / 32
     val okm = ByteArray(n * 32)

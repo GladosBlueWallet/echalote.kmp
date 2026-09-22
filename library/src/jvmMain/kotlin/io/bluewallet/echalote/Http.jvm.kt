@@ -60,8 +60,9 @@ private fun readStreamProgress(
     while (true) {
         val n = stream.read(buf)
         if (n < 0) break
-        out.write(buf, 0, n)
         received += n
+        if (received > MAX_HTTP1_BODY) throw IllegalArgumentException("HTTP body too large")
+        out.write(buf, 0, n)
         onDownload?.invoke(received, total)
     }
     return out.toByteArray()

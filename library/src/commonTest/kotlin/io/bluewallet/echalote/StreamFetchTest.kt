@@ -146,6 +146,20 @@ class StreamFetchTest {
         }
 
     @Test
+    fun chunkExtensionsAndTrailersAreFramed() =
+        runTest {
+            val mock =
+                MockDuplex(
+                    listOf(
+                        utf8("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"),
+                        utf8("5;ext=1\r\nhello\r\n0\r\nX-Trailer: 1\r\n\r\n"),
+                    ),
+                )
+            val res = streamFetch("http://localhost/x", StreamFetchInit(mock))
+            assertEquals("hello", res.text())
+        }
+
+    @Test
     fun honorsContentLengthIgnoresBytesPastLength() =
         runTest {
             val mock = MockDuplex(listOf(utf8("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcdEXTRA")))

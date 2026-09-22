@@ -10,6 +10,8 @@ data class Consensus(
     val signatures: List<ConsensusSignature> = emptyList(),
     val preimage: String? = null,
     val knownFlags: List<String> = emptyList(),
+    val validAfterMillis: Long? = null,
+    val validUntilMillis: Long? = null,
 )
 
 data class Authority(
@@ -79,6 +81,8 @@ object ConsensusParser {
         val microdescs = ArrayList<MicrodescHead>()
         val signatures = ArrayList<ConsensusSignature>()
         var preimage: String? = null
+        var validAfterMillis: Long? = null
+        var validUntilMillis: Long? = null
         var i = 0
         while (i < lines.size) {
             val line = lines[i]
@@ -90,6 +94,8 @@ object ConsensusParser {
                 }
                 line.startsWith("vote-status ") -> status = line.split(" ").getOrNull(1)
                 line.startsWith("consensus-method ") -> method = line.split(" ").getOrNull(1)?.toIntOrNull() ?: 0
+                line.startsWith("valid-after ") -> validAfterMillis = parseConsensusTime(line.removePrefix("valid-after "))
+                line.startsWith("valid-until ") -> validUntilMillis = parseConsensusTime(line.removePrefix("valid-until "))
                 line.startsWith("known-flags ") -> {
                     knownFlags.clear()
                     knownFlags += line.split(" ").drop(1)
@@ -194,6 +200,8 @@ object ConsensusParser {
             signatures = signatures,
             preimage = preimage,
             knownFlags = knownFlags,
+            validAfterMillis = validAfterMillis,
+            validUntilMillis = validUntilMillis,
         )
     }
 
@@ -251,4 +259,26 @@ object ConsensusParser {
         }
         throw IllegalArgumentException("Missing $end")
     }
+}
+
+internal fun parseConsensusTime(text: String): Long {
+    val parts = text.trim().split(" ")
+    require(parts.size == 2) { "bad consensus time $text" }
+    val date = parts[0].split("-")
+    val clock = parts[1].split(":")
+    require(date.size == 3 && clock.size == 3) { "bad consensus time $text" }
+    return utcEpochMillis(
+        date[0].toInt(),
+        date[1].toInt(),
+        date[2].toInt(),
+        clock[0].toInt(),
+        clock[1].toInt(),
+        clock[2].toInt(),
+    )
+}
+
+internal fun Consensus.ensureFresh(now: Long = currentEpochMillis()) {
+    val after = validAfterMillis ?: throw Exception("consensus missing valid-after")
+    val until = validUntilMillis ?: throw Exception("consensus missing valid-until")
+    if (now < after || now > until) throw Exception("consensus outside its validity window")
 }

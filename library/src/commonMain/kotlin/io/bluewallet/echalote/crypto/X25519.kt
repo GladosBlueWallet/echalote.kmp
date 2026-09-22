@@ -170,6 +170,9 @@ internal object X25519 {
         gfMul(a, a, c)
         val out = ByteArray(32)
         pack25519(out, a)
+        var acc = 0
+        for (b in out) acc = acc or b.toInt()
+        if (acc == 0) throw IllegalArgumentException("x25519 shared secret is zero")
         return out
     }
 

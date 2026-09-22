@@ -24,6 +24,7 @@ internal data class ParsedServerHello(
 )
 
 private val tlsSessions = LinkedHashMap<String, TlsResumption>()
+private val tlsSessionLock = SpinLock()
 
 internal fun parseNewSessionTicket(body: ByteArray): ParsedSessionTicket {
     require(body.size >= 6) { "short NewSessionTicket" }
@@ -64,37 +65,39 @@ internal fun parseServerHello(body: ByteArray): ParsedServerHello {
 
 internal fun rememberTlsSession(session: TlsResumption) {
     val key = session.host.lowercase()
-    tlsSessions[key] =
+    val copy =
         session.copy(
             host = key,
             master = session.master.copyOf(),
             sessionId = session.sessionId.copyOf(),
             ticket = session.ticket.copyOf(),
         )
+    tlsSessionLock.withLock { tlsSessions[key] = copy }
 }
 
 internal fun lookupTlsSession(
     host: String,
     nowMs: Long = currentEpochMillis(),
-): TlsResumption? {
-    val key = host.lowercase()
-    val hit = tlsSessions[key]
-    if (hit != null && nowMs >= hit.expiresAtMs) {
-        tlsSessions.remove(key)
+): TlsResumption? =
+    tlsSessionLock.withLock {
+        val key = host.lowercase()
+        val hit = tlsSessions[key]
+        if (hit != null && nowMs >= hit.expiresAtMs) {
+            tlsSessions.remove(key)
+        }
+        val live =
+            hit != null &&
+                nowMs < hit.expiresAtMs &&
+                (hit.ticket.isNotEmpty() || hit.sessionId.isNotEmpty())
+        hit.takeIf { live }
     }
-    val live =
-        hit != null &&
-            nowMs < hit.expiresAtMs &&
-            (hit.ticket.isNotEmpty() || hit.sessionId.isNotEmpty())
-    return hit.takeIf { live }
-}
 
 internal fun forgetTlsSession(host: String) {
-    tlsSessions.remove(host.lowercase())
+    tlsSessionLock.withLock { tlsSessions.remove(host.lowercase()) }
 }
 
 internal fun resetTlsSessionCache() {
-    tlsSessions.clear()
+    tlsSessionLock.withLock { tlsSessions.clear() }
 }
 
 internal fun tlsResumeExpiryMs(

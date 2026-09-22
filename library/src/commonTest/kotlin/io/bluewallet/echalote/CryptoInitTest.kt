@@ -2,6 +2,7 @@ package io.bluewallet.echalote
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFails
 import kotlin.test.assertTrue
 
 class CryptoInitTest {
@@ -90,5 +91,19 @@ class CryptoInitTest {
         assertEquals("531877d79547e4e3e2068d56d02cb6f56ceb7960d2ff40cdab5e7f005a7c0a35", bytesToHex(ay.toFixedBytes(32)))
         val z = P256.ecdh(dA, P256.encodeUncompressed(bx, by))
         assertEquals("cd4556e232045594145e8785ec8bffda84eba04bda7aae8a17a7912f82db7ad4", bytesToHex(z))
+    }
+
+    @Test
+    fun inflateZlibChecksAdler() {
+        val zlib = hexToBytes("789c010200fdff486900fb00b2")
+        assertEquals("Hi", InflateKt.inflateZlibOrNull(zlib)?.decodeToString())
+        val bad = zlib.copyOf()
+        bad[bad.size - 1] = 0
+        assertEquals(null, InflateKt.inflateZlibOrNull(bad))
+    }
+
+    @Test
+    fun x25519RejectsAllZeroOutput() {
+        assertFails { X25519.scalarMult(ByteArray(32) { 9 }, ByteArray(32)) }
     }
 }

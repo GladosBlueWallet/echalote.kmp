@@ -263,6 +263,11 @@ class RsaPublicKey private constructor(
             val eBytes = seq[1].asIntegerBytes()
             val n = BigNat.fromBytes(nBytes)
             val e = BigNat.fromBytes(eBytes)
+            require(nBytes.isNotEmpty() && (nBytes.last().toInt() and 1) == 1) { "RSA modulus must be odd" }
+            require(eBytes.isNotEmpty() && (eBytes.last().toInt() and 1) == 1) { "RSA exponent must be odd" }
+            require(e.compare(BigNat.fromBytes(byteArrayOf(3))) >= 0 && e.compare(n) < 0) {
+                "RSA exponent out of range"
+            }
             val k = nBytes.size
             return RsaPublicKey(n, e, k)
         }
@@ -323,9 +328,7 @@ internal class Der(
     companion object {
         fun parse(bytes: ByteArray): Der {
             val (der, rest) = parseOne(bytes, 0)
-            if (rest != bytes.size) {
-                // allow trailing
-            }
+            require(rest == bytes.size) { "trailing bytes after DER value" }
             return der
         }
 
@@ -349,6 +352,7 @@ internal class Der(
             var len = bytes.u8(i++)
             if (len and 0x80 != 0) {
                 val n = len and 0x7f
+                require(n > 0) { "indefinite DER length" }
                 len = 0
                 repeat(n) { len = (len shl 8) or bytes.u8(i++) }
             }

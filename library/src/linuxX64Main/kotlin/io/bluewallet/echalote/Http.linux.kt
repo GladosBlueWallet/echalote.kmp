@@ -9,17 +9,28 @@ import kotlinx.cinterop.ptr
 import kotlinx.cinterop.reinterpret
 import kotlinx.cinterop.usePinned
 import platform.posix.AF_INET
+import platform.posix.EAGAIN
+import platform.posix.EINTR
+import platform.posix.ETIMEDOUT
+import platform.posix.EWOULDBLOCK
 import platform.posix.IPPROTO_TCP
+import platform.posix.MSG_NOSIGNAL
 import platform.posix.SOCK_STREAM
+import platform.posix.SOL_SOCKET
+import platform.posix.SO_RCVTIMEO
+import platform.posix.SO_SNDTIMEO
 import platform.posix.close
 import platform.posix.connect
+import platform.posix.errno
 import platform.posix.htonl
 import platform.posix.htons
 import platform.posix.memset
 import platform.posix.recv
 import platform.posix.send
+import platform.posix.setsockopt
 import platform.posix.sockaddr_in
 import platform.posix.socket
+import platform.posix.timeval
 
 /**
  * Bonus linux target: HTTP/1.1 over TCP (clearnet directory). HTTPS meek is not
@@ -44,6 +55,7 @@ actual fun defaultHttpEngine(): HttpEngine =
                 addr.sin_addr.s_addr = ipv4ToNetworkOrder(parsed.host)
                 val rc = connect(fd, addr.ptr.reinterpret(), kotlinx.cinterop.sizeOf<sockaddr_in>().convert())
                 check(rc == 0) { "connect failed" }
+                applySocketTimeouts(fd, timeoutMs)
 
                 sendAll(fd, buildHttp1Request(method, parsed, headers, body))
 
@@ -65,6 +77,21 @@ private fun ipv4ToNetworkOrder(host: String): UInt {
 }
 
 @OptIn(ExperimentalForeignApi::class)
+private fun applySocketTimeouts(
+    fd: Int,
+    timeoutMs: Long,
+) {
+    val ms = timeoutMs.coerceAtLeast(1L)
+    memScoped {
+        val tv = alloc<timeval>()
+        tv.tv_sec = (ms / 1000L).convert()
+        tv.tv_usec = ((ms % 1000L) * 1000L).convert()
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, tv.ptr, kotlinx.cinterop.sizeOf<timeval>().convert())
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, tv.ptr, kotlinx.cinterop.sizeOf<timeval>().convert())
+    }
+}
+
+@OptIn(ExperimentalForeignApi::class)
 private fun sendAll(
     fd: Int,
     data: ByteArray,
@@ -72,7 +99,11 @@ private fun sendAll(
     data.usePinned { pinned ->
         var off = 0
         while (off < data.size) {
-            val n = send(fd, pinned.addressOf(off), (data.size - off).convert(), 0)
+            val n = send(fd, pinned.addressOf(off), (data.size - off).convert(), MSG_NOSIGNAL)
+            if (n < 0) {
+                if (errno == EINTR) continue
+                error("send failed (${errno})")
+            }
             check(n > 0) { "send failed" }
             off += n.toInt()
         }
@@ -87,8 +118,21 @@ private fun recvHttp1(
     val buf = ByteArray(16 * 1024)
     return readHttp1Raw(onDownload = onDownload) {
         buf.usePinned { pinned ->
-            val n = recv(fd, pinned.addressOf(0), buf.size.convert(), 0)
-            if (n <= 0) null else buf.copyOf(n.toInt())
+            while (true) {
+                val n = recv(fd, pinned.addressOf(0), buf.size.convert(), 0)
+                when {
+                    n > 0 -> return@usePinned buf.copyOf(n.toInt())
+                    n.toLong() == 0L -> return@usePinned null
+                    else -> {
+                        val err = errno
+                        if (err == EINTR) continue
+                        if (err == EAGAIN || err == EWOULDBLOCK || err == ETIMEDOUT) {
+                            error("HTTP socket timeout")
+                        }
+                        error("recv failed ($err)")
+                    }
+                }
+            }
         }
     }
 }
