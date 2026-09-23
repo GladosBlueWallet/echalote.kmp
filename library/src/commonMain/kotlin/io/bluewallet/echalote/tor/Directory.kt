@@ -134,7 +134,7 @@ private class CachedCircuit(
     val createdAtMs: Long,
 )
 
-private sealed interface Boot {
+internal sealed interface Boot {
     data object Retry : Boot
 
     data object Ready : Boot
@@ -144,7 +144,7 @@ private sealed interface Boot {
     ) : Boot
 }
 
-private sealed interface Flight {
+internal sealed interface Flight {
     class Hit(
         val circuit: Circuit,
     ) : Flight
@@ -692,7 +692,7 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
         signal: Abort,
         progress: FetchProgressReporter?,
     ): TorClientDuplex? {
-        val boot =
+        val boot: Boot =
             torLock.withLock {
                 if (disposed) throw Exception("exit dialer disposed")
                 if (tor?.closed != null) {
@@ -852,19 +852,29 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
         signal: Abort,
         key: Pair<String, Int>,
     ): Circuit {
-        val flight =
+        val flight: Flight =
             circuitLock.withLock {
                 if (disposed) throw Exception("exit dialer disposed")
-                val cached = circuits[key]
-                if (cached != null && fresh(cached)) {
-                    Flight.Hit(cached.circuit)
-                } else {
-                    if (cached != null) {
-                        circuits.remove(key)?.let { scope.launch { runCatching { it.circuit.close() } } }
-                    }
-                    inflight[key]?.let { Flight.Join(it) }
-                        ?: Flight.Lead(CompletableDeferred<Circuit>().also { inflight[key] = it })
+
+                fun joinOrLead(): Flight {
+                    val pending = inflight[key]
+                    if (pending != null) return Flight.Join(pending)
+                    val created = CompletableDeferred<Circuit>()
+                    inflight[key] = created
+                    return Flight.Lead(created)
                 }
+                val cached = circuits[key]
+                val chosen: Flight =
+                    if (cached != null && fresh(cached)) {
+                        Flight.Hit(cached.circuit)
+                    } else {
+                        if (cached != null) {
+                            circuits.remove(key)
+                            scope.launch { runCatching { cached.circuit.close() } }
+                        }
+                        joinOrLead()
+                    }
+                chosen
             }
         return when (flight) {
             is Flight.Hit -> flight.circuit
