@@ -107,87 +107,7 @@ suspend fun streamFetch(
     // Do not close the duplex here. A full close tears down TLS/Tor reads.
     // The TypeScript client only half-closes the write side; this ByteDuplex
     // has no half-close, and the response is framed by length/chunked.
-
-    val reader = HttpByteReader(init.stream, abort)
-    val headBytes = reader.readUntil(CRLFCRLF)
-    val headText = headBytes.decodeToString()
-    val lines = headText.split("\r\n")
-    val statusParts = (lines.firstOrNull() ?: "").split(" ")
-    val status = statusParts.getOrNull(1)?.toIntOrNull() ?: 0
-    val statusText = statusParts.drop(2).joinToString(" ")
-    require(status in 200..599) { "Invalid HTTP status: ${lines.firstOrNull()}" }
-    val responseHeaders = LinkedHashMap<String, String>()
-    val contentLengths = ArrayList<String>()
-    for (line in lines.drop(1)) {
-        if (line.isEmpty()) continue
-        val colon = line.indexOf(':')
-        if (colon == -1) continue
-        val name = line.substring(0, colon).trim()
-        val value = line.substring(colon + 1).trim()
-        if (name.equals("Content-Length", true)) contentLengths += value
-        responseHeaders[name] = value
-    }
-    require(contentLengths.map { it.trim() }.distinct().size <= 1) { "conflicting Content-Length" }
-    val transfer = responseHeaders.entries.firstOrNull { it.key.equals("Transfer-Encoding", true) }?.value
-    progress?.report(FetchStage.DOWNLOADING_RESPONSE)
-    var bodyBytes =
-        if (transfer != null && transfer.lowercase().contains("chunked")) {
-            reader.readChunkedBody()
-        } else {
-            val lengthHeader = contentLengths.firstOrNull()
-            val connection =
-                responseHeaders.entries
-                    .firstOrNull { it.key.equals("Connection", true) }
-                    ?.value
-            val untilClose =
-                (lines.firstOrNull() ?: "").startsWith("HTTP/1.0") ||
-                    connection?.contains("close", ignoreCase = true) == true
-            if (lengthHeader == null && untilClose) {
-                reader.readUntilEof { have ->
-                    progress?.downloadBytes(FetchStage.DOWNLOADING_RESPONSE, have, null)
-                }
-            } else {
-                require(lengthHeader != null) { "HTTP response missing Content-Length and chunked encoding" }
-                val length = lengthHeader.toLongOrNull()
-                require(length != null && length >= 0) { "Invalid Content-Length: $lengthHeader" }
-                require(length <= MAX_HTTP1_BODY) { "HTTP body too large: $length" }
-                reader.readExact(length.toInt()) { have ->
-                    progress?.downloadBytes(FetchStage.DOWNLOADING_RESPONSE, have, length.toInt())
-                }
-            }
-        }
-    progress?.report(FetchStage.DOWNLOADING_RESPONSE, 1.0)
-    bodyBytes = decodeContentEncoding(responseHeaders, bodyBytes)
-    val version = (lines.firstOrNull() ?: "").substringBefore(' ')
-    val connection =
-        responseHeaders.entries
-            .firstOrNull { it.key.equals("Connection", true) }
-            ?.value
-    val persistent =
-        when {
-            connection?.contains("close", ignoreCase = true) == true -> false
-            connection?.contains("keep-alive", ignoreCase = true) == true -> true
-            version.startsWith("HTTP/1.0") -> false
-            else -> true
-        }
-    return StreamResponse(status, statusText, responseHeaders, bodyBytes, persistent)
-}
-
-private fun decodeContentEncoding(
-    headers: Map<String, String>,
-    body: ByteArray,
-): ByteArray {
-    val encoding =
-        headers.entries
-            .firstOrNull { it.key.equals("Content-Encoding", true) }
-            ?.value
-            ?.lowercase()
-    return when {
-        encoding == null || encoding == "identity" || encoding.isEmpty() -> body
-        encoding.contains("deflate") || encoding.contains("zlib") ->
-            inflateZlibOrNull(body) ?: error("bad zlib body")
-        else -> error("unsupported Content-Encoding: $encoding")
-    }
+    return HttpByteReader(init.stream, abort).readResponse(progress)
 }
 
 private val CRLF = "\r\n".encodeToByteArray()
@@ -398,6 +318,87 @@ private class HttpByteReader(
     val duplex: ByteDuplex,
     val abort: Abort?,
 ) {
+    suspend fun readResponse(progress: FetchProgressReporter?): StreamResponse {
+        val headText = readUntil(CRLFCRLF).decodeToString()
+        val lines = headText.split("\r\n")
+        val statusLine = lines.firstOrNull() ?: ""
+        val statusParts = statusLine.split(" ")
+        val status = statusParts.getOrNull(1)?.toIntOrNull() ?: 0
+        val statusText = statusParts.drop(2).joinToString(" ")
+        require(status in 200..599) { "Invalid HTTP status: $statusLine" }
+        val responseHeaders = LinkedHashMap<String, String>()
+        val contentLengths = ArrayList<String>()
+        for (line in lines.drop(1)) {
+            val colon = line.indexOf(':')
+            if (line.isNotEmpty() && colon > 0) {
+                val name = line.substring(0, colon).trim()
+                val value = line.substring(colon + 1).trim()
+                if (name.equals("Content-Length", true)) contentLengths += value
+                responseHeaders[name] = value
+            }
+        }
+        require(contentLengths.map { it.trim() }.distinct().size <= 1) { "conflicting Content-Length" }
+        progress?.report(FetchStage.DOWNLOADING_RESPONSE)
+        val bodyBytes = readBody(statusLine, responseHeaders, contentLengths, progress)
+        progress?.report(FetchStage.DOWNLOADING_RESPONSE, 1.0)
+        return finishResponse(status, statusText, statusLine, responseHeaders, bodyBytes)
+    }
+
+    private fun finishResponse(
+        status: Int,
+        statusText: String,
+        statusLine: String,
+        responseHeaders: Map<String, String>,
+        bodyBytes: ByteArray,
+    ): StreamResponse {
+        val connection = responseHeaders.entries.firstOrNull { it.key.equals("Connection", true) }?.value
+        val keep =
+            when {
+                connection?.contains("close", ignoreCase = true) == true -> false
+                connection?.contains("keep-alive", ignoreCase = true) == true -> true
+                else -> !statusLine.startsWith("HTTP/1.0")
+            }
+        val encoding =
+            responseHeaders.entries
+                .firstOrNull { it.key.equals("Content-Encoding", true) }
+                ?.value
+                ?.lowercase()
+        val decoded =
+            when {
+                encoding == null || encoding == "identity" || encoding.isEmpty() -> bodyBytes
+                encoding.contains("deflate") || encoding.contains("zlib") ->
+                    inflateZlibOrNull(bodyBytes) ?: error("bad zlib body")
+                else -> error("unsupported Content-Encoding: $encoding")
+            }
+        return StreamResponse(status, statusText, responseHeaders, decoded, keep)
+    }
+
+    private suspend fun readBody(
+        statusLine: String,
+        responseHeaders: Map<String, String>,
+        contentLengths: List<String>,
+        progress: FetchProgressReporter?,
+    ): ByteArray {
+        val transfer = responseHeaders.entries.firstOrNull { it.key.equals("Transfer-Encoding", true) }?.value
+        val lengthHeader = contentLengths.firstOrNull()
+        val connection = responseHeaders.entries.firstOrNull { it.key.equals("Connection", true) }?.value
+        val untilClose = statusLine.startsWith("HTTP/1.0") || connection?.contains("close", ignoreCase = true) == true
+        val chunked = transfer != null && transfer.lowercase().contains("chunked")
+        return if (chunked) {
+            readChunkedBody()
+        } else if (lengthHeader == null && untilClose) {
+            readUntilEof { have -> progress?.downloadBytes(FetchStage.DOWNLOADING_RESPONSE, have, null) }
+        } else {
+            require(lengthHeader != null) { "HTTP response missing Content-Length and chunked encoding" }
+            val length = lengthHeader.toLongOrNull()
+            require(length != null && length >= 0) { "Invalid Content-Length: $lengthHeader" }
+            require(length <= MAX_HTTP1_BODY) { "HTTP body too large: $length" }
+            readExact(length.toInt()) { have ->
+                progress?.downloadBytes(FetchStage.DOWNLOADING_RESPONSE, have, length.toInt())
+            }
+        }
+    }
+
     private var buf = ByteArray(0)
     private var len = 0
     private var receivedAny = false

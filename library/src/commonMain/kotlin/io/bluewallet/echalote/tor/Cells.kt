@@ -150,7 +150,6 @@ internal fun encodeRelayPayload(
     streamId: Int,
     fragment: ByteArray,
     targets: List<Target>,
-    @Suppress("UNUSED_PARAMETER") early: Boolean,
     recordDigest: Boolean,
 ): Pair<ByteArray, ByteArray?> {
     val payload = ByteArray(PAYLOAD_LEN)
