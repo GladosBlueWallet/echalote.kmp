@@ -58,7 +58,7 @@ internal class SecretTorStreamDuplex(
                 val (stream, reason) = pair
                 if (circ !== circuit || stream !== this) return@on
                 if (reason.id == 6) {
-                    circuit.tor.scope.launch { duplex.close() }
+                    duplex.close()
                 } else {
                     fail(RelayEndedError(reason))
                 }

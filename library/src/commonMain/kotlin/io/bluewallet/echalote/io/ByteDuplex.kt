@@ -56,10 +56,17 @@ private fun deliver(
     inbox: ArrayDeque<ByteArray>,
     lock: SpinLock,
     ready: Ready?,
+    wake: () -> Ready?,
 ) {
-    if (ready == null) return
-    if (!ready.deferred.complete(ready.chunk) && ready.chunk.isNotEmpty()) {
-        lock.withLock { inbox.addFirst(ready.chunk) }
+    var pending = ready
+    while (pending != null) {
+        val current = pending
+        if (current.deferred.complete(current.chunk) || current.chunk.isEmpty()) return
+        pending =
+            lock.withLock {
+                inbox.addFirst(current.chunk)
+                wake()
+            }
     }
 }
 
@@ -103,7 +110,7 @@ fun pairedByteDuplexes(): Pair<ByteDuplex, ByteDuplex> {
                         peer.inbox.addLast(bytes.copyOf())
                         ready(peer)
                     }
-                deliver(peer.inbox, peer.lock, done)
+                deliver(peer.inbox, peer.lock, done) { ready(peer) }
             }
 
             override fun close() {
@@ -117,8 +124,8 @@ fun pairedByteDuplexes(): Pair<ByteDuplex, ByteDuplex> {
                         peer.peerClosed = true
                         ready(peer)
                     }
-                deliver(state.inbox, state.lock, local)
-                deliver(peer.inbox, peer.lock, remote)
+                deliver(state.inbox, state.lock, local) { ready(state) }
+                deliver(peer.inbox, peer.lock, remote) { ready(peer) }
             }
         }
 
@@ -207,22 +214,30 @@ class ChannelDuplex : ByteDuplex {
                     ready()
                 }
             }
-        deliver(inbox, lock, done)
+        deliver(inbox, lock, done) { ready() }
     }
 
     fun error(reason: Throwable) {
-        val done =
+        var pending =
             lock.withLock {
                 terminal = reason
                 closed = true
                 ready()
             }
-        if (done != null && !done.deferred.isCompleted) {
-            if (done.chunk.isNotEmpty()) {
-                done.deferred.complete(done.chunk)
-            } else {
-                done.deferred.completeExceptionally(reason)
-            }
+        while (pending != null) {
+            val current = pending
+            val delivered =
+                if (current.chunk.isNotEmpty()) {
+                    current.deferred.complete(current.chunk)
+                } else {
+                    current.deferred.completeExceptionally(reason)
+                }
+            if (delivered || current.chunk.isEmpty()) break
+            pending =
+                lock.withLock {
+                    inbox.addFirst(current.chunk)
+                    ready()
+                }
         }
         onClose?.invoke()
     }
@@ -265,7 +280,7 @@ class ChannelDuplex : ByteDuplex {
                 closed = true
                 ready()
             }
-        deliver(inbox, lock, done)
+        deliver(inbox, lock, done) { ready() }
         onClose?.invoke()
     }
 
@@ -278,6 +293,6 @@ class ChannelDuplex : ByteDuplex {
                 closed = true
                 ready()
             }
-        deliver(inbox, lock, done)
+        deliver(inbox, lock, done) { ready() }
     }
 }

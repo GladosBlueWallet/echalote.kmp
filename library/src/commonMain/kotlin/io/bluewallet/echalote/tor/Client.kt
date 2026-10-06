@@ -163,6 +163,7 @@ internal class SecretTorClientDuplex {
         if (closed != null) return
         closed = true
         val reason = Exception("tor connection closed")
+        failOpenCircuits(reason)
         with(TorSend) { this@SecretTorClientDuplex.failWaits(reason) }
         closeEvent.emit(Unit)
         job.cancel()
@@ -172,10 +173,16 @@ internal class SecretTorClientDuplex {
     fun error(reason: Throwable) {
         if (closed != null) return
         closed = reason
+        failOpenCircuits(reason)
         with(TorSend) { this@SecretTorClientDuplex.failWaits(reason) }
         errorEvent.emit(reason)
         job.cancel()
         tls.close()
+    }
+
+    private fun failOpenCircuits(reason: Throwable) {
+        val open = gate.withLock { circuits.values.toList() }
+        for (circuit in open) circuit.onCloseOrError(reason)
     }
 
     suspend fun waitOrThrow(abort: Abort? = null) {
@@ -528,6 +535,16 @@ private object TorInbound {
             return
         }
         val (version, frag) = readSendmeCircuit(relay.fragment)
+        if (version == 0) {
+            val waiters =
+                gate.withLock {
+                    val target = circ.targets.getOrNull(relay.hop) ?: throw InvalidRelaySendmeCellDigestError()
+                    applyCircuitSendme(target, version)
+                    drainWindowWaiters()
+                }
+            for (w in waiters) w.complete(Unit)
+            return
+        }
         if (version != 1 || frag.size != 20) throw InvalidRelaySendmeCellDigestError()
         creditCircuit(circ, relay.hop, frag.copyOf(20))
     }

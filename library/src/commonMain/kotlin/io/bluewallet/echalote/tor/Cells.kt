@@ -133,6 +133,14 @@ internal fun tryReadCell(cursor: Cursor): RawCell? {
 internal const val RELAY_HEAD_LEN = 1 + 2 + 2 + 4 + 2
 internal const val RELAY_DATA_LEN = PAYLOAD_LEN - RELAY_HEAD_LEN
 
+internal fun applyCircuitSendme(
+    target: Target,
+    version: Int,
+) {
+    if (version != 0) throw InvalidRelaySendmeCellDigestError()
+    target.packageWindow += 100
+}
+
 internal class Target(
     val relayidRsa: ByteArray,
     val forwardDigest: Sha1.Hasher,

@@ -6,12 +6,15 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlin.concurrent.atomics.update
+import kotlin.concurrent.Volatile
 
 /** AbortSignal analogue for races and timeouts. */
 class Abort {
+    @Volatile
     var aborted: Boolean = false
         private set
+
+    @Volatile
     var reason: Throwable? = null
         private set
 
@@ -31,7 +34,33 @@ class Abort {
     }
 
     fun onAbort(block: () -> Unit) {
-        if (aborted) block() else listeners.update { it + block }
+        var added = false
+        while (!aborted && !added) {
+            val current = listeners.load()
+            added = listeners.compareAndSet(current, current + block)
+        }
+        if (aborted) {
+            if (!added) {
+                block()
+            } else {
+                claimAndRun(block)
+            }
+        }
+    }
+
+    private fun claimAndRun(block: () -> Unit) {
+        var claimed = false
+        while (!claimed) {
+            val published = listeners.load()
+            val index = published.indexOfFirst { it === block }
+            if (index < 0) return
+            claimed =
+                listeners.compareAndSet(
+                    published,
+                    published.filterIndexed { i, _ -> i != index },
+                )
+        }
+        block()
     }
 
     fun throwIfAborted() {

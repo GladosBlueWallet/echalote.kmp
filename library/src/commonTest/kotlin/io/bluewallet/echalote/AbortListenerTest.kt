@@ -4,6 +4,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlin.concurrent.Volatile
+import kotlin.concurrent.atomics.AtomicInt
+import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
@@ -64,5 +66,41 @@ class AbortListenerTest {
             }.join()
             jobs.forEach { it.join() }
             assertNull(failed.value, failed.value?.stackTraceToString())
+        }
+
+    @OptIn(ExperimentalAtomicApi::class)
+    @Test
+    fun onAbortIsNotLostWhenAbortWinsTheRace() =
+        runBlocking {
+            val missed = AtomicInt(0)
+            repeat(4_000) {
+                val abort = Abort()
+                val ran = AtomicInt(0)
+                val aborting = launch(Dispatchers.Default) { abort.abort() }
+                val subscribing = launch(Dispatchers.Default) { abort.onAbort { ran.addAndFetch(1) } }
+                aborting.join()
+                subscribing.join()
+                if (ran.load() == 0) missed.addAndFetch(1)
+            }
+            assertEquals(0, missed.load())
+        }
+
+    @OptIn(ExperimentalAtomicApi::class)
+    @Test
+    fun twoSubscribersAreNotLostWhenAbortAlreadySwapped() =
+        runBlocking {
+            val missed = AtomicInt(0)
+            repeat(8_000) {
+                val abort = Abort()
+                val ran = AtomicInt(0)
+                val aborting = launch(Dispatchers.Default) { abort.abort() }
+                val first = launch(Dispatchers.Default) { abort.onAbort { ran.addAndFetch(1) } }
+                val second = launch(Dispatchers.Default) { abort.onAbort { ran.addAndFetch(1) } }
+                aborting.join()
+                first.join()
+                second.join()
+                if (ran.load() != 2) missed.addAndFetch(1)
+            }
+            assertEquals(0, missed.load())
         }
 }

@@ -48,4 +48,14 @@ class CircuitLifecycleTest {
             tor.close()
         }
     }
+
+    @Test
+    fun closeMarksEveryCircuitClosed() {
+        val tor = SecretTorClientDuplex()
+        val circ = SecretCircuit(3, tor)
+        tor.circuits[3] = circ
+        tor.close()
+        assertTrue(circ.closed != null)
+        assertTrue(tor.circuits.isEmpty())
+    }
 }

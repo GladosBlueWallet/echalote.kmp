@@ -471,7 +471,7 @@ val AUTHORITY_HOSTS =
 
 val CONSENSUS_MIRRORS = AUTHORITY_HOSTS.map { "http://$it/tor/status-vote/current/consensus-microdesc" }
 
-private var cachedConsensus: Pair<Long, Consensus>? = null
+internal var cachedConsensus: Pair<Long, Consensus>? = null
 private const val CACHE_MS = 30 * 60 * 1000L
 
 internal fun resetCachedConsensus() {
@@ -492,9 +492,18 @@ suspend fun fetchMicrodescConsensus(
     val now = currentEpochMillis()
     val cached = cachedConsensus
     if (!force && cached != null && now - cached.first < CACHE_MS) {
-        cached.second.ensureFresh(now)
-        progress?.report(FetchStage.DOWNLOADING_DIRECTORY, 1.0)
-        return cached.second
+        val stillValid =
+            try {
+                cached.second.ensureFresh(now)
+                true
+            } catch (_: IllegalStateException) {
+                false
+            }
+        if (stillValid) {
+            progress?.report(FetchStage.DOWNLOADING_DIRECTORY, 1.0)
+            return cached.second
+        }
+        cachedConsensus = null
     }
     val shuffled = mirrors.toMutableList().also { it.shuffle() }
     val consensus =
