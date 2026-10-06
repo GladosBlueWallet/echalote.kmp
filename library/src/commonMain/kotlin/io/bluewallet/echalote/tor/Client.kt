@@ -7,20 +7,22 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlin.concurrent.atomics.update
 
+@OptIn(kotlin.concurrent.atomics.ExperimentalAtomicApi::class)
 internal class Emitter<T> {
+    private val listeners = kotlin.concurrent.atomics.AtomicReference(emptyList<(T) -> Unit>())
     private val lock = SpinLock()
-    private val listeners = ArrayList<(T) -> Unit>()
     private val pending = ArrayList<CompletableDeferred<T>>()
     private var failure: Throwable? = null
 
     fun on(fn: (T) -> Unit): () -> Unit {
-        lock.withLock { listeners += fn }
-        return { lock.withLock { listeners.remove(fn) } }
+        listeners.update { it + fn }
+        return { drop(fn) }
     }
 
     fun emit(value: T) {
-        val copy = lock.withLock { listeners.toList() }
+        val copy = lock.withLock { listeners.load() }
         for (l in copy) {
             try {
                 l(value)
@@ -53,15 +55,20 @@ internal class Emitter<T> {
         lock.withLock {
             failure?.let { throw it }
             pending += done
-            listeners += listener
+            listeners.update { it + listener }
         }
         return try {
             withAbort(abort) { done.await() }
         } finally {
-            lock.withLock {
-                listeners.remove(listener)
-                pending.remove(done)
-            }
+            drop(listener)
+            lock.withLock { pending.remove(done) }
+        }
+    }
+
+    private fun drop(fn: (T) -> Unit) {
+        listeners.update { current ->
+            val index = current.indexOfFirst { it === fn }
+            if (index < 0) current else current.filterIndexed { i, _ -> i != index }
         }
     }
 }

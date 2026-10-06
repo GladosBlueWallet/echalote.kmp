@@ -1,9 +1,12 @@
+@file:OptIn(kotlin.concurrent.atomics.ExperimentalAtomicApi::class)
+
 package io.bluewallet.echalote
 
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlin.concurrent.atomics.update
 
 /** AbortSignal analogue for races and timeouts. */
 class Abort {
@@ -11,14 +14,14 @@ class Abort {
         private set
     var reason: Throwable? = null
         private set
-    private val listeners = ArrayList<() -> Unit>()
+
+    private val listeners = kotlin.concurrent.atomics.AtomicReference(emptyList<() -> Unit>())
 
     fun abort(cause: Throwable = CancellationException("aborted")) {
         if (aborted) return
         aborted = true
         reason = cause
-        val copy = listeners.toList()
-        listeners.clear()
+        val copy = listeners.exchange(emptyList())
         for (l in copy) {
             try {
                 l()
@@ -28,7 +31,7 @@ class Abort {
     }
 
     fun onAbort(block: () -> Unit) {
-        if (aborted) block() else listeners += block
+        if (aborted) block() else listeners.update { it + block }
     }
 
     fun throwIfAborted() {
