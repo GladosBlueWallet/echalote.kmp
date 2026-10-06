@@ -7,19 +7,24 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlin.concurrent.atomics.update
 
+@OptIn(kotlin.concurrent.atomics.ExperimentalAtomicApi::class)
 internal class Emitter<T> {
-    private val listeners = ArrayList<(T) -> Unit>()
+    private val listeners = kotlin.concurrent.atomics.AtomicReference(emptyList<(T) -> Unit>())
 
     fun on(fn: (T) -> Unit): () -> Unit {
-        listeners += fn
+        listeners.update { it + fn }
         return {
-            listeners.remove(fn)
+            listeners.update { current ->
+                val index = current.indexOfFirst { it === fn }
+                if (index < 0) current else current.filterIndexed { i, _ -> i != index }
+            }
         }
     }
 
     fun emit(value: T) {
-        for (l in listeners.toList()) {
+        for (l in listeners.load()) {
             try {
                 l(value)
             } catch (_: Throwable) {
