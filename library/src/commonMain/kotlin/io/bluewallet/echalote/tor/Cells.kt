@@ -133,6 +133,14 @@ internal fun tryReadCell(cursor: Cursor): RawCell? {
 internal const val RELAY_HEAD_LEN = 1 + 2 + 2 + 4 + 2
 internal const val RELAY_DATA_LEN = PAYLOAD_LEN - RELAY_HEAD_LEN
 
+internal fun applyCircuitSendme(
+    target: Target,
+    version: Int,
+) {
+    if (version != 0) throw InvalidRelaySendmeCellDigestError()
+    target.packageWindow += 100
+}
+
 internal class Target(
     val relayidRsa: ByteArray,
     val forwardDigest: Sha1.Hasher,
@@ -150,8 +158,8 @@ internal fun encodeRelayPayload(
     streamId: Int,
     fragment: ByteArray,
     targets: List<Target>,
-    @Suppress("UNUSED_PARAMETER") early: Boolean,
-): ByteArray {
+    recordDigest: Boolean,
+): Pair<ByteArray, ByteArray?> {
     val payload = ByteArray(PAYLOAD_LEN)
     val c = Cursor(payload)
     c.writeU8(rcommand)
@@ -166,16 +174,12 @@ internal fun encodeRelayPayload(
     val exit = targets.last()
     exit.forwardDigest.update(payload)
     val digest20 = exit.forwardDigest.clone().finalize()
-    if (rcommand == RelayCmd.DATA) {
-        if (exit.packageWindow % 100 == 1) exit.digests += digest20
-        exit.packageWindow--
-    }
     payload.putU32be(digestOffset, (digest20.u8(0) shl 24) or (digest20.u8(1) shl 16) or (digest20.u8(2) shl 8) or digest20.u8(3))
     val mem = Memory(payload)
     for (i in targets.indices.reversed()) {
         targets[i].forwardKey.applyKeystream(mem)
     }
-    return payload
+    return payload to if (recordDigest) digest20 else null
 }
 
 internal data class DecodedRelay(
@@ -183,14 +187,19 @@ internal data class DecodedRelay(
     val streamId: Int,
     val fragment: ByteArray,
     val digest20: ByteArray,
-)
+    val hop: Int,
+    val hopCount: Int,
+) {
+    fun fromEndpoint(): Boolean = hopCount > 0 && hop == hopCount - 1
+}
 
 internal fun decodeRelayPayload(
     payload: ByteArray,
     targets: List<Target>,
 ): DecodedRelay {
     val mem = Memory(payload.copyOf())
-    for (target in targets) {
+    for (hop in targets.indices) {
+        val target = targets[hop]
         target.backwardKey.applyKeystream(mem)
         val c = Cursor(mem.bytes)
         val rcommand = c.readU8()
@@ -211,7 +220,7 @@ internal fun decodeRelayPayload(
         target.backwardDigest.update(mem.bytes)
         val length = c.readU16()
         val data = c.read(length)
-        return DecodedRelay(rcommand, streamId, data, digest20)
+        return DecodedRelay(rcommand, streamId, data, digest20, hop, targets.size)
     }
     throw UnrecognisedRelayCellError()
 }

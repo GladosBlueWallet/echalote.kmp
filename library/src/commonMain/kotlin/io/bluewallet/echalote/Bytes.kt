@@ -86,6 +86,26 @@ internal fun ByteArray.putU64be(
     }
 }
 
+/**
+ * Non-suspending lock for maps touched from both coroutine and plain callbacks.
+ * Critical sections must not suspend or re-enter.
+ */
+@OptIn(kotlin.concurrent.atomics.ExperimentalAtomicApi::class)
+internal class SpinLock {
+    private val locked = kotlin.concurrent.atomics.AtomicInt(0)
+
+    fun <T> withLock(block: () -> T): T {
+        while (!locked.compareAndSet(0, 1)) {
+            // The sections are a handful of map operations.
+        }
+        try {
+            return block()
+        } finally {
+            locked.store(0)
+        }
+    }
+}
+
 private val HEX_DIGITS =
     charArrayOf(
         '0',

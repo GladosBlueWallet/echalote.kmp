@@ -56,11 +56,21 @@ internal class SecretCircuit(
     var closed: Any? = null
 
     fun onCloseOrError(reason: Any?) {
-        if (closed != null) return
-        closed = reason ?: true
-        for (s in streams.values.toList()) s.fail(reason as? Throwable ?: DestroyedError(0))
-        streams.clear()
-        tor.circuits.remove(id)
+        val doomed =
+            tor.gate.withLock {
+                if (closed != null) {
+                    null
+                } else {
+                    closed = reason ?: true
+                    val list = streams.values.toList()
+                    streams.clear()
+                    tor.circuits.remove(id)
+                    list to tor.drainWindowWaiters()
+                }
+            } ?: return
+        for (w in doomed.second) w.complete(Unit)
+        val err = reason as? Throwable ?: DestroyedError(0)
+        for (s in doomed.first) s.fail(err)
     }
 
     suspend fun close(reason: Int = DestroyReasons.NONE) {
@@ -74,11 +84,15 @@ internal class SecretCircuit(
         onCloseOrError(error)
     }
 
+    private fun throwIfClosed() {
+        if (closed != null) throw (closed as? Throwable) ?: DestroyedError(0)
+    }
+
     suspend fun extendOrThrow(
         microdesc: Microdesc,
         abort: Abort? = null,
     ) {
-        if (closed != null) throw (closed as? Throwable) ?: DestroyedError(0)
+        throwIfClosed()
         val relayidRsa = Base64.decode(microdesc.identity)
         require(relayidRsa.size == HASH_LEN) { "bad identity" }
         val ntorKey = Base64.decode(microdesc.ntorOnionKey)
@@ -89,6 +103,7 @@ internal class SecretCircuit(
         microdesc.ipv6?.let { links += extend2LinkIpv6(it) }
         links += extend2LinkLegacyId(relayidRsa)
         if (relayidEd != null) links += extend2LinkModernId(relayidEd)
+        tor.gate.withLock { throwIfClosed() }
         val (secret, publicX) = X25519.randomKeyPair()
         val request = NtorRequest(publicX, relayidRsa, ntorKey)
         val reqBytes = ByteArray(request.size())
@@ -117,7 +132,10 @@ internal class SecretCircuit(
                 Aes128Ctr128BEKey(Memory(result.forwardKey), Memory(ByteArray(16))),
                 Aes128Ctr128BEKey(Memory(result.backwardKey), Memory(ByteArray(16))),
             )
-        targets += target
+        tor.gate.withLock {
+            throwIfClosed()
+            targets += target
+        }
     }
 
     suspend fun openOrThrow(
@@ -126,10 +144,14 @@ internal class SecretCircuit(
         wait: Boolean = true,
         abort: Abort? = null,
     ): TorStreamDuplex {
-        if (closed != null) throw (closed as? Throwable) ?: DestroyedError(0)
-        lastStreamId = nextClientStreamId(lastStreamId)
-        val stream = SecretTorStreamDuplex("external", lastStreamId, this)
-        streams[stream.id] = stream
+        val stream =
+            tor.gate.withLock {
+                throwIfClosed()
+                lastStreamId = nextClientStreamId(lastStreamId)
+                val created = SecretTorStreamDuplex("external", lastStreamId, this)
+                streams[created.id] = created
+                created
+            }
         val begin = beginPayload("$hostname:$port", beginFlagsPreferred())
         tor.sendRelay(this, RelayCmd.BEGIN, stream.id, begin)
         if (wait) stream.waitConnected(abort)

@@ -409,6 +409,11 @@ class Aes128Ctr128BEKey(
 ) {
     private val roundKeys = Aes.expandKey(key.bytes.copyOf())
     private val counter = iv.bytes.copyOf()
+
+    init {
+        require(counter.size == 16) { "AES-CTR IV must be 16 bytes" }
+    }
+
     private val keystream = ByteArray(16)
     private var offset = 16
 

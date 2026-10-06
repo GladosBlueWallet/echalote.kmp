@@ -15,9 +15,23 @@ fun parseHttpUrl(url: String): DirHttpUrl {
     val slash = rest.indexOf('/')
     val hostPort = if (slash < 0) rest else rest.substring(0, slash)
     val path = if (slash < 0) "/" else rest.substring(slash)
-    val colon = hostPort.indexOf(':')
-    val host = if (colon < 0) hostPort else hostPort.substring(0, colon)
-    val port = if (colon < 0) 80 else hostPort.substring(colon + 1).toInt()
+    val host: String
+    val port: Int
+    if (hostPort.startsWith("[")) {
+        val end = hostPort.indexOf(']')
+        require(end > 1) { "bad ipv6 url $url" }
+        host = hostPort.substring(1, end)
+        port =
+            if (end + 1 < hostPort.length && hostPort[end + 1] == ':') {
+                hostPort.substring(end + 2).toInt()
+            } else {
+                80
+            }
+    } else {
+        val colon = hostPort.indexOf(':')
+        host = if (colon < 0) hostPort else hostPort.substring(0, colon)
+        port = if (colon < 0) 80 else hostPort.substring(colon + 1).toInt()
+    }
     return DirHttpUrl(host, port, path)
 }
 
@@ -50,15 +64,18 @@ fun parseHttp1Response(raw: ByteArray): HttpResponse {
     val lines = head.split("\r\n")
     val status = lines[0].split(" ").getOrNull(1)?.toIntOrNull() ?: 0
     val headers = mutableMapOf<String, String>()
+    val contentLengths = ArrayList<String>()
     for (line in lines.drop(1)) {
         val c = line.indexOf(':')
-        if (c > 0) headers[line.substring(0, c).trim()] = line.substring(c + 1).trim()
+        if (c > 0) {
+            val name = line.substring(0, c).trim()
+            val value = line.substring(c + 1).trim()
+            if (name.equals("Content-Length", true)) contentLengths += value
+            headers[name] = value
+        }
     }
-    val length =
-        headers.entries
-            .firstOrNull { it.key.equals("Content-Length", true) }
-            ?.value
-            ?.toIntOrNull()
+    require(contentLengths.map { it.trim() }.distinct().size <= 1) { "conflicting Content-Length" }
+    val length = contentLengths.firstOrNull()?.toIntOrNull()
     val sliced = if (length != null) body.copyOf(minOf(length, body.size)) else body
     return HttpResponse(status, sliced, headers)
 }
@@ -87,14 +104,19 @@ fun http1HeaderValue(
     name: String,
 ): String? {
     val text = headerBytes.decodeToString()
+    var found: String? = null
     for (line in text.split("\r\n").drop(1)) {
         val c = line.indexOf(':')
         if (c <= 0) continue
         if (line.substring(0, c).trim().equals(name, ignoreCase = true)) {
-            return line.substring(c + 1).trim()
+            val value = line.substring(c + 1).trim()
+            require(found == null || !name.equals("Content-Length", true) || found == value) {
+                "conflicting Content-Length"
+            }
+            if (found == null) found = value
         }
     }
-    return null
+    return found
 }
 
 fun http1ContentLength(headerBytes: ByteArray): Int? = http1HeaderValue(headerBytes, "Content-Length")?.toIntOrNull()

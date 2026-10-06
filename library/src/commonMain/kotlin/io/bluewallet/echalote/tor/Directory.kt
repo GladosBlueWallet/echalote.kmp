@@ -134,6 +134,47 @@ private class CachedCircuit(
     val createdAtMs: Long,
 )
 
+internal sealed interface Boot {
+    data object Retry : Boot
+
+    data object Ready : Boot
+
+    class Wait(
+        val deferred: kotlinx.coroutines.Deferred<Unit>,
+    ) : Boot
+}
+
+internal sealed interface Flight {
+    class Hit(
+        val circuit: Circuit,
+    ) : Flight
+
+    class Join(
+        val deferred: CompletableDeferred<Circuit>,
+    ) : Flight
+
+    class Lead(
+        val deferred: CompletableDeferred<Circuit>,
+    ) : Flight
+}
+
+internal fun randomIndex(size: Int): Int {
+    require(size > 0)
+    if (size == 1) return 0
+    val bound = size.toLong()
+    val space = 0x1_0000_0000L
+    val limit = space - (space % bound)
+    while (true) {
+        val b = secureRandom(4)
+        val v =
+            ((b[0].toLong() and 0xff) shl 24) or
+                ((b[1].toLong() and 0xff) shl 16) or
+                ((b[2].toLong() and 0xff) shl 8) or
+                (b[3].toLong() and 0xff)
+        if (v < limit) return (v % bound).toInt()
+    }
+}
+
 private val defaultDialerMutex = Mutex()
 private var defaultDialer: ExitDialer? = null
 
@@ -430,7 +471,7 @@ val AUTHORITY_HOSTS =
 
 val CONSENSUS_MIRRORS = AUTHORITY_HOSTS.map { "http://$it/tor/status-vote/current/consensus-microdesc" }
 
-private var cachedConsensus: Pair<Long, Consensus>? = null
+internal var cachedConsensus: Pair<Long, Consensus>? = null
 private const val CACHE_MS = 30 * 60 * 1000L
 
 internal fun resetCachedConsensus() {
@@ -448,10 +489,21 @@ suspend fun fetchMicrodescConsensus(
 ): Consensus {
     val progress = fetchProgress()
     progress?.report(FetchStage.DOWNLOADING_DIRECTORY)
+    val now = currentEpochMillis()
     val cached = cachedConsensus
-    if (!force && cached != null && currentEpochMillis() - cached.first < CACHE_MS) {
-        progress?.report(FetchStage.DOWNLOADING_DIRECTORY, 1.0)
-        return cached.second
+    if (!force && cached != null && now - cached.first < CACHE_MS) {
+        val stillValid =
+            try {
+                cached.second.ensureFresh(now)
+                true
+            } catch (_: IllegalStateException) {
+                false
+            }
+        if (stillValid) {
+            progress?.report(FetchStage.DOWNLOADING_DIRECTORY, 1.0)
+            return cached.second
+        }
+        cachedConsensus = null
     }
     val shuffled = mirrors.toMutableList().also { it.shuffle() }
     val consensus =
@@ -465,6 +517,7 @@ suspend fun fetchMicrodescConsensus(
                 if (!text.contains("directory-footer")) throw Exception("truncated consensus (no directory-footer)")
                 val parsed = ConsensusParser.parseOrThrow(text)
                 if (parsed.microdescs.isEmpty()) throw Exception("consensus has no microdescs")
+                parsed.ensureFresh()
                 parsed
             },
             concurrency = concurrency,
@@ -527,6 +580,8 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
     val torLock = Mutex()
     val circuitLock = Mutex()
     val circuits = LinkedHashMap<Pair<String, Int>, CachedCircuit>()
+    val inflight = LinkedHashMap<Pair<String, Int>, CompletableDeferred<Circuit>>()
+    val retrying = HashSet<CompletableDeferred<Circuit>>()
     var tor: TorClientDuplex? = null
     var meekStream: BatchedFetchStream? = null
     var ready: kotlinx.coroutines.Deferred<Unit>? = null
@@ -537,9 +592,30 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
         port: Int,
     ) = host.lowercase() to port
 
-    fun resetTor() {
-        val snapshot = circuits.values.toList()
-        circuits.clear()
+    suspend fun resetTor(only: TorClientDuplex? = null) {
+        val closing =
+            torLock.withLock {
+                if (only != null && tor !== only) return@withLock null
+                val pair = tor to meekStream
+                tor = null
+                meekStream = null
+                ready = null
+                pair
+            } ?: return
+        val snapshot: List<CachedCircuit>
+        val pending: List<CompletableDeferred<Circuit>>
+        circuitLock.withLock {
+            snapshot = circuits.values.toList()
+            circuits.clear()
+            val kept = inflight.filterValues { it in retrying }
+            pending = inflight.values.filter { it !in retrying }
+            inflight.clear()
+            for ((k, deferred) in kept) inflight[k] = deferred
+        }
+        val reason = Exception("reset")
+        for (wait in pending) {
+            if (!wait.isCompleted) wait.completeExceptionally(reason)
+        }
         for (cached in snapshot) {
             scope.launch {
                 try {
@@ -549,16 +625,13 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
             }
         }
         try {
-            tor?.close()
+            closing.first?.close()
         } catch (_: Throwable) {
         }
         try {
-            meekStream?.error(Exception("reset"))
+            closing.second?.error(reason)
         } catch (_: Throwable) {
         }
-        tor = null
-        meekStream = null
-        ready = null
     }
 
     fun wrap(
@@ -584,19 +657,28 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
                     pipeDuplex(meek.duplex, client.inner)
                 } catch (_: Throwable) {
                 }
-                if (tor === client) resetTor()
+                if (tor === client) resetTor(client)
             }
             scope.launch {
                 try {
                     pipeDuplex(client.inner, meek.duplex)
                 } catch (_: Throwable) {
                 }
-                if (tor === client) resetTor()
+                if (tor === client) resetTor(client)
             }
             meek.start()
             client.waitOrThrow(signal)
             progress?.report(FetchStage.CONNECTING, 1.0)
-            tor = client
+            val installed =
+                torLock.withLock {
+                    if (client.closed == null && tor == null) {
+                        tor = client
+                        true
+                    } else {
+                        tor != null
+                    }
+                }
+            check(installed) { "tor connection closed" }
         } catch (err: Throwable) {
             try {
                 meek.error(err)
@@ -606,10 +688,59 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
                 client.close()
             } catch (_: Throwable) {
             }
-            meekStream = null
-            ready = null
+            val attempt = kotlin.coroutines.coroutineContext[kotlinx.coroutines.Job]
+            torLock.withLock {
+                if (meekStream === meek) meekStream = null
+                if (ready === attempt) ready = null
+            }
             throw wrap("bootstrap", err)
         }
+    }
+
+    suspend fun awaitBoot(
+        signal: Abort,
+        progress: FetchProgressReporter?,
+    ): TorClientDuplex? {
+        val boot: Boot =
+            torLock.withLock {
+                if (disposed) throw Exception("exit dialer disposed")
+                if (tor?.closed != null) {
+                    Boot.Retry
+                } else if (tor != null) {
+                    Boot.Ready
+                } else {
+                    if (ready == null) ready = beginBootstrap(signal, progress)
+                    Boot.Wait(ready!!)
+                }
+            }
+        val client =
+            when (boot) {
+                Boot.Retry -> null
+                Boot.Ready -> tor ?: error("tor client failed to start")
+                is Boot.Wait -> {
+                    runCatching { withAbort(signal) { boot.deferred.await() } }.getOrElse { err ->
+                        throw wrap("bootstrap", err)
+                    }
+                    progress?.report(FetchStage.CONNECTING, 1.0)
+                    tor ?: error("tor client failed to start")
+                }
+            }
+        return client
+    }
+
+    suspend fun bootClient(
+        signal: Abort,
+        progress: FetchProgressReporter?,
+    ): TorClientDuplex? {
+        val stale = torLock.withLock { tor?.takeIf { it.closed != null } }
+        val booted =
+            if (stale != null) {
+                resetTor(stale)
+                null
+            } else {
+                awaitBoot(signal, progress)
+            }
+        return booted
     }
 
     suspend fun ensureTor(signal: Abort): TorClientDuplex {
@@ -618,32 +749,20 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
         val progress = fetchProgress()
         progress?.report(FetchStage.CONNECTING)
         val hook = hooks.ensureTor
-        if (hook != null) {
-            if (tor?.closed != null) tor = null
-            val hooked = tor ?: hook(signal).also { tor = it }
+        val hooked =
+            if (hook == null) {
+                null
+            } else {
+                if (tor?.closed != null) tor = null
+                tor ?: hook(signal).also { tor = it }
+            }
+        if (hooked != null) {
             progress?.report(FetchStage.CONNECTING, 1.0)
             return hooked
         }
-        val boot =
-            torLock.withLock {
-                if (disposed) throw Exception("exit dialer disposed")
-                if (tor?.closed != null) resetTor()
-                if (tor != null) {
-                    null
-                } else {
-                    if (ready == null) ready = beginBootstrap(signal, progress)
-                    ready
-                }
-            }
-        if (boot != null) {
-            try {
-                withAbort(signal) { boot.await() }
-            } catch (err: Throwable) {
-                throw if (err is Exception && err.message?.startsWith("tor ") == true) err else wrap("bootstrap", err)
-            }
-        }
-        progress?.report(FetchStage.CONNECTING, 1.0)
-        return tor ?: throw Exception("tor client failed to start")
+        var client: TorClientDuplex? = null
+        while (client == null) client = bootClient(signal, progress)
+        return client
     }
 
     suspend fun makeExitCircuit(
@@ -675,40 +794,103 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
         }
     }
 
+    fun fresh(cached: CachedCircuit): Boolean {
+        val stale =
+            options.maxCircuitAgeMs > 0L &&
+                hooks.nowMs() - cached.createdAtMs >= options.maxCircuitAgeMs
+        return !stale && !cached.circuit.isClosed
+    }
+
+    fun rethrowCircuit(err: Throwable): Nothing {
+        if (err is Exception && err.message?.startsWith("tor ") == true) throw err
+        throw wrap("extend circuit", err)
+    }
+
+    suspend fun buildWithOneRetry(
+        client: TorClientDuplex,
+        signal: Abort,
+    ): Circuit =
+        try {
+            makeExitCircuit(client, signal)
+        } catch (err: Throwable) {
+            if (hooks.makeCircuit != null || !isTransientCircuitError(err) || signal.aborted) {
+                rethrowCircuit(err)
+            }
+            resetTor(client)
+            makeExitCircuit(ensureTor(signal), signal)
+        }
+
+    suspend fun leadCircuit(
+        client: TorClientDuplex,
+        signal: Abort,
+        key: Pair<String, Int>,
+        flight: Flight.Lead,
+    ): Circuit {
+        circuitLock.withLock { retrying += flight.deferred }
+        try {
+            val built = buildWithOneRetry(client, signal)
+            val installed =
+                circuitLock.withLock {
+                    if (inflight[key] !== flight.deferred) {
+                        false
+                    } else {
+                        inflight.remove(key)
+                        circuits[key] = CachedCircuit(built, hooks.nowMs())
+                        true
+                    }
+                }
+            if (!installed) {
+                scope.launch { runCatching { built.close() } }
+                error("circuit build was reset")
+            }
+            flight.deferred.complete(built)
+            return built
+        } catch (err: Throwable) {
+            circuitLock.withLock {
+                if (inflight[key] === flight.deferred) inflight.remove(key)
+            }
+            flight.deferred.completeExceptionally(err)
+            throw err
+        } finally {
+            circuitLock.withLock { retrying -= flight.deferred }
+        }
+    }
+
     suspend fun obtainCircuit(
         client: TorClientDuplex,
         signal: Abort,
         key: Pair<String, Int>,
-    ): Circuit =
-        circuitLock.withLock {
-            val cached = circuits[key]
-            if (cached != null) {
-                val stale =
-                    options.maxCircuitAgeMs > 0L &&
-                        hooks.nowMs() - cached.createdAtMs >= options.maxCircuitAgeMs
-                if (!stale && !cached.circuit.isClosed) return@withLock cached.circuit
-                evictCircuit(key)
-            }
-            var used = client
-            val built =
-                try {
-                    makeExitCircuit(used, signal)
-                } catch (err: Throwable) {
-                    if (hooks.makeCircuit == null && isTransientCircuitError(err) && !signal.aborted) {
-                        resetTor()
-                        used = ensureTor(signal)
-                        makeExitCircuit(used, signal)
-                    } else {
-                        throw if (err is Exception && err.message?.startsWith("tor ") == true) {
-                            err
-                        } else {
-                            wrap("extend circuit", err)
-                        }
-                    }
+    ): Circuit {
+        val flight: Flight =
+            circuitLock.withLock {
+                if (disposed) throw Exception("exit dialer disposed")
+
+                fun joinOrLead(): Flight {
+                    val pending = inflight[key]
+                    if (pending != null) return Flight.Join(pending)
+                    val created = CompletableDeferred<Circuit>()
+                    inflight[key] = created
+                    return Flight.Lead(created)
                 }
-            circuits[key] = CachedCircuit(built, hooks.nowMs())
-            built
+                val cached = circuits[key]
+                val chosen: Flight =
+                    if (cached != null && fresh(cached)) {
+                        Flight.Hit(cached.circuit)
+                    } else {
+                        if (cached != null) {
+                            circuits.remove(key)
+                            scope.launch { runCatching { cached.circuit.close() } }
+                        }
+                        joinOrLead()
+                    }
+                chosen
+            }
+        return when (flight) {
+            is Flight.Hit -> flight.circuit
+            is Flight.Join -> withAbort(signal) { flight.deferred.await() }
+            is Flight.Lead -> leadCircuit(client, signal, key, flight)
         }
+    }
 
     return object : ExitDialer {
         override suspend fun dial(
@@ -784,7 +966,7 @@ internal suspend fun pickExtendable(
     var last: Throwable = Exception("no extendable relays")
     var i = 0
     while (i < tries && remaining.isNotEmpty()) {
-        val idx = (secureRandom(1)[0].toInt() and 0xff) % remaining.size
+        val idx = randomIndex(remaining.size)
         val head = remaining.removeAt(idx)
         try {
             return fetchMicrodesc(head, signal, engine = engine)
@@ -796,6 +978,17 @@ internal suspend fun pickExtendable(
     throw last
 }
 
+private fun usableRelay(
+    head: MicrodescHead,
+    guardId: ByteArray?,
+    exit: Boolean,
+): Boolean {
+    val flags = head.flags
+    val role = if (exit) flags.contains("Exit") && !flags.contains("BadExit") else flags.contains("V2Dir")
+    val notGuard = guardId == null || !equalBytes(Base64.decode(head.identity), guardId)
+    return role && flags.contains("Fast") && flags.contains("Stable") && notGuard
+}
+
 internal suspend fun buildExitCircuitOnce(
     client: TorClientDuplex,
     signal: Abort,
@@ -803,7 +996,7 @@ internal suspend fun buildExitCircuitOnce(
 ): Circuit {
     val progress = fetchProgress()
     val engine = options.http ?: defaultHttpEngine()
-    val circuit = client.createOrThrow(signal)
+    val circuit = withAbortTimeout(options.extendTimeoutMs, signal) { client.createOrThrow(it) }
     try {
         val consensus =
             fetchMicrodescConsensus(
@@ -811,17 +1004,14 @@ internal suspend fun buildExitCircuitOnce(
                 mirrors = options.consensusUrls ?: CONSENSUS_MIRRORS,
                 engine = engine,
             )
-        val middles =
-            consensus.microdescs.filter {
-                it.flags.contains("Fast") && it.flags.contains("Stable") && it.flags.contains("V2Dir")
-            }
-        val exits =
-            consensus.microdescs.filter {
-                it.flags.contains("Fast") &&
-                    it.flags.contains("Stable") &&
-                    it.flags.contains("Exit") &&
-                    !it.flags.contains("BadExit")
-            }
+        val guardId =
+            (circuit as? LiveCircuit)
+                ?.secret
+                ?.targets
+                ?.firstOrNull()
+                ?.relayidRsa
+        val middles = consensus.microdescs.filter { usableRelay(it, guardId, exit = false) }
+        val exits = consensus.microdescs.filter { usableRelay(it, guardId, exit = true) }
         if (middles.isEmpty() || exits.isEmpty()) {
             throw Exception("tor consensus missing usable relays (middles=${middles.size} exits=${exits.size})")
         }
@@ -850,7 +1040,7 @@ internal suspend fun buildExitCircuitOnce(
 
 private fun <T> MutableList<T>.shuffle() {
     for (i in size - 1 downTo 1) {
-        val j = (secureRandom(1)[0].toInt() and 0xff) % (i + 1)
+        val j = randomIndex(i + 1)
         val t = this[i]
         this[i] = this[j]
         this[j] = t

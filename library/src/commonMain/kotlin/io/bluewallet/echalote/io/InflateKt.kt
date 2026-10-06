@@ -3,12 +3,50 @@ package io.bluewallet.echalote
 /** Pure Kotlin zlib/deflate inflater (RFC 1950/1951) for native targets. */
 internal object InflateKt {
     fun inflateZlibOrNull(input: ByteArray): ByteArray? {
-        if (input.size < 2 || (input[0].toInt() and 0xff) != 0x78) return null
-        return try {
-            inflateDeflate(input, 2)
-        } catch (_: Exception) {
+        val headerOk =
+            input.size >= 6 &&
+                input.u8(0) and 0x0f == 8 &&
+                (input.u8(0) * 256 + input.u8(1)) % 31 == 0 &&
+                input.u8(1) and 0x20 == 0
+        return if (!headerOk) {
             null
+        } else {
+            try {
+                val (out, end) = inflateDeflate(input, 2)
+                val expect = if (end + 4 <= input.size) input.u32be(end).toLong() and 0xffffffffL else null
+                if (expect != null && expect == adler32(out)) out else null
+            } catch (_: Exception) {
+                null
+            }
         }
+    }
+
+    private fun adler32(data: ByteArray): Long {
+        var a = 1L
+        var b = 0L
+        for (i in data.indices) {
+            a += data.u8(i)
+            if (a >= 65521) a -= 65521
+            b += a
+            if (b >= 65521) b -= 65521
+        }
+        return (b shl 16) or a
+    }
+
+    private class OutBuf {
+        private var buf = ByteArray(256)
+        var size: Int = 0
+            private set
+
+        operator fun plusAssign(b: Byte) {
+            require(size < MAX_HTTP1_BODY) { "inflate output too large" }
+            if (size == buf.size) buf = buf.copyOf(buf.size * 2)
+            buf[size++] = b
+        }
+
+        operator fun get(i: Int): Byte = buf[i]
+
+        fun toByteArray(): ByteArray = buf.copyOf(size)
     }
 
     private class BitReader(
@@ -217,9 +255,9 @@ internal object InflateKt {
     private fun inflateDeflate(
         src: ByteArray,
         start: Int,
-    ): ByteArray {
+    ): Pair<ByteArray, Int> {
         val r = BitReader(src, start)
-        val out = ArrayList<Byte>(src.size * 2)
+        val out = OutBuf()
         while (true) {
             val last = r.bits(1)
             when (r.bits(2)) {
@@ -233,12 +271,13 @@ internal object InflateKt {
             }
             if (last == 1) break
         }
-        return ByteArray(out.size) { out[it] }
+        r.byteAlign()
+        return out.toByteArray() to r.i
     }
 
     private fun inflateStored(
         r: BitReader,
-        out: ArrayList<Byte>,
+        out: OutBuf,
     ) {
         r.byteAlign()
         require(r.i + 4 <= r.src.size) { "truncated stored" }
@@ -247,13 +286,13 @@ internal object InflateKt {
         r.i += 4
         require(len xor 0xffff == nlen) { "stored nlen mismatch" }
         for (i in 0 until len) {
-            out += r.src[r.i++].toByte()
+            out += r.src[r.i++]
         }
     }
 
     private fun inflateHuffman(
         r: BitReader,
-        out: ArrayList<Byte>,
+        out: OutBuf,
         lit: Huffman,
         dist: Huffman,
     ) {
@@ -289,16 +328,20 @@ internal object InflateKt {
             when (s) {
                 in 0..15 -> lengths[n++] = s
                 16 -> {
-                    val prev = if (n == 0) 0 else lengths[n - 1]
+                    require(n > 0) { "bad code-length repeat" }
+                    val prev = lengths[n - 1]
                     val rep = 3 + r.bits(2)
+                    require(n + rep <= lengths.size) { "code-length repeat overflow" }
                     repeat(rep) { lengths[n++] = prev }
                 }
                 17 -> {
                     val rep = 3 + r.bits(3)
+                    require(n + rep <= lengths.size) { "code-length repeat overflow" }
                     n += rep
                 }
                 18 -> {
                     val rep = 11 + r.bits(7)
+                    require(n + rep <= lengths.size) { "code-length repeat overflow" }
                     n += rep
                 }
                 else -> throw IllegalArgumentException("bad clen")

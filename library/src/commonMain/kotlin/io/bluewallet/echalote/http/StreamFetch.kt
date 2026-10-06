@@ -23,6 +23,7 @@ data class StreamResponse(
     val statusText: String,
     val headers: Map<String, String>,
     val body: ByteArray,
+    val persistent: Boolean = false,
 ) {
     val ok: Boolean get() = status in 200..299
 
@@ -85,6 +86,9 @@ suspend fun streamFetch(
     if (init.headers.keys.none { it.equals("User-Agent", true) }) {
         headers["User-Agent"] = TOR_BROWSER_USER_AGENT
     }
+    if (init.headers.keys.none { it.equals("Accept-Encoding", true) }) {
+        headers["Accept-Encoding"] = "identity"
+    }
     headers.putAll(init.headers)
     val method = init.method.ifBlank { "GET" }
     val hasLength = headers.keys.any { it.equals("Content-Length", true) }
@@ -103,49 +107,23 @@ suspend fun streamFetch(
     // Do not close the duplex here. A full close tears down TLS/Tor reads.
     // The TypeScript client only half-closes the write side; this ByteDuplex
     // has no half-close, and the response is framed by length/chunked.
-
-    val reader = HttpByteReader(init.stream, abort)
-    val headBytes = reader.readUntil(CRLFCRLF)
-    val headText = headBytes.decodeToString()
-    val lines = headText.split("\r\n")
-    val statusParts = (lines.firstOrNull() ?: "").split(" ")
-    val status = statusParts.getOrNull(1)?.toIntOrNull() ?: 0
-    val statusText = statusParts.drop(2).joinToString(" ")
-    require(status in 200..599) { "Invalid HTTP status: ${lines.firstOrNull()}" }
-    val responseHeaders = LinkedHashMap<String, String>()
-    for (line in lines.drop(1)) {
-        if (line.isEmpty()) continue
-        val colon = line.indexOf(':')
-        if (colon == -1) continue
-        responseHeaders[line.substring(0, colon).trim()] = line.substring(colon + 1).trim()
-    }
-    val transfer = responseHeaders.entries.firstOrNull { it.key.equals("Transfer-Encoding", true) }?.value
-    progress?.report(FetchStage.DOWNLOADING_RESPONSE)
-    var bodyBytes =
-        if (transfer != null && transfer.lowercase().contains("chunked")) {
-            reader.readChunkedBody()
-        } else {
-            val lengthHeader =
-                responseHeaders.entries.firstOrNull { it.key.equals("Content-Length", true) }?.value
-                    ?: throw IllegalArgumentException("HTTP response missing Content-Length and chunked encoding")
-            val length = lengthHeader.toIntOrNull()
-            require(length != null && length >= 0) { "Invalid Content-Length: $lengthHeader" }
-            reader.readExact(length) { have ->
-                progress?.downloadBytes(FetchStage.DOWNLOADING_RESPONSE, have, length)
-            }
-        }
-    progress?.report(FetchStage.DOWNLOADING_RESPONSE, 1.0)
-    inflateZlibOrNull(bodyBytes)?.let { bodyBytes = it }
-    return StreamResponse(status, statusText, responseHeaders, bodyBytes)
+    return HttpByteReader(init.stream, abort).readResponse(progress)
 }
 
 private val CRLF = "\r\n".encodeToByteArray()
 private val CRLFCRLF = "\r\n\r\n".encodeToByteArray()
 
-internal data class HttpsSession(
+internal class HttpsSession(
     val plaintext: ByteDuplex,
     val close: () -> Unit,
-)
+) {
+    val io = Mutex()
+}
+
+internal class HttpStreamException(
+    message: String,
+    val reusable: Boolean,
+) : IllegalArgumentException(message)
 
 internal var httpsSessionFactory: (suspend (String, Int, Abort?) -> HttpsSession)? = null
 
@@ -189,21 +167,23 @@ suspend fun httpsFetch(
             reporter.report(FetchStage.SENDING_REQUEST)
             val first =
                 runCatching {
-                    streamFetch(url, StreamFetchInit(session.plaintext, abort, headers, method, body))
+                    session.io.withLock {
+                        streamFetch(url, StreamFetchInit(session.plaintext, abort, headers, method, body))
+                    }
                 }
             keptAlive(key, first)?.let {
                 reporter.report(FetchStage.DONE)
                 return@withContext it
             }
             last = first.exceptionOrNull()
-            val stop =
-                last is CoroutineCancellation ||
-                    abort?.aborted == true ||
-                    last?.message?.contains("closed duplex") == true
-            if (!stop) {
+            val failure = last
+            val reusable = failure is HttpStreamException && failure.reusable
+            if (reusable && abort?.aborted != true) {
                 val second =
                     runCatching {
-                        streamFetch(url, StreamFetchInit(session.plaintext, abort, headers, method, body))
+                        session.io.withLock {
+                            streamFetch(url, StreamFetchInit(session.plaintext, abort, headers, method, body))
+                        }
                     }
                 keptAlive(key, second)?.let {
                     reporter.report(FetchStage.DONE)
@@ -220,13 +200,7 @@ suspend fun httpsFetch(
     }
 }
 
-private fun keepsAlive(res: StreamResponse): Boolean {
-    val conn =
-        res.headers.entries
-            .firstOrNull { it.key.equals("Connection", true) }
-            ?.value
-    return conn?.contains("keep-alive", ignoreCase = true) == true
-}
+private fun keepsAlive(res: StreamResponse): Boolean = res.persistent
 
 private suspend fun keptAlive(
     key: Pair<String, Int>,
@@ -315,15 +289,27 @@ private fun parseUrl(input: String): ParsedHttpUrl {
     val hostPort = if (slash < 0) rest else rest.substring(0, slash)
     val path = if (slash < 0) "/" else rest.substring(slash)
     val defaultPort = if (scheme == "http") 80 else 443
-    val split = hostPort.lastIndexOf(':')
     val host: String
     val port: Int
-    if (split > 0 && !hostPort.startsWith("[")) {
-        host = hostPort.substring(0, split)
-        port = hostPort.substring(split + 1).toIntOrNull() ?: defaultPort
+    if (hostPort.startsWith("[")) {
+        val end = hostPort.indexOf(']')
+        require(end > 1) { "bad ipv6 url" }
+        host = hostPort.substring(1, end)
+        port =
+            if (end + 1 < hostPort.length && hostPort[end + 1] == ':') {
+                hostPort.substring(end + 2).toIntOrNull() ?: defaultPort
+            } else {
+                defaultPort
+            }
     } else {
-        host = hostPort.trimStart('[').trimEnd(']')
-        port = defaultPort
+        val split = hostPort.lastIndexOf(':')
+        if (split > 0) {
+            host = hostPort.substring(0, split)
+            port = hostPort.substring(split + 1).toIntOrNull() ?: defaultPort
+        } else {
+            host = hostPort
+            port = defaultPort
+        }
     }
     return ParsedHttpUrl(host, port, path)
 }
@@ -332,9 +318,112 @@ private class HttpByteReader(
     val duplex: ByteDuplex,
     val abort: Abort?,
 ) {
-    private var buf = ByteArray(0)
+    suspend fun readResponse(progress: FetchProgressReporter?): StreamResponse {
+        val headText = readUntil(CRLFCRLF).decodeToString()
+        val lines = headText.split("\r\n")
+        val statusLine = lines.firstOrNull() ?: ""
+        val statusParts = statusLine.split(" ")
+        val status = statusParts.getOrNull(1)?.toIntOrNull() ?: 0
+        val statusText = statusParts.drop(2).joinToString(" ")
+        require(status in 200..599) { "Invalid HTTP status: $statusLine" }
+        val responseHeaders = LinkedHashMap<String, String>()
+        val contentLengths = ArrayList<String>()
+        for (line in lines.drop(1)) {
+            val colon = line.indexOf(':')
+            if (line.isNotEmpty() && colon > 0) {
+                val name = line.substring(0, colon).trim()
+                val value = line.substring(colon + 1).trim()
+                if (name.equals("Content-Length", true)) contentLengths += value
+                responseHeaders[name] = value
+            }
+        }
+        require(contentLengths.map { it.trim() }.distinct().size <= 1) { "conflicting Content-Length" }
+        progress?.report(FetchStage.DOWNLOADING_RESPONSE)
+        val bodyBytes = readBody(statusLine, responseHeaders, contentLengths, progress)
+        progress?.report(FetchStage.DOWNLOADING_RESPONSE, 1.0)
+        return finishResponse(status, statusText, statusLine, responseHeaders, bodyBytes)
+    }
 
-    private suspend fun pull() {
+    private fun finishResponse(
+        status: Int,
+        statusText: String,
+        statusLine: String,
+        responseHeaders: Map<String, String>,
+        bodyBytes: ByteArray,
+    ): StreamResponse {
+        val connection = responseHeaders.entries.firstOrNull { it.key.equals("Connection", true) }?.value
+        val keep =
+            when {
+                connection?.contains("close", ignoreCase = true) == true -> false
+                connection?.contains("keep-alive", ignoreCase = true) == true -> true
+                else -> !statusLine.startsWith("HTTP/1.0")
+            }
+        val encoding =
+            responseHeaders.entries
+                .firstOrNull { it.key.equals("Content-Encoding", true) }
+                ?.value
+                ?.lowercase()
+        val decoded =
+            when {
+                encoding == null || encoding == "identity" || encoding.isEmpty() -> bodyBytes
+                encoding.contains("deflate") || encoding.contains("zlib") ->
+                    inflateZlibOrNull(bodyBytes) ?: error("bad zlib body")
+                else -> error("unsupported Content-Encoding: $encoding")
+            }
+        return StreamResponse(status, statusText, responseHeaders, decoded, keep)
+    }
+
+    private suspend fun readBody(
+        statusLine: String,
+        responseHeaders: Map<String, String>,
+        contentLengths: List<String>,
+        progress: FetchProgressReporter?,
+    ): ByteArray {
+        val transfer = responseHeaders.entries.firstOrNull { it.key.equals("Transfer-Encoding", true) }?.value
+        val lengthHeader = contentLengths.firstOrNull()
+        val connection = responseHeaders.entries.firstOrNull { it.key.equals("Connection", true) }?.value
+        val untilClose = statusLine.startsWith("HTTP/1.0") || connection?.contains("close", ignoreCase = true) == true
+        val chunked = transfer != null && transfer.lowercase().contains("chunked")
+        return if (chunked) {
+            readChunkedBody()
+        } else if (lengthHeader == null && untilClose) {
+            readUntilEof { have -> progress?.downloadBytes(FetchStage.DOWNLOADING_RESPONSE, have, null) }
+        } else {
+            require(lengthHeader != null) { "HTTP response missing Content-Length and chunked encoding" }
+            val length = lengthHeader.toLongOrNull()
+            require(length != null && length >= 0) { "Invalid Content-Length: $lengthHeader" }
+            require(length <= MAX_HTTP1_BODY) { "HTTP body too large: $length" }
+            readExact(length.toInt()) { have ->
+                progress?.downloadBytes(FetchStage.DOWNLOADING_RESPONSE, have, length.toInt())
+            }
+        }
+    }
+
+    private var buf = ByteArray(0)
+    private var len = 0
+    private var receivedAny = false
+
+    private fun append(value: ByteArray) {
+        receivedAny = true
+        val need = len + value.size
+        require(need <= MAX_HTTP1_BODY) { "HTTP body too large" }
+        if (buf.size < need) {
+            var cap = if (buf.isEmpty()) 256 else buf.size
+            while (cap < need) cap *= 2
+            buf = buf.copyOf(cap)
+        }
+        value.copyInto(buf, len)
+        len += value.size
+    }
+
+    private fun consume(n: Int): ByteArray {
+        val out = buf.copyOfRange(0, n)
+        buf.copyInto(buf, 0, n, len)
+        len -= n
+        return out
+    }
+
+    private suspend fun pull(eofOk: Boolean): Boolean {
         abort?.throwIfAborted()
         val value =
             coroutineScope {
@@ -348,19 +437,26 @@ private class HttpByteReader(
                 }
             }
         abort?.throwIfAborted()
-        require(value.isNotEmpty()) { "Unexpected end of HTTP stream (buffered=${buf.size})" }
-        buf = concatBytes(buf, value)
+        if (value.isEmpty()) {
+            if (eofOk) return false
+            throw HttpStreamException(
+                "Unexpected end of HTTP stream (buffered=$len)",
+                reusable = !receivedAny,
+            )
+        }
+        append(value)
+        return true
     }
 
-    suspend fun readUntil(needle: ByteArray): ByteArray {
+    suspend fun readUntil(
+        needle: ByteArray,
+        max: Int = 256 * 1024,
+    ): ByteArray {
         while (true) {
-            val i = indexOf(buf, needle)
-            if (i != -1) {
-                val before = buf.copyOfRange(0, i)
-                buf = buf.copyOfRange(i + needle.size, buf.size)
-                return before
-            }
-            pull()
+            val i = indexOf(buf, needle, 0, len)
+            if (i != -1) return consume(i).also { consume(needle.size) }
+            if (len > max) throw HttpStreamException("HTTP headers too large", reusable = false)
+            pull(eofOk = false)
         }
     }
 
@@ -368,27 +464,43 @@ private class HttpByteReader(
         n: Int,
         onHave: ((Int) -> Unit)? = null,
     ): ByteArray {
-        onHave?.invoke(buf.size.coerceAtMost(n))
-        while (buf.size < n) {
-            pull()
-            onHave?.invoke(buf.size.coerceAtMost(n))
+        onHave?.invoke(len.coerceAtMost(n))
+        while (len < n) {
+            pull(eofOk = false)
+            onHave?.invoke(len.coerceAtMost(n))
         }
-        val out = buf.copyOfRange(0, n)
-        buf = buf.copyOfRange(n, buf.size)
-        return out
+        return consume(n)
+    }
+
+    suspend fun readUntilEof(onHave: ((Int) -> Unit)? = null): ByteArray {
+        while (pull(eofOk = true)) {
+            onHave?.invoke(len)
+        }
+        return consume(len)
     }
 
     suspend fun readChunkedBody(): ByteArray {
         val parts = ArrayList<ByteArray>()
+        var total = 0
         while (true) {
             val sizeLine = readUntil(CRLF).decodeToString()
-            val size = sizeLine.trim().toIntOrNull(16) ?: throw IllegalArgumentException("Invalid chunk size")
+            val sizeToken = sizeLine.substringBefore(';').trim()
+            val size = sizeToken.toIntOrNull(16) ?: throw IllegalArgumentException("Invalid chunk size")
+            require(size >= 0) { "Invalid chunk size" }
             if (size == 0) {
-                readExact(2)
+                while (readUntil(CRLF).isNotEmpty()) {
+                    // trailers
+                }
                 break
             }
-            parts += readExact(size)
-            readExact(2)
+            require(total.toLong() + size <= MAX_HTTP1_BODY) { "HTTP body too large" }
+            val chunk = readExact(size)
+            val crlf = readExact(2)
+            require(crlf.size == 2 && crlf[0] == 0x0d.toByte() && crlf[1] == 0x0a.toByte()) {
+                "chunk missing CRLF"
+            }
+            parts += chunk
+            total += size
         }
         return concatBytes(*parts.toTypedArray())
     }
@@ -398,8 +510,9 @@ private fun indexOf(
     haystack: ByteArray,
     needle: ByteArray,
     from: Int = 0,
+    end: Int = haystack.size,
 ): Int {
-    outer@ for (i in from..haystack.size - needle.size) {
+    outer@ for (i in from..end - needle.size) {
         for (j in needle.indices) {
             if (haystack[i + j] != needle[j]) continue@outer
         }

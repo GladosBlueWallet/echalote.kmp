@@ -314,6 +314,27 @@ internal object Ed25519 {
         }
     }
 
+    /** Low 255 bits of [p] must be strictly less than 2^255-19. */
+    private fun yBelowP(p: ByteArray): Boolean {
+        val top = p.u8(31) and 0x7f
+        return when {
+            top < 0x7f -> true
+            top > 0x7f -> false
+            (30 downTo 1).any { p.u8(it) != 0xff } -> true
+            else -> p.u8(0) < 0xed
+        }
+    }
+
+    /** Little-endian scalar must be strictly less than L. */
+    private fun scalarBelowL(s: ByteArray): Boolean {
+        for (i in 31 downTo 0) {
+            val a = s.u8(i)
+            val b = L[i].toInt()
+            if (a != b) return a < b
+        }
+        return false
+    }
+
     private fun reduce(r: ByteArray) {
         val x = LongArray(64) { r.u8(it).toLong() }
         for (i in r.indices) r[i] = 0
@@ -331,31 +352,36 @@ internal object Ed25519 {
         val den2 = Gf()
         val den4 = Gf()
         val den6 = Gf()
-        set25519(r.z, gf1)
-        unpack25519(r.y, p)
-        gfSqr(num, r.y)
-        gfMul(den, num, D)
-        gfSub(num, num, r.z)
-        gfAdd(den, r.z, den)
-        gfSqr(den2, den)
-        gfSqr(den4, den2)
-        gfMul(den6, den4, den2)
-        gfMul(t, den6, num)
-        gfMul(t, t, den)
-        pow2523(t, t)
-        gfMul(t, t, num)
-        gfMul(t, t, den)
-        gfMul(t, t, den)
-        gfMul(r.x, t, den)
-        gfSqr(chk, r.x)
-        gfMul(chk, chk, den)
-        if (neq25519(chk, num)) gfMul(r.x, r.x, I)
-        gfSqr(chk, r.x)
-        gfMul(chk, chk, den)
-        if (neq25519(chk, num)) return false
-        if (par25519(r.x) == ((p[31].toInt() and 0xff) ushr 7)) gfSub(r.x, gf0, r.x)
-        gfMul(r.t, r.x, r.y)
-        return true
+        var ok = yBelowP(p)
+        if (ok) {
+            set25519(r.z, gf1)
+            unpack25519(r.y, p)
+            gfSqr(num, r.y)
+            gfMul(den, num, D)
+            gfSub(num, num, r.z)
+            gfAdd(den, r.z, den)
+            gfSqr(den2, den)
+            gfSqr(den4, den2)
+            gfMul(den6, den4, den2)
+            gfMul(t, den6, num)
+            gfMul(t, t, den)
+            pow2523(t, t)
+            gfMul(t, t, num)
+            gfMul(t, t, den)
+            gfMul(t, t, den)
+            gfMul(r.x, t, den)
+            gfSqr(chk, r.x)
+            gfMul(chk, chk, den)
+            if (neq25519(chk, num)) gfMul(r.x, r.x, I)
+            gfSqr(chk, r.x)
+            gfMul(chk, chk, den)
+            ok = !neq25519(chk, num)
+            if (ok) {
+                if (par25519(r.x) == ((p[31].toInt() and 0xff) ushr 7)) gfSub(r.x, gf0, r.x)
+                gfMul(r.t, r.x, r.y)
+            }
+        }
+        return ok
     }
 
     private fun cryptoSignOpen(
@@ -372,8 +398,10 @@ internal object Ed25519 {
         val h = Sha512.hash(m.copyOf(n))
         reduce(h)
         val p = Pt()
+        val scalar = sm.copyOfRange(32, 64)
+        if (!scalarBelowL(scalar)) return false
         scalarmult(p, q, h)
-        scalarbase(q, sm.copyOfRange(32, 64))
+        scalarbase(q, scalar)
         add(p, q)
         val t = ByteArray(32)
         pack(t, p)
