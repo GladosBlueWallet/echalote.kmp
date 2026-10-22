@@ -86,7 +86,7 @@ internal suspend fun verifyWebPkiChain(
         is CancellationException, is TlsCertificateError -> throw failure
         else -> rejectCertificate("TLS certificate for $name rejected: ${failure.message ?: failure::class.simpleName}", failure)
     }
-    if (!certificateMatchesHost(chainDer[0], host ?: name)) rejectCertificate("TLS certificate does not match host $name")
+    if (!certificateMatchesHost(chainDer[0], host)) rejectCertificate("TLS certificate does not match host $name")
 }
 
 internal fun rejectCertificate(
