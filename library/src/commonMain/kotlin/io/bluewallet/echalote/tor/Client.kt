@@ -104,7 +104,8 @@ open class TorClientDuplex {
 }
 
 internal class SecretTorClientDuplex {
-    val tls = TlsClientDuplex()
+    // The OR link certificate is self-signed; it is authenticated by the CERTS cell instead.
+    val tls = TlsClientDuplex(trust = TlsTrust.TorLink)
     val inner: ByteDuplex get() = tls.inner
     val circuits = LinkedHashMap<Int, SecretCircuit>()
     val gate = SpinLock()
