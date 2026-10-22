@@ -3,6 +3,7 @@ package io.bluewallet.echalote
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
@@ -405,8 +406,20 @@ suspend fun <T, R> fetchFirstOk(
     var inFlight = 0
     val workers = CoroutineScope(currentCoroutineContext().minusKey(Job) + SupervisorJob())
 
-    fun stopWorkers(reason: Throwable) {
-        for (c in runCatching { locals.toList() }.getOrDefault(emptyList())) {
+    var stopped = false
+
+    // Copies the losers under the same lock launchOne adds them with, and marks the race
+    // stopped so no worker can be added after the copy. Abort is what a loser stuck in
+    // non-suspending work (signature checks) observes; coroutine cancellation alone is not.
+    suspend fun stopWorkers(reason: Throwable) {
+        val losers =
+            withContext(NonCancellable) {
+                lock.withLock {
+                    stopped = true
+                    locals.toList()
+                }
+            }
+        for (c in losers) {
             try {
                 c.abort(reason)
             } catch (_: Throwable) {
@@ -423,7 +436,7 @@ suspend fun <T, R> fetchFirstOk(
         val item: T
         val local: Abort
         lock.withLock {
-            if (done.isCompleted || cursor >= items.size) return
+            if (stopped || done.isCompleted || cursor >= items.size) return
             item = items[cursor]
             cursor += 1
             inFlight += 1

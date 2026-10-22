@@ -28,6 +28,9 @@ internal class CancelHook {
         }
     }
 
+    /** True once [cancel] ran; blocking code that waits in slices polls this between them. */
+    val isCancelled: Boolean get() = locked { cancelled }
+
     fun register(onCancel: () -> Unit) =
         locked {
             action = onCancel

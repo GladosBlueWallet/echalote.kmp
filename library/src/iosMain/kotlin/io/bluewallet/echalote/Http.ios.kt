@@ -103,9 +103,9 @@ private fun CancelHook.http1OverTcp(
 ): HttpResponse {
     val parsed = parseHttpUrl(url)
     val timing = Http1Timing(url)
+    // posixConnect leaves the cancel hook registered on the connected fd (shutdown on cancel).
     val fd = posixConnect(parsed.host, parsed.port, timeoutMs)
     timing.connected()
-    register { shutdown(fd, SHUT_RDWR) }
     try {
         sendAll(fd, buildHttp1Request(method, parsed, headers, body))
         return parseHttp1Response(recvHttp1(fd, onDownload, timing)).also { timing.done(it) }
@@ -114,13 +114,20 @@ private fun CancelHook.http1OverTcp(
     }
 }
 
+/**
+ * Resolves and connects, trying each address in turn. Each socket gets the cancel hook
+ * (shutdown) as soon as it exists, and the connect wait polls in short slices that check
+ * [CancelHook.isCancelled], so a cancelled request frees this thread promptly. On success the
+ * hook stays registered on the returned fd; the caller releases it.
+ */
 @OptIn(ExperimentalForeignApi::class)
-private fun posixConnect(
+private fun CancelHook.posixConnect(
     host: String,
     port: Int,
     timeoutMs: Long,
 ): Int =
     memScoped {
+        throwIfCancelled()
         val hints = alloc<addrinfo>()
         memset(hints.ptr, 0, kotlinx.cinterop.sizeOf<addrinfo>().convert())
         hints.ai_family = AF_UNSPEC
@@ -133,28 +140,37 @@ private fun posixConnect(
         try {
             var ai: CPointer<addrinfo>? = head
             while (ai != null) {
+                throwIfCancelled()
                 val info = ai.pointed
                 val fd = socket(info.ai_family, info.ai_socktype, info.ai_protocol)
                 if (fd >= 0) {
-                    try {
-                        disableSigPipe(fd)
-                        if (connectWithTimeout(fd, info, timeoutMs)) {
-                            applySocketTimeouts(fd, timeoutMs)
-                            return@memScoped fd
+                    register { shutdown(fd, SHUT_RDWR) }
+                    val connected =
+                        try {
+                            disableSigPipe(fd)
+                            connectWithTimeout(fd, info, timeoutMs)
+                        } catch (e: Throwable) {
+                            release { close(fd) }
+                            throw e
                         }
-                    } catch (e: Throwable) {
-                        close(fd)
-                        throw e
+                    if (connected) {
+                        applySocketTimeouts(fd, timeoutMs)
+                        return@memScoped fd
                     }
-                    close(fd)
+                    release { close(fd) }
                 }
                 ai = info.ai_next
             }
+            throwIfCancelled()
             error("connect failed for $host:$port")
         } finally {
             freeaddrinfo(head)
         }
     }
+
+private fun CancelHook.throwIfCancelled() {
+    check(!isCancelled) { "http request cancelled" }
+}
 
 @OptIn(ExperimentalForeignApi::class)
 private fun disableSigPipe(fd: Int) =
@@ -167,7 +183,7 @@ private fun disableSigPipe(fd: Int) =
     }
 
 @OptIn(ExperimentalForeignApi::class)
-private fun connectWithTimeout(
+private fun CancelHook.connectWithTimeout(
     fd: Int,
     info: addrinfo,
     timeoutMs: Long,
@@ -175,6 +191,7 @@ private fun connectWithTimeout(
     setNonBlocking(fd, true)
     val rc = connect(fd, info.ai_addr, info.ai_addrlen)
     val connected = rc == 0 || (posixErrno() == EINPROGRESS && pollConnected(fd, timeoutMs) && socketError(fd) == 0)
+    throwIfCancelled()
     setNonBlocking(fd, false)
     return connected
 }
@@ -190,29 +207,43 @@ private fun setNonBlocking(
     check(fcntl(fd, F_SETFL, next) != -1) { "fcntl F_SETFL failed" }
 }
 
+/** Longest single poll while waiting for connect, so cancellation is noticed quickly. */
+private const val CONNECT_POLL_SLICE_MS = 100L
+
+/**
+ * Waits up to [timeoutMs] in total for the non-blocking connect on [fd], polling in
+ * [CONNECT_POLL_SLICE_MS] slices and giving up as soon as the hook is cancelled.
+ */
 @OptIn(ExperimentalForeignApi::class)
-private fun pollConnected(
+private fun CancelHook.pollConnected(
     fd: Int,
     timeoutMs: Long,
 ): Boolean {
+    val started =
+        kotlin.time.TimeSource.Monotonic
+            .markNow()
+    val total = timeoutMs.coerceAtLeast(1L)
+    var connected = false
+    var waiting = true
     memScoped {
         val pfd = alloc<pollfd>()
         pfd.fd = fd
         pfd.events = POLLOUT.toShort()
-        pfd.revents = 0
-        while (true) {
-            val n = poll(pfd.ptr, 1.convert(), timeoutMs.coerceAtLeast(1L).toInt())
-            if (n == 0) return false
-            if (n < 0) {
-                if (posixErrno() == EINTR) continue
-                return false
+        while (waiting && !isCancelled) {
+            val remaining = total - started.elapsedNow().inWholeMilliseconds
+            pfd.revents = 0
+            val n = if (remaining > 0L) poll(pfd.ptr, 1.convert(), minOf(remaining, CONNECT_POLL_SLICE_MS).toInt()) else -1
+            // n == 0 (slice elapsed) or EINTR: keep waiting; any other error or timeout: give up.
+            if (n > 0) {
+                val revents = pfd.revents.toInt()
+                connected = revents and (POLLERR or POLLHUP or POLLNVAL) == 0 && revents and POLLOUT != 0
+                waiting = false
+            } else if (n < 0 && (remaining <= 0L || posixErrno() != EINTR)) {
+                waiting = false
             }
-            val revents = pfd.revents.toInt()
-            if (revents and (POLLERR or POLLHUP or POLLNVAL) != 0) return false
-            return revents and POLLOUT != 0
         }
     }
-    error("unreachable")
+    return connected
 }
 
 @OptIn(ExperimentalForeignApi::class)
