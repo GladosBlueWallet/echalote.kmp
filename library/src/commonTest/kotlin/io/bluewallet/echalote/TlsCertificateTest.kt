@@ -55,6 +55,55 @@ class TlsCertificateTest {
         assertFalse(ipSans.matches("localhost"))
     }
 
+    @Test
+    fun ipv6Host_matchesSixteenByteIpAddressSans() {
+        val addr =
+            ByteArray(16).also {
+                it[0] = 0x20
+                it[1] = 0x01
+                it[2] = 0x0d
+                it[3] = 0xb8.toByte()
+                it[15] = 1
+            }
+        val sans = SubjectAltNames(dnsNames = listOf("2001:db8::1"), ipAddresses = listOf(addr))
+        assertTrue(sans.matches("2001:db8::1"))
+        assertTrue(sans.matches("[2001:db8::1]"))
+        assertTrue(sans.matches("2001:DB8:0:0:0:0:0:1"))
+        assertTrue(sans.matches("2001:db8:0::0:1"))
+        assertFalse(sans.matches("2001:db8::2"))
+        assertFalse(SubjectAltNames(listOf("2001:db8::1"), emptyList()).matches("2001:db8::1"), "never via dNSName")
+        val mapped =
+            ByteArray(16).also {
+                it[10] = -1
+                it[11] = -1
+                it[12] = 127
+                it[15] = 1
+            }
+        assertTrue(SubjectAltNames(emptyList(), listOf(mapped)).matches("::ffff:127.0.0.1"))
+        val loopback = ByteArray(16).also { it[15] = 1 }
+        assertTrue(SubjectAltNames(emptyList(), listOf(loopback)).matches("::1"))
+    }
+
+    @Test
+    fun parseIpLiteral_rejectsMalformedIpv6() {
+        for (bad in listOf("1::2::3", "1:2:3:4:5:6:7:8:9", "1:2:3:4:5:6:7", "12345::", "g::1", ":1", "1:", "fe80::1%eth0", "[::1", "::1.2.3")) {
+            assertNull(parseIpLiteral(bad), bad)
+        }
+        assertEquals(16, parseIpLiteral("1:2:3:4:5:6:7:8")?.size)
+        assertEquals(16, parseIpLiteral("::")?.size)
+    }
+
+    @Test
+    fun nonCanonicalNumericHosts_matchNothing() {
+        val ipSans = SubjectAltNames(dnsNames = listOf("10.0.0.1", "1.2.3"), ipAddresses = listOf(byteArrayOf(10, 0, 0, 1)))
+        assertTrue(ipSans.matches("10.0.0.1"))
+        assertFalse(ipSans.matches("010.0.0.1"), "leading zeros may be read as octal by a resolver")
+        assertFalse(ipSans.matches("10.00.0.1"))
+        assertFalse(ipSans.matches("1.2.3"), "short-form IPv4 is never a DNS name")
+        assertFalse(ipSans.matches("0x0a.0.0.1"))
+        assertFalse(SubjectAltNames(listOf("*.0.0.1"), emptyList()).matches("010.0.0.1"))
+    }
+
     // --- SAN extraction from real DER --------------------------------------------
 
     @Test
@@ -139,7 +188,7 @@ class TlsCertificateTest {
         val data = "signed".encodeToByteArray()
         assertContentEquals(Sha256.hash(data), serverKeyExchangeDigest(4, data).first)
         assertContentEquals(Sha384.hash(data), serverKeyExchangeDigest(5, data).first)
-        assertFails { serverKeyExchangeDigest(2, data) } // SHA-1 was never offered
+        assertFailsWith<IllegalArgumentException> { serverKeyExchangeDigest(2, data) } // SHA-1 was never offered
         assertFails { serverKeyExchangeDigest(6, data) }
     }
 
@@ -161,6 +210,58 @@ class TlsCertificateTest {
         b += compression.toByte()
         return b.toByteArray()
     }
+
+    // --- Scripted server: auth failures before ClientKeyExchange ------------------------
+
+    private fun record(
+        type: Int,
+        body: ByteArray,
+    ): ByteArray = concatBytes(byteArrayOf(type.toByte(), 3, 3, (body.size ushr 8).toByte(), body.size.toByte()), body)
+
+    private fun handshake(
+        type: Int,
+        body: ByteArray,
+    ): ByteArray = concatBytes(byteArrayOf(type.toByte()), u24(body.size), body)
+
+    /** Runs a client against [flight] and returns what it wrote after its ClientHello. */
+    private suspend fun rejectedFlight(flight: ByteArray): Pair<Throwable?, ByteArray> {
+        val (client, server) = pairedByteDuplexes()
+        val tls = TlsClientDuplex("echalote.test", recordTransport = client)
+        try {
+            server.read(16 * 1024) // ClientHello
+            server.write(record(22, flight))
+            val error = runCatching { tls.ready.await() }.exceptionOrNull()
+            return error to server.read(16)
+        } finally {
+            tls.close()
+        }
+    }
+
+    @Test
+    fun malformedCertificateMessage_isTlsCertificateError_withDecodeErrorAlert() =
+        runTest {
+            val flight = concatBytes(handshake(2, serverHello()), handshake(11, u24(0)))
+            val (error, sent) = rejectedFlight(flight)
+            assertTrue(error is TlsCertificateError, "got $error")
+            assertContentEquals(byteArrayOf(21, 3, 3, 0, 2, 2, 50), sent)
+        }
+
+    @Test
+    fun sha1ServerKeyExchange_isTlsCertificateError_withIllegalParameterAlert() =
+        runTest {
+            val point = ByteArray(65).also { it[0] = 4 }
+            val ske = concatBytes(byteArrayOf(3, 0, 0x17, 65), point, byteArrayOf(2, 1, 0, 2, 9, 9))
+            val flight =
+                concatBytes(
+                    handshake(2, serverHello()),
+                    handshake(11, certMessage(TlsTestCerts.VALID_LEAF)),
+                    handshake(12, ske),
+                    handshake(14, ByteArray(0)),
+                )
+            val (error, sent) = rejectedFlight(flight)
+            assertTrue(error is TlsCertificateError, "got $error")
+            assertContentEquals(byteArrayOf(21, 3, 3, 0, 2, 2, 47), sent)
+        }
 
     @Test
     fun serverHello_requiresTls12() {

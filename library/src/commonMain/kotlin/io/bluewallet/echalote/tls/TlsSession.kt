@@ -1,7 +1,13 @@
 package io.bluewallet.echalote
 
 internal const val TLS_SESSION_TICKET_EXT = 0x0023
-private const val DEFAULT_TICKET_TTL_MS = 2L * 60L * 60L * 1000L
+
+/**
+ * Longest a verified session may be resumed. Resumption skips certificate checks, so this
+ * also bounds how long a full-handshake verification is trusted; past it a full handshake
+ * (with chain verification) is forced.
+ */
+internal const val MAX_TLS_RESUME_TTL_MS = 2L * 60L * 60L * 1000L
 
 internal data class TlsResumption(
     val host: String,
@@ -105,12 +111,20 @@ internal fun resetTlsSessionCache() {
     tlsSessionLock.withLock { tlsSessions.clear() }
 }
 
+/**
+ * Expiry for a cached session: the server's ticket lifetime hint, capped at
+ * [MAX_TLS_RESUME_TTL_MS] (a zero hint means "unspecified" and gets the cap), and never past
+ * [ceilingMs]. Callers pass the leaf's notAfter for a full handshake and the cached expiry for a
+ * resumption, so a resumed session can never outlive the verification it came from.
+ */
 internal fun tlsResumeExpiryMs(
     lifetimeHintSec: Long,
     nowMs: Long = currentEpochMillis(),
+    ceilingMs: Long = Long.MAX_VALUE,
 ): Long {
-    val ttl = if (lifetimeHintSec > 0L) lifetimeHintSec * 1000L else DEFAULT_TICKET_TTL_MS
-    return nowMs + ttl
+    val hintMs = lifetimeHintSec.coerceIn(0L, MAX_TLS_RESUME_TTL_MS / 1000L) * 1000L
+    val ttl = if (hintMs > 0L) hintMs else MAX_TLS_RESUME_TTL_MS
+    return minOf(nowMs + ttl, ceilingMs)
 }
 
 internal fun storeTlsResumption(session: TlsResumption) {

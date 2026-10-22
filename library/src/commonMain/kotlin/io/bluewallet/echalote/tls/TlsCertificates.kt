@@ -39,12 +39,18 @@ internal class SubjectAltNames(
     val dnsNames: List<String>,
     val ipAddresses: List<ByteArray>,
 ) {
-    /** RFC 6125 / RFC 2818 matching. No subject CN fallback. */
+    /**
+     * RFC 6125 / RFC 2818 matching. No subject CN fallback. An IP literal (IPv4 dotted quad, or
+     * IPv6 with or without brackets) is compared byte-for-byte with the iPAddress SANs only.
+     * Anything numeric that is not a canonical IPv4 address (leading zeros, fewer than four parts,
+     * an all-digit last label) matches nothing, because resolvers disagree on what it means.
+     */
     fun matches(host: String): Boolean {
-        val ip = parseIpv4(host)
+        val ip = parseIpLiteral(host)
         return when {
             ip != null -> ipAddresses.any { it.contentEquals(ip) }
-            host.contains(':') -> false // IPv6 literals: not supported, fail closed
+            host.contains(':') || host.startsWith('[') -> false
+            looksNumeric(host) -> false
             else -> dnsNames.any { hostMatchesDnsName(host, it) }
         }
     }
@@ -101,7 +107,7 @@ private fun wildcardMatches(
     val validPattern =
         pattern.startsWith("*.") && !suffix.contains('*') && suffix.contains('.') && isDnsName(suffix)
     val dot = host.indexOf('.')
-    return validPattern && parseIpv4(host) == null && dot > 0 && host.substring(dot + 1) == suffix
+    return validPattern && !looksNumeric(host) && dot > 0 && host.substring(dot + 1) == suffix
 }
 
 private fun isDnsName(s: String): Boolean =
@@ -109,15 +115,6 @@ private fun isDnsName(s: String): Boolean =
         s.split('.').all { label ->
             label.isNotEmpty() && label.length <= 63 && label.all { it in 'a'..'z' || it in '0'..'9' || it == '-' || it == '_' }
         }
-
-private fun parseIpv4(host: String): ByteArray? {
-    val parts = host.split('.')
-    val octets =
-        parts.mapNotNull { part ->
-            part.takeIf { it.length in 1..3 && it.all { c -> c in '0'..'9' } }?.toInt()?.takeIf { it <= 255 }
-        }
-    return if (parts.size == 4 && octets.size == 4) ByteArray(4) { i -> octets[i].toByte() } else null
-}
 
 /** Digest and DigestInfo prefix for the ServerKeyExchange signature; only offered hashes. */
 internal fun serverKeyExchangeDigest(

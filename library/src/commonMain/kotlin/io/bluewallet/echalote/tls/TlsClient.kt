@@ -27,6 +27,9 @@ private const val HS_CLIENT_KEY_EXCHANGE = 16
 private const val HS_FINISHED = 20
 private const val ALERT_FATAL = 2
 private const val ALERT_BAD_CERTIFICATE = 42
+private const val ALERT_ILLEGAL_PARAMETER = 47
+private const val ALERT_DECODE_ERROR = 50
+private const val ALERT_DECRYPT_ERROR = 51
 private const val MAX_HANDSHAKE_MESSAGE = 128 * 1024
 
 internal open class TlsAlertError(
@@ -124,6 +127,14 @@ private class TlsEngine(
         hdr.putU16be(1, TLS_VERSION)
         hdr.putU16be(3, body.size)
         transport.write(concatBytes(hdr, body))
+    }
+
+    /** Best effort: the handshake is being abandoned either way. */
+    suspend fun sendFatalAlert(description: Int) {
+        try {
+            writeRecord(REC_ALERT, byteArrayOf(ALERT_FATAL.toByte(), description.toByte()))
+        } catch (_: Throwable) {
+        }
     }
 
     suspend fun readRecord(): Pair<Int, ByteArray> {
@@ -240,6 +251,7 @@ private class FullServerAuth {
     var signature: ByteArray = ByteArray(0)
     var ticket: ByteArray = ByteArray(0)
     var lifetime: Long = 0L
+    var leafNotAfterMs: Long = 0L
 }
 
 private class TlsHandshake(
@@ -265,7 +277,7 @@ private class TlsHandshake(
         sessionId: ByteArray,
         ticket: ByteArray,
         ems: Boolean,
-        lifetime: Long,
+        expiresAtMs: Long,
     ) {
         val host = hostName ?: return
         // Only WebPKI-verified sessions are cached; a TorLink session must never be resumed.
@@ -278,7 +290,7 @@ private class TlsHandshake(
                 sessionId = sessionId,
                 ticket = ticket,
                 ems = ems,
-                expiresAtMs = tlsResumeExpiryMs(lifetime),
+                expiresAtMs = expiresAtMs,
             ),
         )
         println("echalote.tls $host ticket=${ticket.size} sid=${sessionId.size}")
@@ -329,7 +341,8 @@ private class TlsHandshake(
         val clientFinished = tlsPrfSha384(cached.master, "client finished", Sha384.hash(hs.transcript), 12)
         tls.writeRecord(REC_HS, handshakeMessage(HS_FINISHED, clientFinished))
         val sid = if (hello.sessionId.isNotEmpty()) hello.sessionId else cached.sessionId
-        keepSession(cached.master, sid, ticket, cached.ems, lifetime)
+        // Resumption re-verifies nothing, so it must not extend the original session's life.
+        keepSession(cached.master, sid, ticket, cached.ems, tlsResumeExpiryMs(lifetime, ceilingMs = cached.expiresAtMs))
         return TlsSession(ByteArray(0), tls)
     }
 
@@ -339,27 +352,31 @@ private class TlsHandshake(
     ): TlsSession {
         val auth = readFullServerAuth(first)
         verifyServerKeyExchange(auth, hello)
-        if (trust == TlsTrust.WebPki) verifyCertificates(auth)
+        if (trust == TlsTrust.WebPki) {
+            val started = TimeSource.Monotonic.markNow()
+            try {
+                verifyWebPkiChain(auth.chain, hostName)
+            } catch (e: TlsCertificateError) {
+                rejectServerAuth(ALERT_BAD_CERTIFICATE, e)
+            }
+            val ms = started.elapsedNow().inWholeMilliseconds
+            println("echalote.tls $hostName certificate verified chain=${auth.chain.size} ms=$ms")
+        }
         val master = sendClientKeyExchange(auth, hello)
         readServerFinished(auth, master)
-        keepSession(master, hello.sessionId, auth.ticket, hello.ems, auth.lifetime)
+        val expiresAtMs = tlsResumeExpiryMs(auth.lifetime, ceilingMs = auth.leafNotAfterMs)
+        keepSession(master, hello.sessionId, auth.ticket, hello.ems, expiresAtMs)
         return TlsSession(auth.leaf, tls)
     }
 
-    private suspend fun verifyCertificates(auth: FullServerAuth) {
-        val started = TimeSource.Monotonic.markNow()
-        try {
-            verifyWebPkiChain(auth.chain, hostName)
-            val ms = started.elapsedNow().inWholeMilliseconds
-            println("echalote.tls $hostName certificate verified chain=${auth.chain.size} ms=$ms")
-        } catch (e: TlsCertificateError) {
-            try {
-                tls.writeRecord(REC_ALERT, byteArrayOf(ALERT_FATAL.toByte(), ALERT_BAD_CERTIFICATE.toByte()))
-            } catch (_: Throwable) {
-            }
-            println("echalote.tls $hostName certificate rejected: ${e.message}")
-            throw e
-        }
+    /** Server authentication failed before any key was sent: alert the peer, then throw. */
+    private suspend fun rejectServerAuth(
+        alert: Int,
+        error: TlsCertificateError,
+    ): Nothing {
+        tls.sendFatalAlert(alert)
+        println("echalote.tls $hostName certificate rejected: ${error.message}")
+        throw error
     }
 
     private suspend fun readFullServerAuth(first: TlsNext): FullServerAuth {
@@ -374,7 +391,12 @@ private class TlsHandshake(
             when (type) {
                 HS_CERTIFICATE -> {
                     require(auth.chain.isEmpty()) { "duplicate Certificate" }
-                    auth.chain = parseCertificateChain(body)
+                    auth.chain =
+                        try {
+                            parseCertificateChain(body)
+                        } catch (e: IllegalArgumentException) {
+                            rejectServerAuth(ALERT_DECODE_ERROR, TlsCertificateError("TLS: malformed Certificate message: ${e.message}", e))
+                        }
                 }
                 HS_SERVER_KEY_EXCHANGE -> {
                     require(auth.peerPoint.isEmpty()) { "duplicate ServerKeyExchange" }
@@ -422,16 +444,27 @@ private class TlsHandshake(
         auth.signature = body.copyOfRange(o, o + slen)
     }
 
-    private fun verifyServerKeyExchange(
+    private suspend fun verifyServerKeyExchange(
         auth: FullServerAuth,
         hello: ParsedServerHello,
     ) {
-        val x509 = X509Certificate.parse(auth.leaf)
+        val x509 =
+            runCatching { X509Certificate.parse(auth.leaf) }.getOrElse { e ->
+                rejectServerAuth(ALERT_BAD_CERTIFICATE, TlsCertificateError("TLS: unparseable server certificate: ${e.message}", e))
+            }
+        auth.leafNotAfterMs = x509.notAfterMillis
         val signed = concatBytes(clientRandom, hello.serverRandom, auth.ecdheParams)
-        val (hash, prefix) = serverKeyExchangeDigest(auth.sigHash, signed)
-        require(x509.rsaPublicKey().verifyPkcs1v15Digest(prefix, hash, auth.signature)) {
-            "TLS ServerKeyExchange signature failed"
-        }
+        val (hash, prefix) =
+            try {
+                serverKeyExchangeDigest(auth.sigHash, signed)
+            } catch (e: IllegalArgumentException) {
+                rejectServerAuth(ALERT_ILLEGAL_PARAMETER, TlsCertificateError("TLS: ${e.message}", e))
+            }
+        val ok =
+            runCatching { x509.rsaPublicKey().verifyPkcs1v15Digest(prefix, hash, auth.signature) }.getOrElse { e ->
+                rejectServerAuth(ALERT_BAD_CERTIFICATE, TlsCertificateError("TLS: unusable server public key: ${e.message}", e))
+            }
+        if (!ok) rejectServerAuth(ALERT_DECRYPT_ERROR, TlsCertificateError("TLS ServerKeyExchange signature failed"))
     }
 
     private suspend fun sendClientKeyExchange(

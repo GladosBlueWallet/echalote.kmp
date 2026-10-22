@@ -122,14 +122,22 @@ class TlsCertificateVerificationJvmTest {
     @Test
     fun verifiedSession_resumesOnSecondConnection() {
         TestTlsServer("valid.p12").use { server ->
+            val before = currentEpochMillis()
             connect(server, "echalote.test").close()
-            assertNotNull(lookupTlsSession("echalote.test"))
+            val first = assertNotNull(lookupTlsSession("echalote.test"))
+            assertTrue(first.expiresAtMs <= before + MAX_TLS_RESUME_TTL_MS + 60_000L, "resume TTL must be capped")
+            val leafNotAfter = X509Certificate.parse(tlsFixture("valid.der")).notAfterMillis
+            assertTrue(first.expiresAtMs <= leafNotAfter, "resume must not outlive the leaf")
             val tls = connect(server, "echalote.test")
             try {
                 val res = runBlocking { httpGetOver(tls, "echalote.test") }
                 assertTrue(res.startsWith("HTTP/1.1 200"), res)
             } finally {
                 tls.close()
+            }
+            val second = lookupTlsSession("echalote.test")
+            if (second != null) {
+                assertTrue(second.expiresAtMs <= first.expiresAtMs, "a resumption must not extend the session")
             }
         }
     }
