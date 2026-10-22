@@ -7,6 +7,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlin.time.TimeSource
 
 internal const val TLS_ECDHE_RSA_AES256_GCM_SHA384 = 0xC030
 internal const val TLS_HANDSHAKE_TIMEOUT_MS = 20_000L
@@ -24,6 +25,9 @@ private const val HS_CERTIFICATE_STATUS = 22
 private const val HS_SERVER_HELLO_DONE = 14
 private const val HS_CLIENT_KEY_EXCHANGE = 16
 private const val HS_FINISHED = 20
+private const val ALERT_FATAL = 2
+private const val ALERT_BAD_CERTIFICATE = 42
+private const val MAX_HANDSHAKE_MESSAGE = 128 * 1024
 
 internal open class TlsAlertError(
     message: String,
@@ -41,12 +45,15 @@ private fun throwTlsAlert(body: ByteArray): Nothing {
 }
 
 /**
- * Userspace TLS 1.2 client: ECDHE_RSA_WITH_AES_256_GCM_SHA384, no PKI trust.
- * Exposes the leaf certificate DER for Tor CERTS `sign_to_tls`.
+ * Userspace TLS 1.2 client: ECDHE_RSA_WITH_AES_256_GCM_SHA384.
+ * With [TlsTrust.WebPki] (default) the server chain is verified by the platform and the
+ * host name against the leaf's subjectAltName, both before ClientKeyExchange; [TlsTrust.TorLink] skips PKI and only exposes the
+ * leaf certificate DER for Tor CERTS `sign_to_tls`.
  */
 internal class TlsClientDuplex(
     private val hostName: String? = null,
     recordTransport: ByteDuplex? = null,
+    internal val trust: TlsTrust = TlsTrust.WebPki,
 ) {
     val inner: ByteDuplex
     val outer: ByteDuplex
@@ -190,8 +197,13 @@ private sealed class TlsNext {
 private suspend fun runTlsHandshake(
     transport: ByteDuplex,
     hostName: String?,
+    trust: TlsTrust,
 ): TlsSession {
-    val cached = hostName?.takeIf { it.isNotEmpty() }?.let { lookupTlsSession(it) }
+    // Only WebPKI-verified sessions are ever cached, so only WebPKI may resume one.
+    val cached =
+        hostName
+            ?.takeIf { it.isNotEmpty() && trust == TlsTrust.WebPki }
+            ?.let { lookupTlsSession(it) }
     val tls = TlsEngine(transport)
     val hs = HandshakeBuf(tls)
     val clientRandom = secureRandom(32)
@@ -205,7 +217,7 @@ private suspend fun runTlsHandshake(
     hs.transcript = concatBytes(hs.transcript, helloRaw)
     val hello = parseServerHello(helloBody)
     val next = hs.nextOrCcs()
-    val flow = TlsHandshake(tls, hs, hostName, clientRandom)
+    val flow = TlsHandshake(tls, hs, hostName, clientRandom, trust)
     val resume = cached
     val abbreviated =
         next is TlsNext.Ccs ||
@@ -220,7 +232,8 @@ private suspend fun runTlsHandshake(
 }
 
 private class FullServerAuth {
-    var leaf: ByteArray = ByteArray(0)
+    var chain: List<ByteArray> = emptyList()
+    val leaf: ByteArray get() = chain.firstOrNull() ?: ByteArray(0)
     var peerPoint: ByteArray = ByteArray(0)
     var ecdheParams: ByteArray = ByteArray(0)
     var sigHash: Int = 0
@@ -234,6 +247,7 @@ private class TlsHandshake(
     val hs: HandshakeBuf,
     val hostName: String?,
     val clientRandom: ByteArray,
+    val trust: TlsTrust,
 ) {
     fun installKeys(
         master: ByteArray,
@@ -254,7 +268,9 @@ private class TlsHandshake(
         lifetime: Long,
     ) {
         val host = hostName ?: return
-        if (host.isEmpty() || (ticket.isEmpty() && sessionId.isEmpty())) return
+        // Only WebPKI-verified sessions are cached; a TorLink session must never be resumed.
+        val resumable = ticket.isNotEmpty() || sessionId.isNotEmpty()
+        if (trust != TlsTrust.WebPki || host.isEmpty() || !resumable) return
         storeTlsResumption(
             TlsResumption(
                 host = host,
@@ -323,10 +339,27 @@ private class TlsHandshake(
     ): TlsSession {
         val auth = readFullServerAuth(first)
         verifyServerKeyExchange(auth, hello)
+        if (trust == TlsTrust.WebPki) verifyCertificates(auth)
         val master = sendClientKeyExchange(auth, hello)
         readServerFinished(auth, master)
         keepSession(master, hello.sessionId, auth.ticket, hello.ems, auth.lifetime)
         return TlsSession(auth.leaf, tls)
+    }
+
+    private suspend fun verifyCertificates(auth: FullServerAuth) {
+        val started = TimeSource.Monotonic.markNow()
+        try {
+            verifyWebPkiChain(auth.chain, hostName)
+            val ms = started.elapsedNow().inWholeMilliseconds
+            println("echalote.tls $hostName certificate verified chain=${auth.chain.size} ms=$ms")
+        } catch (e: TlsCertificateError) {
+            try {
+                tls.writeRecord(REC_ALERT, byteArrayOf(ALERT_FATAL.toByte(), ALERT_BAD_CERTIFICATE.toByte()))
+            } catch (_: Throwable) {
+            }
+            println("echalote.tls $hostName certificate rejected: ${e.message}")
+            throw e
+        }
     }
 
     private suspend fun readFullServerAuth(first: TlsNext): FullServerAuth {
@@ -339,8 +372,14 @@ private class TlsHandshake(
         while (true) {
             hs.transcript = concatBytes(hs.transcript, raw)
             when (type) {
-                HS_CERTIFICATE -> takeCertificate(auth, body)
-                HS_SERVER_KEY_EXCHANGE -> takeServerKeyExchange(auth, body)
+                HS_CERTIFICATE -> {
+                    require(auth.chain.isEmpty()) { "duplicate Certificate" }
+                    auth.chain = parseCertificateChain(body)
+                }
+                HS_SERVER_KEY_EXCHANGE -> {
+                    require(auth.peerPoint.isEmpty()) { "duplicate ServerKeyExchange" }
+                    takeServerKeyExchange(auth, body)
+                }
                 HS_SERVER_HELLO_DONE -> gotHelloDone = true
                 HS_NEW_SESSION_TICKET -> {
                     val parsed = parseNewSessionTicket(body)
@@ -360,24 +399,15 @@ private class TlsHandshake(
         return auth
     }
 
-    private fun takeCertificate(
-        auth: FullServerAuth,
-        body: ByteArray,
-    ) {
-        require(body.size >= 3) { "short Certificate" }
-        var o = 3
-        val certLen = (body.u8(o) shl 16) or body.u16be(o + 1)
-        o += 3
-        auth.leaf = body.copyOfRange(o, o + certLen)
-    }
-
     private fun takeServerKeyExchange(
         auth: FullServerAuth,
         body: ByteArray,
     ) {
+        require(body.size >= 4) { "short ServerKeyExchange" }
         require(body[0].toInt() == 3) { "expected named_curve" }
         require(body.u16be(1) == 0x0017) { "expected secp256r1" }
         val plen = body.u8(3)
+        require(plen > 0 && 4 + plen + 4 <= body.size) { "truncated ServerKeyExchange" }
         auth.peerPoint = body.copyOfRange(4, 4 + plen)
         auth.ecdheParams = body.copyOfRange(0, 4 + plen)
         var o = 4 + plen
@@ -388,6 +418,7 @@ private class TlsHandshake(
         require(sigId == 1) { "expected RSA signature" }
         val slen = body.u16be(o)
         o += 2
+        require(o + slen == body.size) { "ServerKeyExchange signature length mismatch" }
         auth.signature = body.copyOfRange(o, o + slen)
     }
 
@@ -397,13 +428,7 @@ private class TlsHandshake(
     ) {
         val x509 = X509Certificate.parse(auth.leaf)
         val signed = concatBytes(clientRandom, hello.serverRandom, auth.ecdheParams)
-        val (hash, prefix) =
-            when (auth.sigHash) {
-                4 -> Sha256.hash(signed) to RsaPublicKey.SHA256_DIGESTINFO
-                5 -> Sha384.hash(signed) to RsaPublicKey.SHA384_DIGESTINFO
-                2 -> Sha1.hash(signed) to RsaPublicKey.SHA1_DIGESTINFO
-                else -> error("unsupported TLS signature hash ${auth.sigHash}")
-            }
+        val (hash, prefix) = serverKeyExchangeDigest(auth.sigHash, signed)
         require(x509.rsaPublicKey().verifyPkcs1v15Digest(prefix, hash, auth.signature)) {
             "TLS ServerKeyExchange signature failed"
         }
@@ -475,7 +500,7 @@ private suspend fun TlsClientDuplex.handshakeAndPump(
     app: ByteDuplex,
     hostName: String?,
 ) {
-    val session = runTlsHandshake(transport, hostName)
+    val session = runTlsHandshake(transport, hostName, trust)
     leafCertDer.complete(session.leaf)
     val tls = session.tls
 
@@ -526,6 +551,7 @@ private class HandshakeBuf(
     suspend fun next(): Triple<Int, ByteArray, ByteArray> {
         while (buf.size < 4) pull()
         val len = (buf.u8(1) shl 16) or buf.u16be(2)
+        require(len <= MAX_HANDSHAKE_MESSAGE) { "TLS handshake message too large: $len" }
         while (buf.size < 4 + len) pull()
         val raw = buf.copyOfRange(0, 4 + len)
         buf = buf.copyOfRange(4 + len, buf.size)
@@ -553,6 +579,7 @@ private class HandshakeBuf(
     private fun hasCompleteHandshake(): Boolean {
         if (buf.size < 4) return false
         val len = (buf.u8(1) shl 16) or buf.u16be(2)
+        require(len <= MAX_HANDSHAKE_MESSAGE) { "TLS handshake message too large: $len" }
         return buf.size >= 4 + len
     }
 
@@ -643,13 +670,14 @@ private fun u16(v: Int): ByteArray {
     return b
 }
 
-/** TLS 1.2 over [transport]. [outer] is plaintext HTTP after handshake. */
-suspend fun wrapTls(
+/** Library-internal [wrapTls] that may select [TlsTrust.TorLink] (tests and the Tor OR link only). */
+internal suspend fun wrapTlsWithTrust(
     transport: ByteDuplex,
     hostName: String,
-    abort: Abort? = null,
+    abort: Abort?,
+    trust: TlsTrust,
 ): ByteDuplex {
-    val tls = TlsClientDuplex(hostName, transport)
+    val tls = TlsClientDuplex(hostName, transport, trust)
     try {
         withAbortTimeout(TLS_HANDSHAKE_TIMEOUT_MS, abort) { _ -> tls.ready.await() }
     } catch (err: Throwable) {

@@ -35,27 +35,32 @@ internal fun parseNewSessionTicket(body: ByteArray): ParsedSessionTicket {
 }
 
 internal fun parseServerHello(body: ByteArray): ParsedServerHello {
-    require(body.size >= 34) { "short ServerHello" }
+    require(body.size >= 35) { "short ServerHello" }
+    require(body.u16be(0) == 0x0303) { "unsupported TLS version ${body.u16be(0)}" }
     val serverRandom = body.copyOfRange(2, 34)
     var o = 34
     val sidLen = body.u8(o)
     o += 1
+    require(sidLen <= 32 && o + sidLen <= body.size) { "bad ServerHello session id" }
     val sessionId = body.copyOfRange(o, o + sidLen)
     o += sidLen
     require(o + 3 <= body.size) { "short ServerHello suite" }
     val suite = body.u16be(o)
     o += 2
     require(suite == TLS_ECDHE_RSA_AES256_GCM_SHA384) { "unexpected cipher $suite" }
+    require(body.u8(o) == 0) { "unexpected TLS compression" }
     o += 1
     var ems = false
     if (o + 2 <= body.size) {
         val extLen = body.u16be(o)
         o += 2
         val end = o + extLen
+        require(end <= body.size) { "truncated ServerHello extensions" }
         while (o + 4 <= end) {
             val et = body.u16be(o)
             val el = body.u16be(o + 2)
             o += 4
+            require(o + el <= end) { "truncated ServerHello extension" }
             if (et == 0x0017) ems = true
             o += el
         }
