@@ -213,6 +213,10 @@ class RsaPublicKey private constructor(
     private val e: BigNat,
     private val k: Int,
 ) {
+    /** How long the modular exponentiation of the last verify on this key took (for timing logs). */
+    internal var lastModPow: kotlin.time.Duration = kotlin.time.Duration.ZERO
+        private set
+
     fun verifyPkcs1v15Unprefixed(
         hashed: Memory,
         signature: Memory,
@@ -221,7 +225,11 @@ class RsaPublicKey private constructor(
             if (signature.bytes.size != k) return false
             val s = BigNat.fromBytes(signature.bytes)
             if (s.compare(n) >= 0) return false
+            val modPowStart =
+                kotlin.time.TimeSource.Monotonic
+                    .markNow()
             val m = s.modPow(e, n)
+            lastModPow = modPowStart.elapsedNow()
             val em = m.toFixedBytes(k)
             if (em.u8(0) != 0x00 || em.u8(1) != 0x01) return false
             var i = 2

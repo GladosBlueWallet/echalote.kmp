@@ -168,7 +168,9 @@ suspend fun httpsFetch(
             val first =
                 runCatching {
                     session.io.withLock {
-                        streamFetch(url, StreamFetchInit(session.plaintext, abort, headers, method, body))
+                        timed("tor", "http-request", { "host=${parsed.host}" }) {
+                            streamFetch(url, StreamFetchInit(session.plaintext, abort, headers, method, body))
+                        }
                     }
                 }
             keptAlive(key, first)?.let {
@@ -253,7 +255,7 @@ private suspend fun openDefaultHttpsSession(
 ): HttpsSession {
     val tcp = defaultExitDialer().dial(host, port, abort)
     val tls =
-        runCatching { wrapTls(tcp.outer, host, abort) }.getOrElse { err ->
+        runCatching { timed("tor", "tls-exit", { "host=$host" }) { wrapTls(tcp.outer, host, abort) } }.getOrElse { err ->
             try {
                 tcp.close()
             } catch (_: Throwable) {

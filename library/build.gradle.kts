@@ -9,6 +9,27 @@ plugins {
 group = "io.bluewallet"
 version = "0.0.1"
 
+// Absolute path of src/commonTest/resources, baked into a generated test source so that
+// every test target (JVM, Android host, Kotlin/Native) can read the offline fixtures.
+val testFixtureDir: String =
+    layout.projectDirectory
+        .dir("src/commonTest/resources")
+        .asFile.absolutePath
+        .replace('\\', '/')
+val generateTestFixtureDir by tasks.registering {
+    val out = layout.buildDirectory.dir("generated/testFixtureDir/kotlin")
+    val dir = testFixtureDir
+    inputs.property("dir", dir)
+    outputs.dir(out)
+    doLast {
+        val file = out.get().file("io/bluewallet/echalote/TestFixtureDir.kt").asFile
+        file.parentFile.mkdirs()
+        file.writeText(
+            "package io.bluewallet.echalote\n\ninternal const val TEST_FIXTURE_DIR = \"$dir\"\n",
+        )
+    }
+}
+
 kotlin {
     jvm()
     androidLibrary {
@@ -37,6 +58,10 @@ kotlin {
     linuxX64()
 
     sourceSets {
+        commonTest {
+            kotlin.srcDir(generateTestFixtureDir)
+        }
+
         commonMain.dependencies {
             implementation(libs.kotlinx.coroutines.core)
         }

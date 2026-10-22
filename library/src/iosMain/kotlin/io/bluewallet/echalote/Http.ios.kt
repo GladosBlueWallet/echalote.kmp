@@ -14,7 +14,6 @@ import kotlinx.cinterop.usePinned
 import kotlinx.cinterop.value
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withContext
 import platform.Foundation.NSData
 import platform.Foundation.NSHTTPURLResponse
 import platform.Foundation.NSMutableURLRequest
@@ -40,6 +39,7 @@ import platform.posix.POLLERR
 import platform.posix.POLLHUP
 import platform.posix.POLLNVAL
 import platform.posix.POLLOUT
+import platform.posix.SHUT_RDWR
 import platform.posix.SOCK_STREAM
 import platform.posix.SOL_SOCKET
 import platform.posix.SO_ERROR
@@ -60,6 +60,7 @@ import platform.posix.pollfd
 import platform.posix.recv
 import platform.posix.send
 import platform.posix.setsockopt
+import platform.posix.shutdown
 import platform.posix.socket
 import platform.posix.socklen_tVar
 import platform.posix.timeval
@@ -82,8 +83,8 @@ actual fun defaultHttpEngine(): HttpEngine {
     return HttpEngine { method, url, headers, body, timeoutMs, decompress ->
         val onDownload = http1ProgressSink()
         if (usesCleartextHttp1(url)) {
-            withContext(Dispatchers.Default) {
-                http1OverTcp(method, url, headers, body, timeoutMs, onDownload)
+            cancellableBlocking(Dispatchers.Default) { hook ->
+                hook.http1OverTcp(method, url, headers, body, timeoutMs, onDownload)
             }
         } else {
             httpsUrlSession(session, method, url, headers, body, timeoutMs, decompress)
@@ -92,7 +93,7 @@ actual fun defaultHttpEngine(): HttpEngine {
 }
 
 @OptIn(ExperimentalForeignApi::class)
-private fun http1OverTcp(
+private fun CancelHook.http1OverTcp(
     method: String,
     url: String,
     headers: Map<String, String>,
@@ -101,12 +102,15 @@ private fun http1OverTcp(
     onDownload: ((Int, Int?) -> Unit)?,
 ): HttpResponse {
     val parsed = parseHttpUrl(url)
+    val timing = Http1Timing(url)
     val fd = posixConnect(parsed.host, parsed.port, timeoutMs)
+    timing.connected()
+    register { shutdown(fd, SHUT_RDWR) }
     try {
         sendAll(fd, buildHttp1Request(method, parsed, headers, body))
-        return parseHttp1Response(recvHttp1(fd, onDownload))
+        return parseHttp1Response(recvHttp1(fd, onDownload, timing)).also { timing.done(it) }
     } finally {
-        close(fd)
+        release { close(fd) }
     }
 }
 
@@ -257,9 +261,10 @@ private fun sendAll(
 private fun recvHttp1(
     fd: Int,
     onDownload: ((Int, Int?) -> Unit)?,
+    timing: Http1Timing,
 ): ByteArray {
     val buf = ByteArray(16 * 1024)
-    return readHttp1Raw(onDownload = onDownload) { recvOnce(fd, buf) }
+    return readHttp1Raw(onDownload = onDownload) { recvOnce(fd, buf).also { timing.firstByte() } }
 }
 
 @OptIn(ExperimentalForeignApi::class)

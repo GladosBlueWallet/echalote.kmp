@@ -1,0 +1,40 @@
+dir-key-certificate-version 3
+fingerprint C8313F0A407F1D7EE95F93D2F9D7D1D7EDD78583
+dir-key-published 2026-01-01 00:00:00
+dir-key-expires 2027-01-01 00:00:00
+dir-identity-key
+-----BEGIN RSA PUBLIC KEY-----
+MIIBCgKCAQEAjr51CQKk5pfVk4HkQCaoIbpE5DrxTOrLwWr5fCWuLNsceUqV1crD
+Y4M1Tw91uI6dn3u1hjIogiEK6RiC10Ngjx89qJe5PpiMPz0IyL5/UHfvv+eLmIGN
+GIvgsiYYQcBSzHdqKvekMZb4igodLUV59/y9fvvbpKQ2bUqBeYzEtsbB8nG4bR9V
+ad0iaXQty4SZV2sZppunRvybar2iTH9V4zvF2ZOfC/5sbzliZDiBTPXqDZiLAGNk
+xX7uEKtArSsrZDb9+pXgMggffj/Vwl0IAdhsLjNf5n8e/LKCYmEIVmv8jh2cWQOn
+D16x1sVK+sxz0JSys9ES7Nz9jp0m5nnymQIDAQAB
+-----END RSA PUBLIC KEY-----
+dir-signing-key
+-----BEGIN RSA PUBLIC KEY-----
+MIIBCgKCAQEAlbw28lyKzIbv/K4SsFx2fRbI4n0N+4WXoch/jOthjD594tCkIUtF
+IVyysTI5C6BzV/Cd0US34SIbdtDDTJmAlKMXz/j4WDFJ8NaDk9yWiJ3U0Uuonf8K
+eNalVKgRZiamwB3NxTQiLi5efZ1C9/1zLvqnEgCSlfdPbb3EKqtp3ZpHW2METlVT
+vs69Q4+oFiJt23kKjPH4sHdqHY6CN/y2t7AJX6XYg7HLlSTZjUQpJqeUgbizz6Li
+TC2mUWnZGfZAv9DKz7ZZMnUWva+1n/DBjq2sqS/DiTCu3+n2IqzOylHAJmBc/Don
+nXitKd9yJiiv+pj5XJ/4JJxw0Ex3BuynrwIDAQAB
+-----END RSA PUBLIC KEY-----
+dir-key-crosscert
+-----BEGIN ID SIGNATURE-----
+ORCCylIP+qIPcyNuh7IsOwbZr04Jnu8F1xk7NoLozd+WkR+xSiGqtYoD1d/sdQ1L
+dKEswJBj0ye26DlAMPetrN1FNQna8qYnKwxpwnMBDMHfETEJj8tBKq2T1sdrDeOU
+StbqFoLhXCeBqkvZpAJHhRH3xogJjwO9fTuttcm9rlZNasZgKSwpZ5efRZsbKIKb
+j3ftmNKuJ3g8y3rwYIpB86oIQ+xrYYKZO+ay1bmNOq5+VT0giaUmNnyi8zHPLAs5
+v38KaFNAG5STlZLRlM4mhnY5LDjdaFM0FRGstbH7jidtCjY4gIpVH5uRbvqjstki
+74vnAjsv7LvDxRvWoBO7mw==
+-----END ID SIGNATURE-----
+dir-key-certification
+-----BEGIN SIGNATURE-----
+gvI9j9qNOV57lofyx53+jObtzeqYLc9Yaw7H4mDZU3pedJ+3QRU0pF1b7Y0fDv1F
+F6vSJMrQyOIBkfzhaB0j9ledLwBT5dZKoTHx/iD4VyFBtozcOYR2OQOLctIj+uAn
+P57uxVqYUb/Avh3sFOY+d1d7S+R9t2hw3afjQ1tWzSdDGMqdDcp2R9Hi2xe23kYq
+4SwT9RR/erNRTdJ2Yluerms3sC7Knew0O2/gkxAHy5H6lDJi2NVyGLCgQ6Znab6G
+3iIgUcrG6jNMEuIYcH1/IdAIfmNyZKy6IDoRjfRMMKnJKug8pGaxDzTojpmjFt+b
+X5XdJcHcFEkKSQBKouYmJg==
+-----END SIGNATURE-----

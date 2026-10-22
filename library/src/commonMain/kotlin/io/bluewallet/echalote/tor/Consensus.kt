@@ -71,7 +71,18 @@ data class Microdesc(
 
 object ConsensusParser {
     fun parseOrThrow(text: String): Consensus {
+        val timing = ParseTiming()
+        // Signatures cover everything up to the first "directory-signature " (C tor
+        // router_get_networkstatus_v3_signed_boundaries), so none may appear before the footer.
+        val firstSignature = text.indexOf("\ndirectory-signature")
+        if (firstSignature >= 0) {
+            require(text.indexOf("\ndirectory-footer\n") in 0 until firstSignature) {
+                "directory-signature before directory-footer"
+            }
+        }
+        timing.lap("guard")
         val lines = text.split("\n")
+        timing.lap("split")
         var type: String? = null
         var version = 0
         var status: String? = null
@@ -101,14 +112,20 @@ object ConsensusParser {
                     knownFlags += line.split(" ").drop(1)
                 }
                 line == "directory-footer" -> {
+                    timing.lap("routers")
                     i++
                     while (i < lines.size) {
                         val fl = lines[i]
                         if (fl.startsWith("directory-signature ")) {
                             if (preimage == null) {
+                                timing.lap("footer")
                                 preimage = lines.take(i).joinToString("\n") + "\ndirectory-signature "
+                                timing.lap("preimage")
                             }
                             val parts = fl.split(" ")
+                            // "directory-signature [algorithm] identity signing-key-digest"; sha1 if omitted.
+                            require(parts.size == 3 || parts.size == 4) { "bad directory-signature line" }
+                            val named = parts.size == 4
                             i++
                             val sig =
                                 readBlock(lines, i, "-----BEGIN SIGNATURE-----", "-----END SIGNATURE-----")
@@ -116,9 +133,9 @@ object ConsensusParser {
                             i = sig.second
                             signatures +=
                                 ConsensusSignature(
-                                    algorithm = parts.getOrNull(1) ?: "",
-                                    identity = parts.getOrNull(2) ?: "",
-                                    signingKeyDigest = parts.getOrNull(3) ?: "",
+                                    algorithm = if (named) parts[1] else "sha1",
+                                    identity = if (named) parts[2] else parts[1],
+                                    signingKeyDigest = if (named) parts[3] else parts[2],
                                     signature = sig.first,
                                 )
                         }
@@ -190,6 +207,8 @@ object ConsensusParser {
             }
             i++
         }
+        timing.lap("signatures")
+        timing.log("lines=${lines.size} relays=${microdescs.size} sigs=${signatures.size}")
         return Consensus(
             type = type,
             version = version,
@@ -282,5 +301,23 @@ internal fun Consensus.ensureFresh(now: Long = currentEpochMillis()) {
     val until = validUntilMillis
     check(after != null && until != null && now >= after && now <= until) {
         "consensus outside its validity window"
+    }
+}
+
+/** Splits [ConsensusParser.parseOrThrow] into laps; logs one line. */
+private class ParseTiming {
+    private val start = timeMark()
+    private var last = start.elapsedNow()
+    private val laps = ArrayList<Pair<String, kotlin.time.Duration>>()
+
+    fun lap(name: String) {
+        val now = start.elapsedNow()
+        laps += name to (now - last)
+        last = now
+    }
+
+    fun log(extra: String) {
+        val detail = laps.joinToString(" ") { "${it.first}=${it.second.msText()}" }
+        logTiming("consensus", "parse-breakdown", start.elapsedNow(), "$detail $extra")
     }
 }

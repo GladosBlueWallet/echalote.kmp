@@ -45,37 +45,26 @@ class ReviewFixTest {
     @Test
     fun expiredCachedConsensusIsRefetched() =
         runTest {
-            val fresh =
-                """
-                network-status-version 3 microdesc
-                vote-status consensus
-                consensus-method 35
-                valid-after 2000-01-01 00:00:00
-                fresh-until 2100-01-01 00:00:00
-                valid-until 2100-01-01 00:00:00
-                r c0der AjUfyI0L8G9s3lRSZWZB5hGdvX4 2038-01-01 00:00:00 95.216.20.80 8080 0
-                m mkHw/LD1moosjemRD+GqSqXzzK1kOvK3ZwTsCPGJIFs
-                s Fast Guard Running Stable V2Dir Valid
-                pr Link=1-5
-                w Bandwidth=1
-                directory-footer
-                """.trimIndent()
             var calls = 0
             val engine =
-                HttpEngine { _, _, _, _, _, _ ->
-                    calls += 1
-                    HttpResponse(200, fresh.encodeToByteArray())
+                HttpEngine { _, url, _, _, _, _ ->
+                    if (url.contains("/tor/keys/")) {
+                        HttpResponse(200, fixtureKeysText.encodeToByteArray())
+                    } else {
+                        calls += 1
+                        HttpResponse(200, fixtureConsensusText.encodeToByteArray())
+                    }
                 }
             try {
-                cachedConsensus = currentEpochMillis() to Consensus(validAfterMillis = 0L, validUntilMillis = 1L)
+                cachedConsensus = FIXTURE_NOW to Consensus(validAfterMillis = 0L, validUntilMillis = 1L)
                 val got =
-                    fetchMicrodescConsensus(
+                    fetchVerifiedMicrodescConsensus(
+                        source = ConsensusSource(listOf("http://127.0.0.1/consensus"), listOf("127.0.0.1:1"), engine, 1),
+                        trust = ConsensusTrust(DirectoryAuthorities.V3_IDENTITIES, AuthorityCertStore(), { FIXTURE_NOW }),
                         force = false,
-                        mirrors = listOf("http://127.0.0.1/consensus"),
-                        engine = engine,
                     )
                 assertEquals(1, calls)
-                assertTrue((got.validUntilMillis ?: 0L) > currentEpochMillis())
+                assertTrue((got.validUntilMillis ?: 0L) > FIXTURE_NOW)
             } finally {
                 resetCachedConsensus()
             }

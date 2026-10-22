@@ -8,6 +8,7 @@ import kotlinx.cinterop.memScoped
 import kotlinx.cinterop.ptr
 import kotlinx.cinterop.reinterpret
 import kotlinx.cinterop.usePinned
+import kotlinx.coroutines.Dispatchers
 import platform.posix.AF_INET
 import platform.posix.EAGAIN
 import platform.posix.EINTR
@@ -15,6 +16,7 @@ import platform.posix.ETIMEDOUT
 import platform.posix.EWOULDBLOCK
 import platform.posix.IPPROTO_TCP
 import platform.posix.MSG_NOSIGNAL
+import platform.posix.SHUT_RDWR
 import platform.posix.SOCK_STREAM
 import platform.posix.SOL_SOCKET
 import platform.posix.SO_RCVTIMEO
@@ -28,6 +30,7 @@ import platform.posix.memset
 import platform.posix.recv
 import platform.posix.send
 import platform.posix.setsockopt
+import platform.posix.shutdown
 import platform.posix.sockaddr_in
 import platform.posix.socket
 import platform.posix.timeval
@@ -43,29 +46,43 @@ actual fun defaultHttpEngine(): HttpEngine =
         if (!usesCleartextHttp1(url)) {
             throw UnsupportedOperationException("linuxX64 default HttpEngine is HTTP-only; inject an engine for HTTPS meek")
         }
-        val parsed = parseHttpUrl(url)
-        memScoped {
-            val fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
-            check(fd >= 0) { "socket failed" }
-            try {
-                val addr = alloc<sockaddr_in>()
-                memset(addr.ptr, 0, kotlinx.cinterop.sizeOf<sockaddr_in>().convert())
-                addr.sin_family = AF_INET.convert()
-                addr.sin_port = htons(parsed.port.toUShort())
-                addr.sin_addr.s_addr = ipv4ToNetworkOrder(parsed.host)
-                val rc = connect(fd, addr.ptr.reinterpret(), kotlinx.cinterop.sizeOf<sockaddr_in>().convert())
-                check(rc == 0) { "connect failed" }
-                applySocketTimeouts(fd, timeoutMs)
+        val request = buildHttp1Request(method, parseHttpUrl(url), headers, body)
+        cancellableBlocking(Dispatchers.Default) { hook -> hook.http1OverTcp(url, request, timeoutMs, onDownload) }
+    }
 
-                sendAll(fd, buildHttp1Request(method, parsed, headers, body))
+@OptIn(ExperimentalForeignApi::class)
+private fun CancelHook.http1OverTcp(
+    url: String,
+    request: ByteArray,
+    timeoutMs: Long,
+    onDownload: ((Int, Int?) -> Unit)?,
+): HttpResponse {
+    val parsed = parseHttpUrl(url)
+    val timing = Http1Timing(url)
+    return memScoped {
+        val fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+        check(fd >= 0) { "socket failed" }
+        register { shutdown(fd, SHUT_RDWR) }
+        try {
+            val addr = alloc<sockaddr_in>()
+            memset(addr.ptr, 0, kotlinx.cinterop.sizeOf<sockaddr_in>().convert())
+            addr.sin_family = AF_INET.convert()
+            addr.sin_port = htons(parsed.port.toUShort())
+            addr.sin_addr.s_addr = ipv4ToNetworkOrder(parsed.host)
+            val rc = connect(fd, addr.ptr.reinterpret(), kotlinx.cinterop.sizeOf<sockaddr_in>().convert())
+            check(rc == 0) { "connect failed" }
+            timing.connected()
+            applySocketTimeouts(fd, timeoutMs)
 
-                val raw = recvHttp1(fd, onDownload)
-                return@memScoped parseHttp1Response(raw)
-            } finally {
-                close(fd)
-            }
+            sendAll(fd, request)
+
+            val raw = recvHttp1(fd, onDownload, timing)
+            parseHttp1Response(raw).also { timing.done(it) }
+        } finally {
+            release { close(fd) }
         }
     }
+}
 
 private fun ipv4ToNetworkOrder(host: String): UInt {
     val parts = host.split('.')
@@ -114,9 +131,10 @@ private fun sendAll(
 private fun recvHttp1(
     fd: Int,
     onDownload: ((Int, Int?) -> Unit)?,
+    timing: Http1Timing,
 ): ByteArray {
     val buf = ByteArray(16 * 1024)
-    return readHttp1Raw(onDownload = onDownload) { recvOnce(fd, buf) }
+    return readHttp1Raw(onDownload = onDownload) { recvOnce(fd, buf).also { timing.firstByte() } }
 }
 
 @OptIn(ExperimentalForeignApi::class)
