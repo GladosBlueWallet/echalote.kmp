@@ -4,6 +4,7 @@ private val OID_SUBJECT_ALT_NAME = byteArrayOf(0x55, 0x1d, 0x11)
 private const val TAG_EXPLICIT_EXTENSIONS = 0xa3
 private const val TAG_SAN_DNS = 0x82
 private const val TAG_SAN_IP = 0x87
+private const val TAG_BOOLEAN = 0x01
 
 /**
  * Parses a TLS 1.2 Certificate handshake body (RFC 5246 §7.4.2) into DER certificates,
@@ -51,9 +52,20 @@ internal class SubjectAltNames(
             ip != null -> ipAddresses.any { it.contentEquals(ip) }
             host.contains(':') || host.startsWith('[') -> false
             looksNumeric(host) -> false
-            else -> dnsNames.any { hostMatchesDnsName(host, it) }
+            else -> dnsNames.any { dnsNameMatches(host, it) }
         }
     }
+}
+
+/**
+ * extnValue of a subjectAltName Extension ::= SEQUENCE { extnID, critical BOOLEAN DEFAULT FALSE,
+ * extnValue OCTET STRING }, or null for any other extension. Any other shape is rejected.
+ */
+private fun extensionValue(parts: List<Der>): ByteArray? {
+    require(parts.size in 2..3) { "malformed certificate extension" }
+    if (!parts[0].asOid().contentEquals(OID_SUBJECT_ALT_NAME)) return null
+    require(parts.size == 2 || parts[1].tag == TAG_BOOLEAN) { "malformed subjectAltName extension" }
+    return parts.last().asOctetString()
 }
 
 /** Extracts dNSName and iPAddress entries from the leaf's subjectAltName extension. */
@@ -62,11 +74,12 @@ internal fun subjectAltNames(certDer: ByteArray): SubjectAltNames {
     val extensions = tbs.firstOrNull { it.tag == TAG_EXPLICIT_EXTENSIONS } ?: return SubjectAltNames(emptyList(), emptyList())
     val dns = ArrayList<String>()
     val ips = ArrayList<ByteArray>()
+    var seen = false
     for (ext in Der.parse(extensions.body).asSequence()) {
-        val parts = ext.asSequence()
-        if (!parts[0].asOid().contentEquals(OID_SUBJECT_ALT_NAME)) continue
-        val names = Der.parse(parts.last().asOctetString()).asSequence()
-        for (name in names) {
+        val value = extensionValue(ext.asSequence()) ?: continue
+        require(!seen) { "duplicate subjectAltName extension" } // RFC 5280 §4.2
+        seen = true
+        for (name in Der.parse(value).asSequence()) {
             when (name.tag) {
                 TAG_SAN_DNS -> dns += name.body.decodeToString()
                 TAG_SAN_IP -> ips += name.body
@@ -80,18 +93,24 @@ internal fun subjectAltNames(certDer: ByteArray): SubjectAltNames {
 internal fun certificateMatchesHost(
     leafDer: ByteArray,
     host: String,
-): Boolean = runCatching { subjectAltNames(leafDer).matches(host.trimEnd('.')) }.getOrDefault(false)
+): Boolean = runCatching { subjectAltNames(leafDer).matches(host.removeSuffix(".")) }.getOrDefault(false)
 
 /**
- * RFC 6125 §6.4 dNSName match: case-insensitive, trailing dot ignored, and a wildcard only
+ * RFC 6125 §6.4 dNSName match: case-insensitive, one trailing (root) dot ignored, and a wildcard only
  * as the complete left-most label, covering exactly one label, above at least two labels.
  */
 internal fun hostMatchesDnsName(
     host: String,
     pattern: String,
+): Boolean = dnsNameMatches(host.removeSuffix("."), pattern)
+
+/** [host] already has its single root dot removed; a second one is an empty label and fails. */
+private fun dnsNameMatches(
+    host: String,
+    pattern: String,
 ): Boolean {
-    val h = host.trimEnd('.').lowercase()
-    val p = pattern.trimEnd('.').lowercase()
+    val h = host.lowercase()
+    val p = pattern.removeSuffix(".").lowercase()
     return when {
         !isDnsName(h) || p.isEmpty() -> false
         !p.contains('*') -> h == p

@@ -77,7 +77,8 @@ internal suspend fun verifyWebPkiChain(
     chainDer: List<ByteArray>,
     host: String?,
 ) {
-    val name = host?.trimEnd('.')
+    // Only the single root dot is dropped: "example.com.." keeps an empty label and fails.
+    val name = host?.removeSuffix(".")
     if (name.isNullOrEmpty()) rejectCertificate("TLS: no host name to verify the certificate against")
     if (chainDer.isEmpty()) rejectCertificate("TLS: server sent no certificate")
     when (val failure = runCatching { verifyServerChain(chainDer, name) }.exceptionOrNull()) {
@@ -85,7 +86,7 @@ internal suspend fun verifyWebPkiChain(
         is CancellationException, is TlsCertificateError -> throw failure
         else -> rejectCertificate("TLS certificate for $name rejected: ${failure.message ?: failure::class.simpleName}", failure)
     }
-    if (!certificateMatchesHost(chainDer[0], name)) rejectCertificate("TLS certificate does not match host $name")
+    if (!certificateMatchesHost(chainDer[0], host ?: name)) rejectCertificate("TLS certificate does not match host $name")
 }
 
 internal fun rejectCertificate(

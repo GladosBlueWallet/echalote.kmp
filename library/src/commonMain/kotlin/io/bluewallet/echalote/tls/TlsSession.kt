@@ -127,6 +127,21 @@ internal fun tlsResumeExpiryMs(
     return minOf(nowMs + ttl, ceilingMs)
 }
 
+/**
+ * Latest instant a session verified on [chainDer] may be resumed: the earliest notAfter in the
+ * chain, since the path dies with its first certificate. Certificates already expired at [nowMs]
+ * cannot be on the path the platform just validated (e.g. a stale cross-sign), so they are skipped.
+ * A certificate we cannot parse makes the session non-resumable (returns [nowMs]).
+ */
+internal fun chainResumeCeilingMs(
+    chainDer: List<ByteArray>,
+    nowMs: Long = currentEpochMillis(),
+): Long {
+    val notAfters = chainDer.map { der -> runCatching { X509Certificate.parse(der).notAfterMillis }.getOrNull() }
+    if (notAfters.isEmpty() || notAfters.any { it == null }) return nowMs
+    return notAfters.filterNotNull().filter { it >= nowMs }.minOrNull() ?: nowMs
+}
+
 internal fun storeTlsResumption(session: TlsResumption) {
     if (session.host.isEmpty()) return
     if (session.ticket.isEmpty() && session.sessionId.isEmpty()) return

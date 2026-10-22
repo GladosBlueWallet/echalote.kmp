@@ -70,6 +70,31 @@ class TlsSessionResumeTest {
         }
 
     @Test
+    fun clientHello_omitsSniForIpLiterals() =
+        runTest {
+            for ((host, expectSni) in listOf("echalote.test" to true, "127.0.0.1" to false, "::1" to false, "[2001:db8::1]" to false)) {
+                val tls = TlsClientDuplex(host)
+                try {
+                    val rec = tls.inner.read(16 * 1024)
+                    assertEquals(expectSni, clientHelloHasExtension(rec, 0x0000), host)
+                } finally {
+                    tls.close()
+                }
+            }
+        }
+
+    @Test
+    fun resumeCeiling_isEarliestLiveNotAfterInChain() {
+        val leaf = X509Certificate.parse(TlsTestCerts.VALID_LEAF).notAfterMillis
+        val rocketx = X509Certificate.parse(TlsTestCerts.ROCKETX_LEAF).notAfterMillis
+        val chain = listOf(TlsTestCerts.VALID_LEAF, TlsTestCerts.ROCKETX_LEAF)
+        assertEquals(minOf(leaf, rocketx), chainResumeCeilingMs(chain, nowMs = 0L))
+        assertEquals(leaf, chainResumeCeilingMs(chain, nowMs = rocketx + 1), "an already-expired extra cert is off-path")
+        assertEquals(42L, chainResumeCeilingMs(listOf(TlsTestCerts.VALID_LEAF, byteArrayOf(1, 2)), nowMs = 42L))
+        assertEquals(42L, chainResumeCeilingMs(emptyList(), nowMs = 42L))
+    }
+
+    @Test
     fun clientHello_sendsCachedTicket() =
         runTest {
             resetTlsSessionCache()

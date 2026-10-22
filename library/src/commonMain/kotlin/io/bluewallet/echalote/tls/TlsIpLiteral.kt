@@ -16,19 +16,17 @@ internal fun parseIpv4(host: String): ByteArray? {
 
 /** A DNS name never has an all-digit top-level label (RFC 3696 §2), so such a host is an IP-ish literal. */
 internal fun looksNumeric(host: String): Boolean {
-    val last = host.trimEnd('.').substringAfterLast('.')
+    val last = host.substringAfterLast('.')
     return last.isNotEmpty() && last.all { it in '0'..'9' }
 }
 
-/** IPv4 dotted quad, or IPv6 text (RFC 4291 §2.2, optionally in brackets), as 4 or 16 bytes. */
-internal fun parseIpLiteral(host: String): ByteArray? {
-    val h = host.trimEnd('.')
-    return when {
-        h.startsWith('[') -> if (h.endsWith(']')) parseIpv6(h.substring(1, h.length - 1)) else null
-        h.contains(':') -> parseIpv6(h)
-        else -> parseIpv4(h)
+/** IPv4 dotted quad, or IPv6 text (RFC 4291 §2.2, optionally in brackets), as 4 or 16 bytes. [host] has no root dot. */
+internal fun parseIpLiteral(host: String): ByteArray? =
+    when {
+        host.startsWith('[') -> if (host.endsWith(']')) parseIpv6(host.substring(1, host.length - 1)) else null
+        host.contains(':') -> parseIpv6(host)
+        else -> parseIpv4(host)
     }
-}
 
 private fun parseIpv6(text: String): ByteArray? {
     val halves = text.split("::")

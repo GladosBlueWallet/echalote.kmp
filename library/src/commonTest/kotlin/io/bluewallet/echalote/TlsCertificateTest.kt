@@ -104,6 +104,52 @@ class TlsCertificateTest {
         assertFalse(SubjectAltNames(listOf("*.0.0.1"), emptyList()).matches("010.0.0.1"))
     }
 
+    @Test
+    fun onlyOneTrailingRootDotIsIgnored() {
+        assertTrue(hostMatchesDnsName("echalote.test.", "echalote.test"))
+        assertFalse(hostMatchesDnsName("echalote.test..", "echalote.test"), "a second dot is an empty label")
+        assertTrue(certificateMatchesHost(TlsTestCerts.VALID_LEAF, "echalote.test."))
+        assertFalse(certificateMatchesHost(TlsTestCerts.VALID_LEAF, "echalote.test.."))
+        assertFalse(certificateMatchesHost(TlsTestCerts.VALID_LEAF, "127.0.0.1.."))
+    }
+
+    // --- SAN extension shape -----------------------------------------------------------
+
+    private fun der(
+        tag: Int,
+        vararg parts: ByteArray,
+    ): ByteArray {
+        val body = concatBytes(*parts)
+        require(body.size < 128)
+        return concatBytes(byteArrayOf(tag.toByte(), body.size.toByte()), body)
+    }
+
+    private val sanOid = der(0x06, byteArrayOf(0x55, 0x1d, 0x11))
+
+    private fun sanValue(name: String) = der(0x04, der(0x30, der(0x82, name.encodeToByteArray())))
+
+    /** Just enough of a Certificate for subjectAltNames(): SEQ { TBS SEQ { [3] { SEQ { ext... } } } }. */
+    private fun certWithExtensions(vararg extensions: ByteArray) = der(0x30, der(0x30, der(0xa3, der(0x30, *extensions))))
+
+    @Test
+    fun sanExtension_acceptsOptionalCriticalFlag() {
+        assertTrue(certificateMatchesHost(certWithExtensions(der(0x30, sanOid, sanValue("a.test"))), "a.test"))
+        val critical = der(0x01, byteArrayOf(-1))
+        assertTrue(certificateMatchesHost(certWithExtensions(der(0x30, sanOid, critical, sanValue("a.test"))), "a.test"))
+    }
+
+    @Test
+    fun sanExtension_rejectsExtraElementsAndDuplicates() {
+        val trailing = der(0x30, sanOid, sanValue("good.test"), sanValue("evil.test"))
+        assertFalse(certificateMatchesHost(certWithExtensions(trailing), "evil.test"), "no trailing OCTET STRING")
+        assertFalse(certificateMatchesHost(certWithExtensions(trailing), "good.test"))
+        val notBoolean = der(0x30, sanOid, der(0x04, byteArrayOf(1)), sanValue("evil.test"))
+        assertFalse(certificateMatchesHost(certWithExtensions(notBoolean), "evil.test"))
+        val twice = certWithExtensions(der(0x30, sanOid, sanValue("good.test")), der(0x30, sanOid, sanValue("evil.test")))
+        assertFalse(certificateMatchesHost(twice, "evil.test"), "a second subjectAltName extension is malformed")
+        assertFalse(certificateMatchesHost(twice, "good.test"))
+    }
+
     // --- SAN extraction from real DER --------------------------------------------
 
     @Test
@@ -261,6 +307,23 @@ class TlsCertificateTest {
             val (error, sent) = rejectedFlight(flight)
             assertTrue(error is TlsCertificateError, "got $error")
             assertContentEquals(byteArrayOf(21, 3, 3, 0, 2, 2, 47), sent)
+        }
+
+    @Test
+    fun malformedServerHello_sendsDecodeErrorAlert() =
+        runTest {
+            val (error, sent) = rejectedFlight(handshake(2, serverHello(version = 0x0301)))
+            assertTrue(error is IllegalArgumentException, "got $error")
+            assertContentEquals(byteArrayOf(21, 3, 3, 0, 2, 2, 50), sent)
+        }
+
+    @Test
+    fun unexpectedHandshakeMessage_sendsFatalAlert() =
+        runTest {
+            val flight = concatBytes(handshake(2, serverHello()), handshake(11, certMessage(TlsTestCerts.VALID_LEAF)), handshake(99, ByteArray(0)))
+            val (error, sent) = rejectedFlight(flight)
+            assertTrue(error is IllegalStateException, "got $error")
+            assertContentEquals(byteArrayOf(21, 3, 3, 0, 2, 2, 40), sent)
         }
 
     @Test

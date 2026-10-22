@@ -1,5 +1,6 @@
 package io.bluewallet.echalote
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -26,6 +27,7 @@ private const val HS_SERVER_HELLO_DONE = 14
 private const val HS_CLIENT_KEY_EXCHANGE = 16
 private const val HS_FINISHED = 20
 private const val ALERT_FATAL = 2
+private const val ALERT_HANDSHAKE_FAILURE = 40
 private const val ALERT_BAD_CERTIFICATE = 42
 private const val ALERT_ILLEGAL_PARAMETER = 47
 private const val ALERT_DECODE_ERROR = 50
@@ -223,22 +225,35 @@ private suspend fun runTlsHandshake(
     tls.writeRecord(REC_HS, clientHello)
     println("echalote.tls $hostName hello-sent")
 
-    val (helloType, helloBody, helloRaw) = hs.next()
-    require(helloType == HS_SERVER_HELLO) { "expected ServerHello" }
-    hs.transcript = concatBytes(hs.transcript, helloRaw)
-    val hello = parseServerHello(helloBody)
-    val next = hs.nextOrCcs()
-    val flow = TlsHandshake(tls, hs, hostName, clientRandom, trust)
-    val resume = cached
-    val abbreviated =
-        next is TlsNext.Ccs ||
-            (next is TlsNext.Handshake && next.type == HS_NEW_SESSION_TICKET)
-    return if (resume != null && abbreviated) {
-        println("echalote.tls $hostName resume=true")
-        flow.finishResume(resume, hello, next)
-    } else {
-        println("echalote.tls $hostName resume=false")
-        flow.finishFull(hello, next)
+    // A malformed or out-of-order server flight is answered with a fatal alert before giving up.
+    return runCatching {
+        val (helloType, helloBody, helloRaw) = hs.next()
+        require(helloType == HS_SERVER_HELLO) { "expected ServerHello" }
+        hs.transcript = concatBytes(hs.transcript, helloRaw)
+        val hello = parseServerHello(helloBody)
+        val next = hs.nextOrCcs()
+        val flow = TlsHandshake(tls, hs, hostName, clientRandom, trust)
+        val resume = cached
+        val abbreviated =
+            next is TlsNext.Ccs ||
+                (next is TlsNext.Handshake && next.type == HS_NEW_SESSION_TICKET)
+        if (resume != null && abbreviated) {
+            println("echalote.tls $hostName resume=true")
+            flow.finishResume(resume, hello, next)
+        } else {
+            println("echalote.tls $hostName resume=false")
+            flow.finishFull(hello, next)
+        }
+    }.getOrElse { e ->
+        val alert =
+            when (e) {
+                is CancellationException -> null // an IllegalStateException, but not the peer's fault
+                is IllegalArgumentException, is IndexOutOfBoundsException -> ALERT_DECODE_ERROR
+                is IllegalStateException -> ALERT_HANDSHAKE_FAILURE
+                else -> null
+            }
+        alert?.let { tls.sendFatalAlert(it) }
+        throw e
     }
 }
 
@@ -251,7 +266,6 @@ private class FullServerAuth {
     var signature: ByteArray = ByteArray(0)
     var ticket: ByteArray = ByteArray(0)
     var lifetime: Long = 0L
-    var leafNotAfterMs: Long = 0L
 }
 
 private class TlsHandshake(
@@ -364,7 +378,7 @@ private class TlsHandshake(
         }
         val master = sendClientKeyExchange(auth, hello)
         readServerFinished(auth, master)
-        val expiresAtMs = tlsResumeExpiryMs(auth.lifetime, ceilingMs = auth.leafNotAfterMs)
+        val expiresAtMs = tlsResumeExpiryMs(auth.lifetime, ceilingMs = chainResumeCeilingMs(auth.chain))
         keepSession(master, hello.sessionId, auth.ticket, hello.ems, expiresAtMs)
         return TlsSession(auth.leaf, tls)
     }
@@ -452,7 +466,6 @@ private class TlsHandshake(
             runCatching { X509Certificate.parse(auth.leaf) }.getOrElse { e ->
                 rejectServerAuth(ALERT_BAD_CERTIFICATE, TlsCertificateError("TLS: unparseable server certificate: ${e.message}", e))
             }
-        auth.leafNotAfterMs = x509.notAfterMillis
         val signed = concatBytes(clientRandom, hello.serverRandom, auth.ecdheParams)
         val (hash, prefix) =
             try {
@@ -651,7 +664,8 @@ private fun buildClientHello(
     resume: TlsResumption? = null,
 ): ByteArray {
     val sni =
-        if (hostName.isNullOrEmpty()) {
+        // RFC 6066 §3: IP literals are not permitted in server_name.
+        if (hostName.isNullOrEmpty() || parseIpLiteral(hostName.removeSuffix(".")) != null) {
             ByteArray(0)
         } else {
             val host = hostName.encodeToByteArray()
