@@ -1,6 +1,10 @@
 package io.bluewallet.echalote
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFails
@@ -202,6 +206,11 @@ class ExitDialerCircuitReuseTest {
                 now = 10_000
                 dialer.dial("api.example", 443).close()
                 assertEquals(2, built.size)
+                // The stale circuit is closed by a coroutine the dialer launches on Dispatchers.Default
+                // (not awaited by dial), so wait for it in real time instead of racing it.
+                withContext(Dispatchers.Default) {
+                    withTimeout(5_000) { while (built[0].closeCount == 0) delay(1) }
+                }
                 assertEquals(1, built[0].closeCount)
             } finally {
                 dialer.dispose()
