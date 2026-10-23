@@ -1,10 +1,13 @@
 package io.bluewallet.echalote
 
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.supervisorScope
+import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFails
@@ -93,5 +96,22 @@ class ClearnetParallelTest {
                 val ex = runCatching { pending.await() }.exceptionOrNull()
                 assertTrue(ex != null && ex.message?.contains("parent cancelled") == true)
             }
+        }
+
+    @Test
+    fun winnerReturnsWithoutWaitingForLosersThatIgnoreCancellation() =
+        runTest {
+            val result =
+                fetchFirstOk(
+                    listOf("stuck", "fast"),
+                    worker = { key, _ ->
+                        if (key == "stuck") withContext(NonCancellable) { delay(30_000) }
+                        delay(10)
+                        key
+                    },
+                    concurrency = 2,
+                )
+            assertEquals("fast", result)
+            assertEquals(10, currentTime)
         }
 }

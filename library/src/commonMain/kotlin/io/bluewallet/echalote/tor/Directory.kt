@@ -1,12 +1,17 @@
 package io.bluewallet.echalote
 
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Mutex
@@ -351,9 +356,11 @@ suspend fun buildExitCircuit(
             throw (signal.reason as? Exception) ?: CancellationException("aborted")
         }
         try {
-            return raceFirstCircuit(circuitRace, { raceSignal ->
-                once(client, raceSignal, onceOpts)
-            }, signal)
+            return timed("tor", "circuit-race", { "race=$circuitRace" }) {
+                raceFirstCircuit(circuitRace, { raceSignal ->
+                    once(client, raceSignal, onceOpts)
+                }, signal)
+            }
         } catch (err: Throwable) {
             lastError = err
             if (signal.aborted || !isTransientCircuitError(err)) break
@@ -375,6 +382,12 @@ private fun formatAggregate(
     return if (details.isEmpty()) message else "$message: ${details.joinToString(" | ")}"
 }
 
+/**
+ * Runs [worker] over [items], at most [concurrency] at a time, and returns the first result.
+ * A failed worker starts the next item. As soon as one worker succeeds (or [signal] aborts, or
+ * every item failed) the other workers are aborted and cancelled, and this returns right away:
+ * workers run in their own scope, so a loser stuck in a blocking call is not waited for.
+ */
 suspend fun <T, R> fetchFirstOk(
     items: List<T>,
     worker: suspend (T, Abort) -> R,
@@ -391,69 +404,78 @@ suspend fun <T, R> fetchFirstOk(
     val lock = Mutex()
     var cursor = 0
     var inFlight = 0
+    val workers = CoroutineScope(currentCoroutineContext().minusKey(Job) + SupervisorJob())
 
-    fun settleReject(err: Throwable) {
-        if (done.isCompleted) return
-        done.completeExceptionally(err)
-        for (c in locals) c.abort(err)
-    }
+    var stopped = false
 
-    fun settleResolve(value: R) {
-        if (done.isCompleted) return
-        done.complete(value)
-        for (c in locals) {
+    // Copies the losers under the same lock launchOne adds them with, and marks the race
+    // stopped so no worker can be added after the copy. Abort is what a loser stuck in
+    // non-suspending work (signature checks) observes; coroutine cancellation alone is not.
+    suspend fun stopWorkers(reason: Throwable) {
+        val losers =
+            withContext(NonCancellable) {
+                lock.withLock {
+                    stopped = true
+                    locals.toList()
+                }
+            }
+        for (c in losers) {
             try {
-                c.abort(CancellationException("fetchFirstOk: lost race"))
+                c.abort(reason)
             } catch (_: Throwable) {
             }
         }
+        workers.cancel()
     }
 
     signal.onAbort {
-        settleReject(signal.reason ?: CancellationException("aborted"))
+        done.completeExceptionally(signal.reason ?: CancellationException("aborted"))
     }
 
-    coroutineScope {
-        suspend fun launchOne() {
-            val item: T
-            val local: Abort
-            lock.withLock {
-                if (done.isCompleted || cursor >= items.size) return
-                item = items[cursor]
-                cursor += 1
-                inFlight += 1
-                local = Abort()
-                locals += local
-            }
-            launch {
-                val linked = Abort.any(signal, local)
-                try {
-                    val value = worker(item, linked)
-                    settleResolve(value)
-                } catch (err: kotlinx.coroutines.CancellationException) {
-                    throw err
-                } catch (err: Throwable) {
-                    val shouldLaunch: Boolean
-                    lock.withLock {
-                        inFlight -= 1
-                        errors += err
-                        shouldLaunch = !done.isCompleted && cursor < items.size
-                        if (!done.isCompleted && cursor >= items.size && inFlight == 0) {
-                            settleReject(AggregateError(errors.toList(), "fetchFirstOk: all failed"))
-                        }
-                    }
-                    if (shouldLaunch) launchOne()
-                }
-            }
+    suspend fun launchOne() {
+        val item: T
+        val local: Abort
+        lock.withLock {
+            if (stopped || done.isCompleted || cursor >= items.size) return
+            item = items[cursor]
+            cursor += 1
+            inFlight += 1
+            local = Abort()
+            locals += local
         }
-        repeat(minOf(cap, items.size)) { launchOne() }
-        try {
-            done.await()
-        } finally {
-            this.coroutineContext[Job]?.cancelChildren()
+        workers.launch {
+            val linked = Abort.any(signal, local)
+
+            suspend fun failed(err: Throwable) {
+                val shouldLaunch: Boolean
+                lock.withLock {
+                    inFlight -= 1
+                    errors += err
+                    shouldLaunch = !done.isCompleted && cursor < items.size
+                    if (!done.isCompleted && cursor >= items.size && inFlight == 0) {
+                        done.completeExceptionally(AggregateError(errors.toList(), "fetchFirstOk: all failed"))
+                    }
+                }
+                if (shouldLaunch) launchOne()
+            }
+            try {
+                done.complete(worker(item, linked))
+            } catch (err: kotlinx.coroutines.CancellationException) {
+                // Our own cancellation (the race is over) ends quietly; any other counts as a failure.
+                if (!isActive) throw err
+                failed(err)
+            } catch (err: Throwable) {
+                failed(err)
+            }
         }
     }
-    return done.await()
+
+    try {
+        repeat(minOf(cap, items.size)) { launchOne() }
+        return done.await()
+    } finally {
+        stopWorkers(CancellationException("fetchFirstOk: lost race"))
+    }
 }
 
 val AUTHORITY_HOSTS =
@@ -472,7 +494,7 @@ val AUTHORITY_HOSTS =
 val CONSENSUS_MIRRORS = AUTHORITY_HOSTS.map { "http://$it/tor/status-vote/current/consensus-microdesc" }
 
 internal var cachedConsensus: Pair<Long, Consensus>? = null
-private const val CACHE_MS = 30 * 60 * 1000L
+internal const val CONSENSUS_CACHE_MS = 30 * 60 * 1000L
 
 internal fun resetCachedConsensus() {
     cachedConsensus = null
@@ -486,47 +508,13 @@ suspend fun fetchMicrodescConsensus(
     force: Boolean = false,
     concurrency: Int = 3,
     engine: HttpEngine = defaultHttpEngine(),
-): Consensus {
-    val progress = fetchProgress()
-    progress?.report(FetchStage.DOWNLOADING_DIRECTORY)
-    val now = currentEpochMillis()
-    val cached = cachedConsensus
-    if (!force && cached != null && now - cached.first < CACHE_MS) {
-        val stillValid =
-            try {
-                cached.second.ensureFresh(now)
-                true
-            } catch (_: IllegalStateException) {
-                false
-            }
-        if (stillValid) {
-            progress?.report(FetchStage.DOWNLOADING_DIRECTORY, 1.0)
-            return cached.second
-        }
-        cachedConsensus = null
-    }
-    val shuffled = mirrors.toMutableList().also { it.shuffle() }
-    val consensus =
-        fetchFirstOk(
-            shuffled,
-            worker = { url, race ->
-                race.throwIfAborted()
-                val res = engine.call("GET", url, timeoutMs = 30_000)
-                if (res.status !in 200..299) throw Exception("HTTP ${res.status}")
-                val text = res.body.decodeToString()
-                if (!text.contains("directory-footer")) throw Exception("truncated consensus (no directory-footer)")
-                val parsed = ConsensusParser.parseOrThrow(text)
-                if (parsed.microdescs.isEmpty()) throw Exception("consensus has no microdescs")
-                parsed.ensureFresh()
-                parsed
-            },
-            concurrency = concurrency,
-            signal = signal,
-        )
-    cachedConsensus = currentEpochMillis() to consensus
-    progress?.report(FetchStage.DOWNLOADING_DIRECTORY, 1.0)
-    return consensus
-}
+): Consensus =
+    fetchVerifiedMicrodescConsensus(
+        source = ConsensusSource(mirrors, AUTHORITY_HOSTS, engine, concurrency),
+        trust = ConsensusTrust(),
+        force = force,
+        signal = signal,
+    )
 
 suspend fun fetchMicrodesc(
     head: MicrodescHead,
@@ -666,8 +654,8 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
                 }
                 if (tor === client) resetTor(client)
             }
-            meek.start()
-            client.waitOrThrow(signal)
+            timed("tor", "meek-start") { meek.start() }
+            timed("tor", "tor-handshake") { client.waitOrThrow(signal) }
             progress?.report(FetchStage.CONNECTING, 1.0)
             val installed =
                 torLock.withLock {
@@ -905,10 +893,10 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
                 val key = cacheKey(host, port)
                 var retried = false
                 while (true) {
-                    val client = ensureTor(signal)
+                    val client = timed("tor", "ensure-tor") { ensureTor(signal) }
                     val cached = circuitLock.withLock { circuits[key] }
                     val cacheHit = cached != null && !cached.circuit.isClosed
-                    val circuit = obtainCircuit(client, signal, key)
+                    val circuit = timed("tor", "obtain-circuit", { "cacheHit=$cacheHit" }) { obtainCircuit(client, signal, key) }
                     val progress = fetchProgress()
                     progress?.report(FetchStage.OPENING_CONNECTION)
                     println(
@@ -917,8 +905,10 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
                     )
                     try {
                         val stream =
-                            withAbortTimeout(options.openTimeoutMs, signal) { linked ->
-                                circuit.openOrThrow(host, port, wait = true, abort = linked)
+                            timed("tor", "stream-open", { "circ=${circuit.id}" }) {
+                                withAbortTimeout(options.openTimeoutMs, signal) { linked ->
+                                    circuit.openOrThrow(host, port, wait = true, abort = linked)
+                                }
                             }
                         progress?.report(FetchStage.OPENING_CONNECTION, 0.5)
                         println("echalote.open-ok $host:$port circ=${circuit.id}")
@@ -996,14 +986,18 @@ internal suspend fun buildExitCircuitOnce(
 ): Circuit {
     val progress = fetchProgress()
     val engine = options.http ?: defaultHttpEngine()
-    val circuit = withAbortTimeout(options.extendTimeoutMs, signal) { client.createOrThrow(it) }
+    val buildStart = timeMark()
+    val circuit = timed("tor", "create-fast") { withAbortTimeout(options.extendTimeoutMs, signal) { client.createOrThrow(it) } }
+    val tag = { "circ=${circuit.id}" }
     try {
         val consensus =
-            fetchMicrodescConsensus(
-                signal,
-                mirrors = options.consensusUrls ?: CONSENSUS_MIRRORS,
-                engine = engine,
-            )
+            timed("tor", "consensus", tag) {
+                fetchMicrodescConsensus(
+                    signal,
+                    mirrors = options.consensusUrls ?: CONSENSUS_MIRRORS,
+                    engine = engine,
+                )
+            }
         val guardId =
             (circuit as? LiveCircuit)
                 ?.secret
@@ -1015,19 +1009,22 @@ internal suspend fun buildExitCircuitOnce(
         if (middles.isEmpty() || exits.isEmpty()) {
             throw Exception("tor consensus missing usable relays (middles=${middles.size} exits=${exits.size})")
         }
-        val middleFull = pickExtendable(middles, signal, options.pickTries, engine)
+        val middleFull = timed("tor", "microdesc-middle", tag) { pickExtendable(middles, signal, options.pickTries, engine) }
         progress?.report(FetchStage.BUILDING_CIRCUIT)
-        withAbortTimeout(options.extendTimeoutMs, signal) { circuit.extendOrThrow(middleFull, it) }
+        timed("tor", "extend2-middle", tag) { withAbortTimeout(options.extendTimeoutMs, signal) { circuit.extendOrThrow(middleFull, it) } }
         progress?.report(FetchStage.BUILDING_CIRCUIT, 0.5)
         val exitFull =
-            pickExtendable(
-                exits.filter { it.identity != middleFull.identity },
-                signal,
-                options.pickTries,
-                engine,
-            )
-        withAbortTimeout(options.extendTimeoutMs, signal) { circuit.extendOrThrow(exitFull, it) }
+            timed("tor", "microdesc-exit", tag) {
+                pickExtendable(
+                    exits.filter { it.identity != middleFull.identity },
+                    signal,
+                    options.pickTries,
+                    engine,
+                )
+            }
+        timed("tor", "extend2-exit", tag) { withAbortTimeout(options.extendTimeoutMs, signal) { circuit.extendOrThrow(exitFull, it) } }
         progress?.report(FetchStage.BUILDING_CIRCUIT, 1.0)
+        logTiming("tor", "circuit-build", buildStart.elapsedNow(), tag())
         return circuit
     } catch (err: Throwable) {
         try {
@@ -1035,15 +1032,6 @@ internal suspend fun buildExitCircuitOnce(
         } catch (_: Throwable) {
         }
         throw err
-    }
-}
-
-private fun <T> MutableList<T>.shuffle() {
-    for (i in size - 1 downTo 1) {
-        val j = randomIndex(i + 1)
-        val t = this[i]
-        this[i] = this[j]
-        this[j] = t
     }
 }
 

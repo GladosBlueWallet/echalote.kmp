@@ -1,16 +1,17 @@
 package io.bluewallet.echalote
 
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.URL
 
 actual fun defaultHttpEngine(): HttpEngine =
     HttpEngine { method, url, headers, body, timeoutMs, decompress ->
         val onDownload = http1ProgressSink()
-        withContext(Dispatchers.IO) {
+        cancellableBlocking(Dispatchers.IO) { hook ->
+            val timing = Http1Timing(url, enabled = usesCleartextHttp1(url))
             val conn =
                 (URL(url).openConnection() as HttpURLConnection).apply {
+                    hook.register { runCatching { disconnect() } }
                     requestMethod = method
                     connectTimeout = timeoutMs.toInt().coerceAtLeast(1)
                     readTimeout = timeoutMs.toInt().coerceAtLeast(1)
@@ -27,21 +28,21 @@ actual fun defaultHttpEngine(): HttpEngine =
                     }
                 }
             try {
+                runCatching { conn.connect() }
+                timing.connected()
                 val status =
                     try {
                         conn.responseCode
                     } catch (_: Exception) {
                         0
                     }
+                timing.firstByte()
                 val stream = if (status in 200..299) conn.inputStream else conn.errorStream
                 val tick = if (status in 200..299) onDownload else null
                 val bytes = readStreamProgress(stream, conn.contentLength, tick)
-                val hdrs = mutableMapOf<String, String>()
-                for ((k, vs) in conn.headerFields) {
-                    if (k != null && vs != null && vs.isNotEmpty()) hdrs[k] = vs.joinToString(", ")
-                }
-                HttpResponse(status, bytes, hdrs)
+                HttpResponse(status, bytes, conn.headerMap()).also { timing.done(it) }
             } finally {
+                hook.release()
                 conn.disconnect()
             }
         }
@@ -66,4 +67,12 @@ private fun readStreamProgress(
         onDownload?.invoke(received, total)
     }
     return out.toByteArray()
+}
+
+private fun HttpURLConnection.headerMap(): Map<String, String> {
+    val hdrs = mutableMapOf<String, String>()
+    for ((k, vs) in headerFields) {
+        if (k != null && vs != null && vs.isNotEmpty()) hdrs[k] = vs.joinToString(", ")
+    }
+    return hdrs
 }

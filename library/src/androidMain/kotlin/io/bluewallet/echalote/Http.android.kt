@@ -1,7 +1,6 @@
 package io.bluewallet.echalote
 
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -10,16 +9,16 @@ import java.net.URL
 actual fun defaultHttpEngine(): HttpEngine =
     HttpEngine { method, url, headers, body, timeoutMs, decompress ->
         val onDownload = http1ProgressSink()
-        withContext(Dispatchers.IO) {
+        cancellableBlocking(Dispatchers.IO) { hook ->
             if (usesCleartextHttp1(url)) {
-                http1OverTcp(method, url, headers, body, timeoutMs, onDownload)
+                hook.http1OverTcp(method, url, headers, body, timeoutMs, onDownload)
             } else {
-                httpsUrlConnection(method, url, headers, body, timeoutMs, decompress, onDownload)
+                hook.httpsUrlConnection(method, url, headers, body, timeoutMs, decompress, onDownload)
             }
         }
     }
 
-private fun http1OverTcp(
+private fun CancelHook.http1OverTcp(
     method: String,
     url: String,
     headers: Map<String, String>,
@@ -29,24 +28,32 @@ private fun http1OverTcp(
 ): HttpResponse {
     val parsed = parseHttpUrl(url)
     val timeout = timeoutMs.toInt().coerceAtLeast(1)
+    val timing = Http1Timing(url)
     Socket().use { sock ->
-        sock.soTimeout = timeout
-        sock.connect(InetSocketAddress(parsed.host, parsed.port), timeout)
-        val req = buildHttp1Request(method, parsed, headers, body)
-        sock.getOutputStream().write(req)
-        sock.getOutputStream().flush()
-        val input = sock.getInputStream()
-        val buf = ByteArray(16 * 1024)
-        val raw =
-            readHttp1Raw(onDownload = onDownload) {
-                val n = input.read(buf)
-                if (n < 0) null else buf.copyOf(n)
-            }
-        return parseHttp1Response(raw)
+        register { runCatching { sock.close() } }
+        try {
+            sock.soTimeout = timeout
+            sock.connect(InetSocketAddress(parsed.host, parsed.port), timeout)
+            timing.connected()
+            val req = buildHttp1Request(method, parsed, headers, body)
+            sock.getOutputStream().write(req)
+            sock.getOutputStream().flush()
+            val input = sock.getInputStream()
+            val buf = ByteArray(16 * 1024)
+            val raw =
+                readHttp1Raw(onDownload = onDownload) {
+                    val n = input.read(buf)
+                    timing.firstByte()
+                    if (n < 0) null else buf.copyOf(n)
+                }
+            return parseHttp1Response(raw).also { timing.done(it) }
+        } finally {
+            release()
+        }
     }
 }
 
-private fun httpsUrlConnection(
+private fun CancelHook.httpsUrlConnection(
     method: String,
     url: String,
     headers: Map<String, String>,
@@ -57,6 +64,7 @@ private fun httpsUrlConnection(
 ): HttpResponse {
     val conn =
         (URL(url).openConnection() as HttpURLConnection).apply {
+            register { runCatching { disconnect() } }
             requestMethod = method
             connectTimeout = timeoutMs.toInt().coerceAtLeast(1)
             readTimeout = timeoutMs.toInt().coerceAtLeast(1)
@@ -83,6 +91,7 @@ private fun httpsUrlConnection(
         }
         return HttpResponse(status, bytes, hdrs)
     } finally {
+        release()
         conn.disconnect()
     }
 }

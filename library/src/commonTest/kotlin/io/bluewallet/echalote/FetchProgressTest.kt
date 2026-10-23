@@ -99,7 +99,7 @@ class FetchProgressTest {
 
     @Test
     fun concurrentTicksNeverGoBackwards() =
-        runTest {
+        runTest(timeout = RSA_TEST_TIMEOUT) {
             val events = Channel<Int>(Channel.UNLIMITED)
             val reporter = FetchProgressReporter { percent, _ -> events.trySend(percent) }
             reporter.report(FetchStage.DOWNLOADING_DIRECTORY)
@@ -131,37 +131,20 @@ class FetchProgressTest {
 
     @Test
     fun fetchMicrodescConsensusReportsDirectoryDownload() =
-        runTest {
-            val text =
-                """
-                network-status-version 3 microdesc
-                vote-status consensus
-                consensus-method 35
-                valid-after 2000-01-01 00:00:00
-                fresh-until 2100-01-01 00:00:00
-                valid-until 2100-01-01 00:00:00
-                voting-delay 300 300
-                known-flags Authority BadExit Exit Fast Guard HSDir MiddleOnly NoEdConsensus Running Stable StaleDesc V2Dir Valid
-                r c0der AjUfyI0L8G9s3lRSZWZB5hGdvX4 2038-01-01 00:00:00 95.216.20.80 8080 0
-                m mkHw/LD1moosjemRD+GqSqXzzK1kOvK3ZwTsCPGJIFs
-                s Fast Guard Running Stable V2Dir Valid
-                v Tor 0.4.8.8
-                pr Conflux=1 Cons=1-2 Desc=1-2 DirCache=2 FlowCtrl=1-2 HSDir=2 HSIntro=4-5 HSRend=1-2 Link=1-5 LinkAuth=1,3 Microdesc=1-2 Padding=2 Relay=1-4
-                w Bandwidth=34000
-                directory-footer
-                """.trimIndent()
+        runTest(timeout = RSA_TEST_TIMEOUT) {
             val events = ArrayList<Pair<Int, String>>()
             val reporter = FetchProgressReporter { percent, stage -> events += percent to stage }
             val engine =
-                HttpEngine { _, _, _, _, _, _ ->
-                    HttpResponse(200, text.encodeToByteArray())
+                HttpEngine { _, url, _, _, _, _ ->
+                    val body = if (url.contains("/tor/keys/")) fixtureKeysText else fixtureConsensusText
+                    HttpResponse(200, body.encodeToByteArray())
                 }
             try {
                 withContext(FetchProgressContext(reporter)) {
-                    fetchMicrodescConsensus(
+                    fetchVerifiedMicrodescConsensus(
+                        source = ConsensusSource(listOf("http://127.0.0.1/consensus"), listOf("127.0.0.1:1"), engine, 1),
+                        trust = ConsensusTrust(DirectoryAuthorities.V3_IDENTITIES, AuthorityCertStore(), { FIXTURE_NOW }),
                         force = true,
-                        mirrors = listOf("http://127.0.0.1/consensus"),
-                        engine = engine,
                     )
                 }
             } finally {
@@ -175,7 +158,7 @@ class FetchProgressTest {
 
     @Test
     fun fetchMicrodescConsensusRejectsExpiredDocument() =
-        runTest {
+        runTest(timeout = RSA_TEST_TIMEOUT) {
             val text =
                 """
                 network-status-version 3 microdesc
