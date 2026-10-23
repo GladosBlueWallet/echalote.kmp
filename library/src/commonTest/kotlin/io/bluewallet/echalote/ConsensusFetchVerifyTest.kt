@@ -43,7 +43,7 @@ class ConsensusFetchVerifyTest {
 
     @Test
     fun badlySignedConsensusMovesToNextMirrorAndOnlyTheVerifiedOneIsCached() =
-        runTest {
+        runTest(timeout = RSA_TEST_TIMEOUT) {
             val rec = Recorder({ url -> if (url.contains("bad")) tampered else fixtureConsensusText })
             try {
                 val got = fetch(rec, AuthorityCertStore(), listOf("http://bad/c", "http://good/c"))
@@ -57,7 +57,7 @@ class ConsensusFetchVerifyTest {
 
     @Test
     fun everyMirrorBadlySignedFailsClosedAndCachesNothing() =
-        runTest {
+        runTest(timeout = RSA_TEST_TIMEOUT) {
             val rec = Recorder({ tampered })
             try {
                 val err = assertFails { fetch(rec, AuthorityCertStore(), listOf("http://a/c", "http://b/c")) }
@@ -72,7 +72,7 @@ class ConsensusFetchVerifyTest {
 
     @Test
     fun unreachableKeyCertsFailClosed() =
-        runTest {
+        runTest(timeout = RSA_TEST_TIMEOUT) {
             val rec = Recorder({ fixtureConsensusText }, keys = { "" })
             try {
                 assertFails { fetch(rec, AuthorityCertStore(), listOf("http://a/c")) }
@@ -84,7 +84,7 @@ class ConsensusFetchVerifyTest {
 
     @Test
     fun keyCertsComeFromAuthoritiesByFingerprintAndSigningKeyAndAreCached() =
-        runTest {
+        runTest(timeout = RSA_TEST_TIMEOUT) {
             val rec = Recorder({ fixtureConsensusText })
             val store = AuthorityCertStore()
             try {

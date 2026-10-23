@@ -99,7 +99,7 @@ class FetchProgressTest {
 
     @Test
     fun concurrentTicksNeverGoBackwards() =
-        runTest {
+        runTest(timeout = RSA_TEST_TIMEOUT) {
             val events = Channel<Int>(Channel.UNLIMITED)
             val reporter = FetchProgressReporter { percent, _ -> events.trySend(percent) }
             reporter.report(FetchStage.DOWNLOADING_DIRECTORY)
@@ -131,7 +131,7 @@ class FetchProgressTest {
 
     @Test
     fun fetchMicrodescConsensusReportsDirectoryDownload() =
-        runTest {
+        runTest(timeout = RSA_TEST_TIMEOUT) {
             val events = ArrayList<Pair<Int, String>>()
             val reporter = FetchProgressReporter { percent, stage -> events += percent to stage }
             val engine =
@@ -158,7 +158,7 @@ class FetchProgressTest {
 
     @Test
     fun fetchMicrodescConsensusRejectsExpiredDocument() =
-        runTest {
+        runTest(timeout = RSA_TEST_TIMEOUT) {
             val text =
                 """
                 network-status-version 3 microdesc

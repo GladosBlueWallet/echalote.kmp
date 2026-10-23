@@ -87,7 +87,7 @@ class ConsensusSingleFlightTest {
 
     @Test
     fun parallelCallersShareOneDownloadAndOneVerification() =
-        runTest {
+        runTest(timeout = RSA_TEST_TIMEOUT) {
             val m = Mirrors()
             val got = List(2) { async { fetch(listOf("http://m100/c"), m, concurrency = 1) } }.awaitAll()
             assertSame(got[0], got[1])
@@ -97,7 +97,7 @@ class ConsensusSingleFlightTest {
 
     @Test
     fun firstVerifiedCopyStopsTheOthersAndOnlyItIsVerified() =
-        runTest {
+        runTest(timeout = RSA_TEST_TIMEOUT) {
             val m = Mirrors()
             fetch(listOf("http://m100/c", "http://m200/c", "http://m300/c"), m)
             assertEquals(100, currentTime)
@@ -108,7 +108,7 @@ class ConsensusSingleFlightTest {
 
     @Test
     fun winnerDoesNotWaitForALoserThatIgnoresCancellation() =
-        runTest {
+        runTest(timeout = RSA_TEST_TIMEOUT) {
             val m =
                 Mirrors { url ->
                     if (url.contains("hang")) withContext(NonCancellable) { delay(30_000) }
@@ -122,7 +122,7 @@ class ConsensusSingleFlightTest {
 
     @Test
     fun copyFailingVerificationFallsThroughToTheNextMirror() =
-        runTest {
+        runTest(timeout = RSA_TEST_TIMEOUT) {
             val bad = fixtureConsensusText.replaceFirst("\nw Bandwidth=", "\nw Bandwidth=9")
             val m =
                 Mirrors { url ->
@@ -138,7 +138,7 @@ class ConsensusSingleFlightTest {
 
     @Test
     fun waiterThatAbortsDetachesWithoutCancellingTheOthers() =
-        runTest {
+        runTest(timeout = RSA_TEST_TIMEOUT) {
             val m = Mirrors()
             val quitter = Abort()
             val a = async { runCatching { fetch(listOf("http://m1000/c"), m, concurrency = 1, signal = quitter) } }
@@ -157,7 +157,7 @@ class ConsensusSingleFlightTest {
 
     @Test
     fun lastWaiterLeavingCancelsTheSharedAttemptAndNothingIsCached() =
-        runTest {
+        runTest(timeout = RSA_TEST_TIMEOUT) {
             val m = Mirrors()
             val quitter = Abort()
             val a = async { runCatching { fetch(listOf("http://m1000/c"), m, concurrency = 1, signal = quitter) } }
@@ -173,7 +173,7 @@ class ConsensusSingleFlightTest {
 
     @Test
     fun everythingFailingTakesNoLongerThanBeforeAndIsSharedByAllCallers() =
-        runTest {
+        runTest(timeout = RSA_TEST_TIMEOUT) {
             // Before: each caller raced the six mirrors three at a time: two 30 s rounds = 60 s.
             val m =
                 Mirrors { _ ->

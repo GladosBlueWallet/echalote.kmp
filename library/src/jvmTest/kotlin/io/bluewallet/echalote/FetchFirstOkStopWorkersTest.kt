@@ -1,12 +1,13 @@
 package io.bluewallet.echalote
 
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -15,6 +16,10 @@ import kotlin.test.assertEquals
  * fetchFirstOk must abort every loser, including one launched (after another worker failed)
  * at the moment the race ends. A loser stuck in non-suspending work (like a signature check)
  * only stops through its Abort, not through coroutine cancellation. Real threads, many rounds.
+ *
+ * Runs on its own pool with more threads than [CONCURRENCY] busy workers: on Dispatchers.Default a
+ * 4-core CI runner has only 4 threads, the spinners would hold all of them, and the caller's
+ * cancellation (which delivers the aborts) could not run until they gave up.
  */
 class FetchFirstOkStopWorkersTest {
     private class Round {
@@ -28,6 +33,7 @@ class FetchFirstOkStopWorkersTest {
             val deadline = System.nanoTime() + 3_000_000_000L
             try {
                 while (!race.aborted) {
+                    Thread.onSpinWait()
                     if (System.nanoTime() > deadline) {
                         timedOut.incrementAndGet()
                         return
@@ -44,7 +50,7 @@ class FetchFirstOkStopWorkersTest {
 
     @Test
     fun everyLoserIsAbortedWhenAWorkerWins() =
-        runBlocking(Dispatchers.Default) {
+        runOnPool {
             repeat(ROUNDS) { round ->
                 val r = Round()
                 val winner = (round % 5) + 3
@@ -62,7 +68,7 @@ class FetchFirstOkStopWorkersTest {
                                 }
                             }
                         },
-                        concurrency = 4,
+                        concurrency = CONCURRENCY,
                     )
                 assertEquals(winner, result)
                 r.awaitSettled()
@@ -72,7 +78,7 @@ class FetchFirstOkStopWorkersTest {
 
     @Test
     fun everyWorkerIsAbortedWhenTheCallerIsCancelled() =
-        runBlocking(Dispatchers.Default) {
+        runOnPool {
             repeat(ROUNDS) { round ->
                 val r = Round()
                 val call =
@@ -85,7 +91,7 @@ class FetchFirstOkStopWorkersTest {
                                 r.spinUntilAborted(race)
                                 -1
                             },
-                            concurrency = 4,
+                            concurrency = CONCURRENCY,
                         )
                     }
                 while (r.races.isEmpty()) delay(1)
@@ -95,7 +101,18 @@ class FetchFirstOkStopWorkersTest {
             }
         }
 
+    private fun runOnPool(block: suspend kotlinx.coroutines.CoroutineScope.() -> Unit) {
+        val pool = Executors.newFixedThreadPool(POOL_THREADS)
+        try {
+            runBlocking(pool.asCoroutineDispatcher(), block)
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
     private companion object {
         const val ROUNDS = 200
+        const val CONCURRENCY = 4
+        const val POOL_THREADS = CONCURRENCY * 2 + 2
     }
 }

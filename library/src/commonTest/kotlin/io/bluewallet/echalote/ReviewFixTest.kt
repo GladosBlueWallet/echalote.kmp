@@ -44,7 +44,7 @@ class ReviewFixTest {
 
     @Test
     fun expiredCachedConsensusIsRefetched() =
-        runTest {
+        runTest(timeout = RSA_TEST_TIMEOUT) {
             var calls = 0
             val engine =
                 HttpEngine { _, url, _, _, _, _ ->
