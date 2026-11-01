@@ -1,0 +1,75 @@
+name: Live Tor
+
+# Builds a real Tor circuit (meek bootstrap, consensus, microdescriptors, 3-hop exit)
+# and fetches https://api.rocketx.exchange/v1/configs through it. Catches breakage from
+# changes on the live Tor network (e.g. directory format changes) as well as code regressions.
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-tor-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  live-tor:
+    name: Live Tor
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Compile tests
+        run: ./gradlew :echalote:jvmTestClasses --no-daemon
+      - name: Live Tor test (one retry on failure)
+        env:
+          # Only the Tor check; the direct-TLS checks (ECHALOTE_LIVE_TLS) depend on badssl.com.
+          ECHALOTE_LIVE_TOR: "1"
+        run: |
+          set -u
+          test_filter='io.bluewallet.echalote.LiveTlsSmokeTest.live_tor_rocketx_fetchVerifies'
+          results=library/build/test-results/jvmTest
+          for attempt in 1 2; do
+            echo "::group::Live Tor attempt $attempt"
+            rm -rf "$results"
+            rc=0
+            # --rerun + --no-build-cache: never reuse a cached (possibly skipped) result.
+            ./gradlew :echalote:jvmTest --tests "$test_filter" --rerun --no-build-cache --no-daemon || rc=$?
+            echo "::endgroup::"
+            # The test returns early when the env flag is missing; require proof it really ran.
+            if [ "$rc" -eq 0 ] && grep -rqs --include='*.xml' 'live tor api.rocketx.exchange -> status=' "$results"; then
+              grep -rhos --include='*.xml' 'live tor api.rocketx.exchange -> status=[^<]*' "$results"
+              exit 0
+            fi
+            if [ "$rc" -eq 0 ]; then
+              echo "::error::Live Tor test reported success but did not execute (no output in $results)"
+              exit 1
+            fi
+            echo "::warning::Live Tor attempt $attempt failed (exit $rc)"
+          done
+          exit 1
+      - name: Upload test report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-tor-report
+          path: |
+            library/build/reports/tests/jvmTest
+            library/build/test-results/jvmTest
+          if-no-files-found: ignore
