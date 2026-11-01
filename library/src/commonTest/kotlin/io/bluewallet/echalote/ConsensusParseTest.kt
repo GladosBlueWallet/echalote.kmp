@@ -55,6 +55,33 @@ directory-footer
     }
 
     @Test
+    fun parsesMicrodescWithBareOnionKeyLineAndNoRsaBlock() {
+        // Tor 0.4.9 (consensus method 35+) dropped the TAP RSA key: the microdesc keeps a bare
+        // "onion-key" keyword with no PEM block. Captured live from an authority on 2026-11-01.
+        val text =
+            "onion-key\n" +
+                "ntor-onion-key X7YZqw/siNLkQs0smNCoW3Dmwfq0V8JhHiQGlH6gggw\n" +
+                "family-ids ed25519:ri96phwtVtkwug/HYkK4RdIWGbb5la+8x/Y1TkJdhgs\n" +
+                "id ed25519 9Y3x4oH+FcD9LagMr9Hs9pj6kcIVEgCkK31sWnrEKaE\n"
+        val bodies = ConsensusParser.parseMicrodescOrThrow(text)
+        assertEquals(1, bodies.size)
+        val body = bodies.first()
+        assertEquals("", body.onionKey)
+        assertEquals("X7YZqw/siNLkQs0smNCoW3Dmwfq0V8JhHiQGlH6gggw", body.ntorOnionKey)
+        assertEquals("9Y3x4oH+FcD9LagMr9Hs9pj6kcIVEgCkK31sWnrEKaE", body.idEd25519)
+    }
+
+    @Test
+    fun parsesMicrodescWithNoOnionKeyLineAtAll() {
+        val text =
+            "ntor-onion-key O6++9mha1w0W7sAP5eh1DNkDQA9SQDZaquhXhMZ/4xg\n" +
+                "id ed25519 OlsLgK9x92HFLUuPRUxV/NpmkvK1+wUDJBAzE5sY7bY\n"
+        val body = ConsensusParser.parseMicrodescOrThrow(text).single()
+        assertEquals("O6++9mha1w0W7sAP5eh1DNkDQA9SQDZaquhXhMZ/4xg", body.ntorOnionKey)
+        assertEquals("OlsLgK9x92HFLUuPRUxV/NpmkvK1+wUDJBAzE5sY7bY", body.idEd25519)
+    }
+
+    @Test
     fun parsesRouterEntriesWithFlagsUsedForPathSelection() {
         val c = ConsensusParser.parseOrThrow(microdescHeads)
         assertEquals(2, c.microdescs.size)

@@ -1,5 +1,7 @@
 # echalote.kmp
 
+[![Live Tor](https://github.com/GladosBlueWallet/echalote.kmp/actions/workflows/live-tor.yml/badge.svg?branch=master)](https://github.com/GladosBlueWallet/echalote.kmp/actions/workflows/live-tor.yml)
+
 Kotlin Multiplatform port of [`@hazae41/echalote`](https://github.com/Overtorment/echalote) (Overtorment fork): a Tor client that bootstraps over **meek** and builds a 3-hop **exit circuit**.
 
 Primary targets are **Android** and **iOS**. JVM and linuxX64 are extra.
