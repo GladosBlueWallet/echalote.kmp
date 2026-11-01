@@ -224,41 +224,69 @@ object ConsensusParser {
         )
     }
 
+    /**
+     * Parses one or more microdescriptor bodies. Each body starts at an `onion-key` line.
+     *
+     * Since Tor 0.4.9 (consensus method 35+) the TAP RSA key is gone: authorities serve a bare
+     * `onion-key` keyword with no PEM block after it, so the block is optional here. A body
+     * with no `onion-key` line at all is also accepted. Only the ntor key and the ed25519 id
+     * are needed to build circuits (CREATE_FAST + EXTEND2/ntor); [MicrodescBody.onionKey] is
+     * empty when the relay no longer publishes an RSA onion key.
+     */
     fun parseMicrodescOrThrow(text: String): List<MicrodescBody> {
-        val lines = text.split("\n")
+        val lines = text.split("\n").map { it.trimEnd('\r') }
         val items = ArrayList<MicrodescBody>()
         var i = 0
+        if (lines.none { it == "onion-key" || it.startsWith("onion-key ") }) {
+            if (lines.any { it.startsWith("ntor-onion-key ") }) {
+                items += readMicrodescBody(lines, 0, onionKey = "").first
+            }
+            return items
+        }
         while (i < lines.size) {
-            if (lines[i] == "onion-key") {
+            if (lines[i] == "onion-key" || lines[i].startsWith("onion-key ")) {
                 i++
-                val onionKey =
-                    readBlock(lines, i, "-----BEGIN RSA PUBLIC KEY-----", "-----END RSA PUBLIC KEY-----")
-                        ?: throw IllegalArgumentException("Missing BEGIN RSA PUBLIC KEY")
-                i = onionKey.second
-                var ntor: String? = null
-                var idEd: String? = null
-                i++
-                while (i < lines.size) {
-                    when {
-                        lines[i] == "onion-key" -> {
-                            i--
-                            break
-                        }
-                        lines[i].startsWith("ntor-onion-key ") -> ntor = lines[i].split(" ").getOrNull(1)
-                        lines[i].startsWith("id ed25519 ") -> idEd = lines[i].split(" ").getOrNull(2)
-                    }
-                    i++
+                var onionKey = ""
+                if (i < lines.size && lines[i] == "-----BEGIN RSA PUBLIC KEY-----") {
+                    val block =
+                        readBlock(lines, i, "-----BEGIN RSA PUBLIC KEY-----", "-----END RSA PUBLIC KEY-----")
+                            ?: throw IllegalArgumentException("Missing BEGIN RSA PUBLIC KEY")
+                    onionKey = block.first
+                    i = block.second + 1
                 }
-                items +=
-                    MicrodescBody(
-                        onionKey = onionKey.first,
-                        ntorOnionKey = ntor ?: throw IllegalArgumentException("Missing ntor-onion-key"),
-                        idEd25519 = idEd ?: throw IllegalArgumentException("Missing id ed25519"),
-                    )
+                val (body, next) = readMicrodescBody(lines, i, onionKey)
+                items += body
+                i = next
+                continue
             }
             i++
         }
         return items
+    }
+
+    /** Reads keyword lines from [start] until the next `onion-key` line; returns the body and that index. */
+    private fun readMicrodescBody(
+        lines: List<String>,
+        start: Int,
+        onionKey: String,
+    ): Pair<MicrodescBody, Int> {
+        var i = start
+        var ntor: String? = null
+        var idEd: String? = null
+        while (i < lines.size) {
+            val line = lines[i]
+            if (line == "onion-key" || line.startsWith("onion-key ")) break
+            when {
+                line.startsWith("ntor-onion-key ") -> ntor = line.split(" ").getOrNull(1)
+                line.startsWith("id ed25519 ") -> idEd = line.split(" ").getOrNull(2)
+            }
+            i++
+        }
+        return MicrodescBody(
+            onionKey = onionKey,
+            ntorOnionKey = ntor ?: throw IllegalArgumentException("Missing ntor-onion-key"),
+            idEd25519 = idEd ?: throw IllegalArgumentException("Missing id ed25519"),
+        ) to i
     }
 
     private fun readBlock(
