@@ -50,7 +50,8 @@ jobs:
             rm -rf "$results"
             rc=0
             # --rerun + --no-build-cache: never reuse a cached (possibly skipped) result.
-            ./gradlew :echalote:jvmTest --tests "$test_filter" --rerun --no-build-cache --no-daemon || rc=$?
+            # Per-attempt timeout: a broken circuit build can hang rather than fail.
+            timeout 360 ./gradlew :echalote:jvmTest --tests "$test_filter" --rerun --no-build-cache --no-daemon || rc=$?
             echo "::endgroup::"
             # The test returns early when the env flag is missing; require proof it really ran.
             if [ "$rc" -eq 0 ] && grep -rqs --include='*.xml' 'live tor api.rocketx.exchange -> status=' "$results"; then
