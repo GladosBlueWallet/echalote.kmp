@@ -121,7 +121,7 @@ private fun CancelHook.http1OverTcp(
  * hook stays registered on the returned fd; the caller releases it.
  */
 @OptIn(ExperimentalForeignApi::class)
-private fun CancelHook.posixConnect(
+internal fun CancelHook.posixConnect(
     host: String,
     port: Int,
     timeoutMs: Long,
@@ -256,7 +256,7 @@ private fun socketError(fd: Int): Int =
         if (rc != 0) posixErrno() else err.value
     }
 
-private fun posixErrno(): Int = errno
+internal fun posixErrno(): Int = errno
 
 @OptIn(ExperimentalForeignApi::class)
 private fun applySocketTimeouts(

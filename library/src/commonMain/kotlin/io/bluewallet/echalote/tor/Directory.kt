@@ -148,11 +148,16 @@ data class ExitDialerOptions(
      * and kept across launches) instead of the meek bridge, falling back to meek if that
      * fails. Much faster, but anyone watching the network sees a Tor connection, and the
      * consensus must be fetched before the first connection. Ignored where there is no
-     * socket support (iOS for now).
+     * socket support (linuxX64 for now); Android, JVM and iOS have it.
      */
     val directGuard: Boolean = false,
     val directConnectTimeoutMs: Long = 5_000,
-    val directHandshakeTimeoutMs: Long = 8_000,
+    /**
+     * Link handshake budget once the guard accepted the TCP connection. Its certificate checks
+     * run in Kotlin and took 7.4-8 s in a debug build in the iOS simulator on CI, so 8 s made
+     * slow devices throw away a working direct connection for the slower meek path.
+     */
+    val directHandshakeTimeoutMs: Long = 15_000,
 ) {
     internal var hooks: ExitDialerHooks = ExitDialerHooks()
 }
@@ -212,12 +217,65 @@ internal fun randomIndex(size: Int): Int {
 private val defaultDialerMutex = Mutex()
 private var defaultDialer: ExitDialer? = null
 
+/** The [ExitDialerOptions.directGuard] value [defaultDialer] was created with. */
+private var defaultDialerDirect = false
+
 internal var directRelayEnabled = false
 
-internal suspend fun defaultExitDialer(): ExitDialer =
-    defaultDialerMutex.withLock {
-        defaultDialer ?: createExitDialer(ExitDialerOptions(directGuard = directRelayEnabled)).also { defaultDialer = it }
-    }
+/** How a Tor connection reached the network: straight to a guard relay, or via the meek bridge. */
+internal enum class TorRoute { DIRECT, MEEK }
+
+/** Route of the most recent successful bootstrap in this process (for tests and diagnostics). */
+internal var lastBootstrapRoute: TorRoute? = null
+
+/** "nickname host:orport" of the guard the most recent direct bootstrap connected to. */
+internal var lastDirectGuard: String? = null
+
+/**
+ * The shared dialer behind [Echalote.fetch]. If [directRelayEnabled] no longer matches the mode
+ * the current dialer was built with, it is replaced (and the old one disposed), so a mode change
+ * made without [setDefaultDirectRelay] still applies to the next new connection.
+ */
+internal suspend fun defaultExitDialer(): ExitDialer {
+    var stale: ExitDialer? = null
+    val dialer =
+        defaultDialerMutex.withLock {
+            val current = defaultDialer
+            val wanted = directRelayEnabled
+            if (current != null && defaultDialerDirect == wanted) {
+                current
+            } else {
+                stale = current
+                createExitDialer(ExitDialerOptions(directGuard = wanted)).also {
+                    defaultDialer = it
+                    defaultDialerDirect = wanted
+                }
+            }
+        }
+    stale?.dispose()
+    return dialer
+}
+
+/** The default dialer's mode, or null if none exists yet (for tests). */
+internal suspend fun defaultDialerDirectMode(): Boolean? = defaultDialerMutex.withLock { defaultDialer?.let { defaultDialerDirect } }
+
+/**
+ * Switches direct relay mode for the default client and, if that changes the mode in use,
+ * drops the current Tor connection and kept-alive HTTPS sessions so the very next request
+ * reconnects the new way. Requests in flight on the old connection fail and are retried by
+ * [httpsFetch] on a fresh one; nothing keeps using the old route afterwards.
+ */
+internal suspend fun setDefaultDirectRelay(enabled: Boolean) {
+    val old =
+        defaultDialerMutex.withLock {
+            val modeChanged = directRelayEnabled != enabled || (defaultDialer != null && defaultDialerDirect != enabled)
+            directRelayEnabled = enabled
+            if (!modeChanged) return
+            defaultDialer.also { defaultDialer = null }
+        }
+    resetHttpsSessions()
+    old?.dispose()
+}
 
 internal suspend fun resetDefaultExitDialer() {
     resetHttpsSessions()
@@ -721,6 +779,7 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
                 withAbortTimeout(options.directHandshakeTimeoutMs, signal) { client.waitOrThrow(it) }
             }
             installClient(client)
+            lastDirectGuard = "${guard.nickname} ${guard.hostname}:${guard.orport}"
             return true
         } catch (err: Throwable) {
             socket.close()
@@ -752,6 +811,7 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
                     false
                 }
             if (direct) {
+                lastBootstrapRoute = TorRoute.DIRECT
                 progress?.report(FetchStage.CONNECTING, 1.0)
                 return@async
             }
@@ -787,6 +847,7 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
             timed("tor", "tor-handshake") { client.waitOrThrow(signal) }
             progress?.report(FetchStage.CONNECTING, 1.0)
             installClient(client)
+            lastBootstrapRoute = TorRoute.MEEK
         } catch (err: Throwable) {
             try {
                 meek.error(err)
@@ -1249,14 +1310,31 @@ object Echalote {
 
     /**
      * Opt-in direct relay mode for the default client ([ExitDialerOptions.directGuard]):
-     * connects straight to a guard relay, falling back to meek. Takes effect for the next
-     * connection; set it at startup.
+     * connects straight to a guard relay, falling back to meek. Setting this only affects
+     * connections opened afterwards; an already-open Tor connection and its kept-alive HTTPS
+     * sessions keep their route. To switch at runtime use [setDirectRelay], which applies the
+     * change to the very next request in both directions.
      */
     var directRelay: Boolean
         get() = directRelayEnabled
         set(value) {
             directRelayEnabled = value
         }
+
+    /**
+     * Turns direct relay mode on or off and applies it immediately: if the mode in use changes,
+     * the current Tor connection and kept-alive HTTPS sessions are closed, so the next request
+     * reconnects the new way (in-flight requests are retried on a fresh connection). Calling it
+     * with the current mode does nothing.
+     */
+    suspend fun setDirectRelay(enabled: Boolean) = setDefaultDirectRelay(enabled)
+
+    /**
+     * Closes the default client's Tor connection, circuits and kept-alive HTTPS sessions. The
+     * next request bootstraps again with the current settings. Requests in flight fail and are
+     * retried once by [fetch] on the fresh connection.
+     */
+    suspend fun resetConnections() = resetDefaultExitDialer()
 
     /** Prints a `echalote.mark.trace` line with [label], to delimit runs in a trace. */
     fun traceMark(label: String) = println("echalote.mark.trace t=${traceNow()} ev=$label")

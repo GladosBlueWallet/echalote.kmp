@@ -107,3 +107,28 @@ mavenPublishing {
         }
     }
 }
+
+// Live network tests are gated on ECHALOTE_LIVE_* variables. JVM tests inherit the Gradle
+// environment, but iOS simulator tests run via `xcrun simctl spawn`, which only passes on
+// variables named SIMCTL_CHILD_<name> (with the prefix stripped). Forward the flags explicitly
+// to every Kotlin/Native test task so `ECHALOTE_LIVE_DIRECT=1 ./gradlew iosSimulatorArm64Test`
+// just works.
+val liveTestFlags = listOf("ECHALOTE_LIVE_TOR", "ECHALOTE_LIVE_DIRECT", "ECHALOTE_LIVE_TLS")
+tasks.withType<org.jetbrains.kotlin.gradle.targets.native.tasks.KotlinNativeTest>().configureEach {
+    for (name in liveTestFlags) {
+        val value = providers.environmentVariable(name).orNull ?: continue
+        environment(name, value)
+        environment("SIMCTL_CHILD_$name", value)
+        inputs.property(name, value)
+    }
+}
+
+// Kotlin/Native runs simulator tests with `simctl spawn --standalone`, which does not start the
+// device's trustd, so SecTrust (HTTPS certificate checks) fails with errSecInternal (-26276).
+// Live tests set ECHALOTE_IOS_SIMULATOR to the UDID of an already booted simulator to run there.
+providers.environmentVariable("ECHALOTE_IOS_SIMULATOR").orNull?.let { udid ->
+    tasks.withType<org.jetbrains.kotlin.gradle.targets.native.tasks.KotlinNativeSimulatorTest>().configureEach {
+        device.set(udid)
+        standalone.set(false)
+    }
+}

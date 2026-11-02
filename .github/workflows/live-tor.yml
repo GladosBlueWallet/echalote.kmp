@@ -3,6 +3,9 @@ name: Live Tor
 # Builds a real Tor circuit (meek bootstrap, consensus, microdescriptors, 3-hop exit)
 # and fetches https://api.rocketx.exchange/v1/configs through it. Catches breakage from
 # changes on the live Tor network (e.g. directory format changes) as well as code regressions.
+# "Live Tor direct" jobs run direct relay mode (TCP straight to a guard's ORPort, no meek bridge)
+# on the JVM (ubuntu) and in the iOS simulator (macOS), asserting the circuit really went direct
+# rather than falling back to meek.
 
 on:
   pull_request:
@@ -73,4 +76,136 @@ jobs:
           path: |
             library/build/reports/tests/jvmTest
             library/build/test-results/jvmTest
+          if-no-files-found: ignore
+
+  live-direct-jvm:
+    name: Live Tor direct
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Compile tests
+        run: ./gradlew :echalote:jvmTestClasses --no-daemon
+      - name: Live direct-mode test (one retry on failure)
+        env:
+          ECHALOTE_LIVE_DIRECT: "1"
+        run: |
+          set -u
+          test_filter='io.bluewallet.echalote.LiveDirectTorTest'
+          results=library/build/test-results/jvmTest
+          marker='live direct tor api.rocketx.exchange -> route=DIRECT'
+          for attempt in 1 2; do
+            echo "::group::Live direct attempt $attempt"
+            rm -rf "$results"
+            rc=0
+            timeout 360 ./gradlew :echalote:jvmTest --tests "$test_filter" --rerun --no-build-cache --no-daemon || rc=$?
+            echo "::endgroup::"
+            if [ "$rc" -eq 0 ] && grep -rqsF --include='*.xml' "$marker" "$results"; then
+              grep -rhos --include='*.xml' 'live direct[-a-z]* tor api.rocketx.exchange -> [^<]*' "$results"
+              exit 0
+            fi
+            if [ "$rc" -eq 0 ]; then
+              echo "::error::Live direct test reported success but did not execute (no output in $results)"
+              exit 1
+            fi
+            echo "::warning::Live direct attempt $attempt failed (exit $rc)"
+          done
+          exit 1
+      - name: Upload test report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-direct-jvm-report
+          path: |
+            library/build/reports/tests/jvmTest
+            library/build/test-results/jvmTest
+          if-no-files-found: ignore
+
+  live-direct-ios:
+    name: Live Tor direct (iOS simulator)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.konan
+          key: ${{ runner.os }}-konan-${{ hashFiles('**/gradle/libs.versions.toml', '**/gradle-wrapper.properties') }}
+      - name: Build iOS simulator test binary
+        run: ./gradlew :echalote:linkDebugTestIosSimulatorArm64 --no-daemon
+      - name: Boot an iPhone simulator
+        # A booted device runs trustd, which SecTrust needs for HTTPS certificate checks.
+        run: |
+          udid=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          for runtime in sorted((r for r in devices if ".iOS-" in r), reverse=True):
+              for d in devices[runtime]:
+                  if d["name"].startswith("iPhone"):
+                      print(d["udid"]); sys.exit(0)
+          sys.exit("no iPhone simulator available")
+          ')
+          xcrun simctl bootstatus "$udid" -b
+          echo "ECHALOTE_IOS_SIMULATOR=$udid" >> "$GITHUB_ENV"
+      - name: Live direct-mode test in the iOS simulator (one retry on failure)
+        env:
+          # library/build.gradle.kts forwards this to the simulator as SIMCTL_CHILD_ECHALOTE_LIVE_DIRECT.
+          ECHALOTE_LIVE_DIRECT: "1"
+          SIMCTL_CHILD_ECHALOTE_LIVE_DIRECT: "1"
+        run: |
+          set -u
+          test_filter='io.bluewallet.echalote.LiveDirectTorTest'
+          results=library/build/test-results/iosSimulatorArm64Test
+          marker='live direct tor api.rocketx.exchange -> route=DIRECT'
+          for attempt in 1 2; do
+            echo "::group::Live direct (iOS) attempt $attempt"
+            rm -rf "$results"
+            rc=0
+            # perl alarm: macOS has no coreutils timeout.
+            # The runner's bash uses -e and pipefail; capture Gradle's own exit code instead.
+            set +e
+            perl -e 'alarm shift; exec @ARGV' 600 ./gradlew :echalote:iosSimulatorArm64Test --tests "$test_filter" --rerun --no-build-cache --no-daemon 2>&1 | tee gradle-live.log
+            rc=${PIPESTATUS[0]}
+            set -e
+            echo "::endgroup::"
+            # The test returns early when the env flag is missing; require proof it really ran
+            # in direct mode (the marker is printed only after route=DIRECT was recorded).
+            if [ "$rc" -eq 0 ] && { grep -rqsF --include='*.xml' "$marker" "$results" || grep -qF "$marker" gradle-live.log; }; then
+              { grep -rhos --include='*.xml' 'live direct[-a-z]* tor api.rocketx.exchange -> [^<]*' "$results"; grep -hoE 'live direct[-a-z]* tor api.rocketx.exchange -> .*|stage=direct-[a-z]+ .*' gradle-live.log; } | sort -u
+              exit 0
+            fi
+            if [ "$rc" -eq 0 ]; then
+              echo "::error::Live direct test reported success but did not execute (no marker in $results or the Gradle log)"
+              exit 1
+            fi
+            echo "::warning::Live direct (iOS) attempt $attempt failed (exit $rc)"
+          done
+          exit 1
+      - name: Upload test report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-direct-ios-report
+          path: |
+            gradle-live.log
+            library/build/reports/tests/iosSimulatorArm64Test
+            library/build/test-results/iosSimulatorArm64Test
           if-no-files-found: ignore
