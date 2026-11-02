@@ -1,5 +1,10 @@
 package io.bluewallet.echalote
 
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.selects.select
+
 open class Circuit(
     val id: Int,
 ) {
@@ -109,8 +114,28 @@ internal class SecretCircuit(
         val reqBytes = ByteArray(request.size())
         request.write(Cursor(reqBytes))
         val extend = extend2Payload(2, links, reqBytes)
-        tor.sendRelay(this, RelayCmd.EXTEND2, 0, extend, early = true)
-        val respBytes = tor.relayExtended2.wait(abort) { it.first === this }.second
+        // A DESTROY or RELAY_TRUNCATED answering this EXTEND2 fails it now instead of after
+        // the caller's extend timeout (seen live: a 15s stall after an immediate DESTROY).
+        val refused = CompletableDeferred<Throwable>()
+        val offDestroyed = tor.destroyed.on { (c, reason) -> if (c === this) refused.complete(DestroyedError(reason)) }
+        val offTruncated = tor.relayTruncated.on { (c, reason) -> if (c === this) refused.complete(DestroyedError(reason)) }
+        val respBytes =
+            try {
+                coroutineScope {
+                    val extended = async { tor.relayExtended2.wait(abort) { it.first === this@SecretCircuit }.second }
+                    tor.sendRelay(this@SecretCircuit, RelayCmd.EXTEND2, 0, extend, early = true)
+                    select {
+                        extended.onAwait { it }
+                        refused.onAwait { err ->
+                            extended.cancel()
+                            throw err
+                        }
+                    }
+                }
+            } finally {
+                offDestroyed()
+                offTruncated()
+            }
         val response = NtorResponse.read(Cursor(respBytes))
         val sharedXy = X25519.scalarMult(secret, response.publicY)
         val sharedXb = X25519.scalarMult(secret, ntorKey)

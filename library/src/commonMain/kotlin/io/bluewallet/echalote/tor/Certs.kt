@@ -5,7 +5,18 @@ internal class RsaCert(
     val data: ByteArray,
     val x509: X509Certificate,
 ) {
-    fun sha1OrThrow(): ByteArray = Sha1.hash(x509.spkiDer)
+    /**
+     * The relay's RSA identity digest as Tor defines it (and the consensus lists it): SHA-1 of
+     * the DER PKCS#1 RSAPublicKey, i.e. the BIT STRING inside the SubjectPublicKeyInfo, not of
+     * the whole SPKI.
+     */
+    fun sha1OrThrow(): ByteArray =
+        Sha1.hash(
+            Der
+                .parse(x509.spkiDer)
+                .asSequence()[1]
+                .asBitStringBytes(),
+        )
 
     fun verifyOrThrow(): Boolean {
         x509.checkValidity()

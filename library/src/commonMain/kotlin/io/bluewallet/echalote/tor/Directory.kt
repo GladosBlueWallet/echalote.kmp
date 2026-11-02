@@ -33,10 +33,15 @@ class BatchedFetchStream(
     private val job = kotlinx.coroutines.SupervisorJob()
     private val scope = kotlinx.coroutines.CoroutineScope(job + kotlinx.coroutines.Dispatchers.Default)
     private var started = false
+    private var posts = 0
+    private var pendingSince: TimeMark? = null
 
     init {
         duplex.onWrite = { bytes ->
-            mutex.withLock { chunks += bytes.copyOf() }
+            mutex.withLock {
+                if (chunks.isEmpty()) pendingSince = timeMark()
+                chunks += bytes.copyOf()
+            }
             data.trySend(Unit)
         }
         duplex.onClose = {
@@ -70,6 +75,11 @@ class BatchedFetchStream(
                     continue
                 }
                 val startedAt = currentEpochMillis()
+                val postMark = timeMark()
+                val seq = ++posts
+                val queuedMs = pendingSince?.elapsedNow()?.msText() ?: "-"
+                pendingSince = null
+                trace("meek", "post-start") { "seq=$seq up=${body.size} queued=$queuedMs" }
                 val res =
                     engine.call(
                         "POST",
@@ -78,6 +88,9 @@ class BatchedFetchStream(
                         body = body,
                         timeoutMs = 30_000,
                     )
+                trace("meek", "post-done") {
+                    "seq=$seq up=${body.size} down=${res.body.size} ms=${postMark.elapsedNow().msText()} status=${res.status}"
+                }
                 if (res.status !in 200..299) {
                     error(Exception("meek HTTP ${res.status}"))
                     return
@@ -124,6 +137,22 @@ data class ExitDialerOptions(
     val circuitRace: Int = 2,
     val http: HttpEngine? = null,
     val maxCircuitAgeMs: Long = 0,
+    /**
+     * Starts the consensus download (or disk-cache load) as soon as the bridge handshake
+     * starts, instead of after the first CREATE_FAST. The circuit build joins the same
+     * single-flight fetch, so this only overlaps the two; it never downloads twice.
+     */
+    val prefetchConsensus: Boolean = true,
+    /**
+     * Opt-in: connect straight to a guard relay's ORPort (picked from the verified consensus
+     * and kept across launches) instead of the meek bridge, falling back to meek if that
+     * fails. Much faster, but anyone watching the network sees a Tor connection, and the
+     * consensus must be fetched before the first connection. Ignored where there is no
+     * socket support (iOS for now).
+     */
+    val directGuard: Boolean = false,
+    val directConnectTimeoutMs: Long = 5_000,
+    val directHandshakeTimeoutMs: Long = 8_000,
 ) {
     internal var hooks: ExitDialerHooks = ExitDialerHooks()
 }
@@ -183,9 +212,11 @@ internal fun randomIndex(size: Int): Int {
 private val defaultDialerMutex = Mutex()
 private var defaultDialer: ExitDialer? = null
 
+internal var directRelayEnabled = false
+
 internal suspend fun defaultExitDialer(): ExitDialer =
     defaultDialerMutex.withLock {
-        defaultDialer ?: createExitDialer().also { defaultDialer = it }
+        defaultDialer ?: createExitDialer(ExitDialerOptions(directGuard = directRelayEnabled)).also { defaultDialer = it }
     }
 
 internal suspend fun resetDefaultExitDialer() {
@@ -210,6 +241,19 @@ interface ExitDialer {
         abort: Abort? = null,
         onProgress: FetchProgressListener? = null,
     ): TorStreamDuplex
+
+    /**
+     * Like [dial], but returns as soon as RELAY_BEGIN is queued instead of waiting for
+     * RELAY_CONNECTED ("optimistic data", as Tor's own client does for exits). Bytes written
+     * right away travel in the same round trip as BEGIN; the exit buffers them until it has
+     * connected. If the exit refuses, the stream fails with the relay's END reason on the first
+     * read instead of here, so callers must treat a read failure like a failed open.
+     */
+    suspend fun dialOptimistic(
+        host: String,
+        port: Int,
+        abort: Abort? = null,
+    ): TorStreamDuplex = dial(host, port, abort)
 
     suspend fun dispose()
 
@@ -491,13 +535,18 @@ val AUTHORITY_HOSTS =
         "216.218.219.41:80",
     )
 
-val CONSENSUS_MIRRORS = AUTHORITY_HOSTS.map { "http://$it/tor/status-vote/current/consensus-microdesc" }
+/**
+ * `.z` asks the authority for the zlib-compressed document (~0.8 MB instead of ~3.4 MB); the
+ * body is inflated in [downloadVerifiedConsensus] (or already by the platform HTTP stack).
+ */
+val CONSENSUS_MIRRORS = AUTHORITY_HOSTS.map { "http://$it/tor/status-vote/current/consensus-microdesc.z" }
 
 internal var cachedConsensus: Pair<Long, Consensus>? = null
 internal const val CONSENSUS_CACHE_MS = 30 * 60 * 1000L
 
 internal fun resetCachedConsensus() {
     cachedConsensus = null
+    resetDiskConsensusState()
 }
 
 fun sha256Base64Unpadded(bytes: ByteArray): String = Base64.encodeUnpadded(Sha256.hash(bytes))
@@ -572,6 +621,7 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
     val retrying = HashSet<CompletableDeferred<Circuit>>()
     var tor: TorClientDuplex? = null
     var meekStream: BatchedFetchStream? = null
+    var directSocket: ByteDuplex? = null
     var ready: kotlinx.coroutines.Deferred<Unit>? = null
     var disposed = false
 
@@ -585,6 +635,8 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
             torLock.withLock {
                 if (only != null && tor !== only) return@withLock null
                 val pair = tor to meekStream
+                directSocket?.close()
+                directSocket = null
                 tor = null
                 meekStream = null
                 ready = null
@@ -631,11 +683,88 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
         return Exception("tor $stage: ${err.message ?: err}$causeMsg", err)
     }
 
+    suspend fun installClient(client: TorClientDuplex) {
+        val installed =
+            torLock.withLock {
+                if (client.closed == null && tor == null) {
+                    tor = client
+                    true
+                } else {
+                    tor != null
+                }
+            }
+        check(installed) { "tor connection closed" }
+    }
+
+    /** Direct ORPort bootstrap; false when the platform has no sockets. Throws on failure. */
+    suspend fun bootDirect(signal: Abort): Boolean {
+        val consensus = timed("tor", "direct-consensus") { fetchMicrodescConsensus(signal, engine = engine) }
+        val guard = pickDirectGuard(consensus)
+        val socket =
+            timed("tor", "direct-connect", { "guard=${guard.nickname} addr=${guard.hostname}:${guard.orport}" }) {
+                withAbortTimeout(options.directConnectTimeoutMs, signal) {
+                    platformTcpConnect(guard.hostname, guard.orport, options.directConnectTimeoutMs)
+                }
+            } ?: return false
+        val client = TorClientDuplex(Base64.decode(guard.identity))
+        directSocket = socket
+        try {
+            scope.launch {
+                pipeDuplex(socket, client.inner)
+                if (tor === client) resetTor(client)
+            }
+            scope.launch {
+                pipeDuplex(client.inner, socket)
+                if (tor === client) resetTor(client)
+            }
+            timed("tor", "direct-handshake") {
+                withAbortTimeout(options.directHandshakeTimeoutMs, signal) { client.waitOrThrow(it) }
+            }
+            installClient(client)
+            return true
+        } catch (err: Throwable) {
+            socket.close()
+            try {
+                client.close()
+            } catch (_: Throwable) {
+            }
+            if (directSocket === socket) directSocket = null
+            // Pick another guard next time rather than retrying a dead one forever.
+            forgetDirectGuard()
+            throw err
+        }
+    }
+
     fun beginBootstrap(
         signal: Abort,
         progress: FetchProgressReporter?,
     ) = scope.async {
         progress?.report(FetchStage.CONNECTING)
+        if (options.directGuard && hooks.makeCircuit == null) {
+            val direct =
+                try {
+                    bootDirect(signal)
+                } catch (err: CancellationException) {
+                    throw err
+                } catch (err: Throwable) {
+                    if (signal.aborted) throw wrap("bootstrap", err)
+                    println("echalote.direct failed, falling back to meek: ${err.message}")
+                    false
+                }
+            if (direct) {
+                progress?.report(FetchStage.CONNECTING, 1.0)
+                return@async
+            }
+        }
+        if (options.prefetchConsensus && hooks.makeCircuit == null) {
+            scope.launch {
+                try {
+                    timed("tor", "consensus-prefetch") { fetchMicrodescConsensus(engine = engine) }
+                } catch (err: Throwable) {
+                    println("echalote.consensus prefetch failed: ${err.message}")
+                }
+            }
+        }
         val meek = createMeekStream(options.meekUrl, engine)
         val client = TorClientDuplex()
         meekStream = meek
@@ -657,16 +786,7 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
             timed("tor", "meek-start") { meek.start() }
             timed("tor", "tor-handshake") { client.waitOrThrow(signal) }
             progress?.report(FetchStage.CONNECTING, 1.0)
-            val installed =
-                torLock.withLock {
-                    if (client.closed == null && tor == null) {
-                        tor = client
-                        true
-                    } else {
-                        tor != null
-                    }
-                }
-            check(installed) { "tor connection closed" }
+            installClient(client)
         } catch (err: Throwable) {
             try {
                 meek.error(err)
@@ -749,7 +869,19 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
             return hooked
         }
         var client: TorClientDuplex? = null
-        while (client == null) client = bootClient(signal, progress)
+        var failures = 0
+        while (client == null) {
+            client =
+                try {
+                    bootClient(signal, progress)
+                } catch (err: Throwable) {
+                    // A meek front answers 502 now and then (seen in ~1 of 20 live runs); one
+                    // fresh session usually works, so retry the bootstrap once.
+                    if (err is CancellationException || signal.aborted || ++failures > 1) throw err
+                    println("echalote.bootstrap retry after: ${err.message}")
+                    null
+                }
+        }
         return client
     }
 
@@ -887,6 +1019,22 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
             abort: Abort?,
             onProgress: FetchProgressListener?,
         ): TorStreamDuplex {
+            return openStream(host, port, abort, onProgress, wait = true)
+        }
+
+        override suspend fun dialOptimistic(
+            host: String,
+            port: Int,
+            abort: Abort?,
+        ): TorStreamDuplex = openStream(host, port, abort, null, wait = false)
+
+        suspend fun openStream(
+            host: String,
+            port: Int,
+            abort: Abort?,
+            onProgress: FetchProgressListener?,
+            wait: Boolean,
+        ): TorStreamDuplex {
             suspend fun open(): TorStreamDuplex {
                 if (disposed) throw Exception("exit dialer disposed")
                 val signal = abort ?: Abort()
@@ -905,9 +1053,9 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
                     )
                     try {
                         val stream =
-                            timed("tor", "stream-open", { "circ=${circuit.id}" }) {
+                            timed("tor", "stream-open", { "circ=${circuit.id} wait=$wait" }) {
                                 withAbortTimeout(options.openTimeoutMs, signal) { linked ->
-                                    circuit.openOrThrow(host, port, wait = true, abort = linked)
+                                    circuit.openOrThrow(host, port, wait = wait, abort = linked)
                                 }
                             }
                         progress?.report(FetchStage.OPENING_CONNECTION, 0.5)
@@ -944,6 +1092,43 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
             job.cancel()
         }
     }
+}
+
+internal const val DIRECT_GUARD_KEY = "direct-guard"
+
+internal fun isDirectGuardCandidate(head: MicrodescHead): Boolean {
+    val f = head.flags
+    return "Guard" in f && "Fast" in f && "Stable" in f && "Running" in f && "Valid" in f &&
+        "Exit" !in f && head.orport > 0
+}
+
+/**
+ * The guard for direct mode: the one saved earlier if the consensus still lists it as a
+ * guard, else a bandwidth-weighted pick that is then saved, so one device keeps using the
+ * same entry relay (as Tor itself does) instead of meeting a new one every launch.
+ */
+internal suspend fun pickDirectGuard(consensus: Consensus): MicrodescHead {
+    val pool = consensus.microdescs.filter(::isDirectGuardCandidate)
+    if (pool.isEmpty()) throw Exception("tor consensus has no usable guards")
+    val saved = runCatching { torDirCache.read(DIRECT_GUARD_KEY)?.decodeToString() }.getOrNull()
+    pool.firstOrNull { it.identity == saved }?.let { return it }
+    val weights = pool.map { (it.bandwidth["Bandwidth"]?.toLongOrNull() ?: 0L).coerceAtLeast(1L) }
+    val total = weights.sum()
+    var r = (randomIndex(Int.MAX_VALUE).toLong() * total) / Int.MAX_VALUE
+    var pick = pool.last()
+    for ((i, w) in weights.withIndex()) {
+        if (r < w) {
+            pick = pool[i]
+            break
+        }
+        r -= w
+    }
+    runCatching { torDirCache.write(DIRECT_GUARD_KEY, pick.identity.encodeToByteArray()) }
+    return pick
+}
+
+internal suspend fun forgetDirectGuard() {
+    runCatching { torDirCache.delete(DIRECT_GUARD_KEY) }
 }
 
 internal suspend fun pickExtendable(
@@ -1038,6 +1223,41 @@ internal suspend fun buildExitCircuitOnce(
 object Echalote {
     const val DEFAULT_MEEK_URL = io.bluewallet.echalote.DEFAULT_MEEK_URL
 
+    /**
+     * Persistent cache for the consensus and authority certificates, shared by every client in
+     * this process. Defaults to [TorDirCache.None]. Set it once at startup, before the first
+     * fetch; cached documents are always re-verified before use.
+     */
+    var dirCache: TorDirCache
+        get() = torDirCache
+        set(value) {
+            torDirCache = value
+        }
+
+    /**
+     * Prints one timestamped `echalote.*.trace` line per meek POST, Tor cell and TLS flight.
+     * Off by default; meant for diagnosing where a slow start spends its time.
+     */
+    var verboseTrace: Boolean
+        get() = io.bluewallet.echalote.verboseTrace
+        set(value) {
+            io.bluewallet.echalote.verboseTrace = value
+        }
+
+    /**
+     * Opt-in direct relay mode for the default client ([ExitDialerOptions.directGuard]):
+     * connects straight to a guard relay, falling back to meek. Takes effect for the next
+     * connection; set it at startup.
+     */
+    var directRelay: Boolean
+        get() = directRelayEnabled
+        set(value) {
+            directRelayEnabled = value
+        }
+
+    /** Prints a `echalote.mark.trace` line with [label], to delimit runs in a trace. */
+    fun traceMark(label: String) = println("echalote.mark.trace t=${traceNow()} ev=$label")
+
     fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()) = io.bluewallet.echalote.createExitDialer(options)
 
     suspend fun dial(
@@ -1077,6 +1297,12 @@ object Echalote {
         body: ByteArray = ByteArray(0),
         onProgress: FetchProgressListener? = null,
     ) = io.bluewallet.echalote.httpsFetch(url, abort, method, headers, body, onProgress)
+
+    /** See [io.bluewallet.echalote.warmUpHttps]: pre-opens Tor, the exit circuit and TLS for [url]. */
+    suspend fun warmUp(
+        url: String,
+        abort: Abort? = null,
+    ) = io.bluewallet.echalote.warmUpHttps(url, abort)
 
     suspend fun wrapTls(
         transport: ByteDuplex,

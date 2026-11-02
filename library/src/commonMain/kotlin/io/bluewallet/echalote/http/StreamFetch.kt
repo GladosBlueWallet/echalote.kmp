@@ -1,6 +1,9 @@
 package io.bluewallet.echalote
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -87,7 +90,9 @@ suspend fun streamFetch(
         headers["User-Agent"] = TOR_BROWSER_USER_AGENT
     }
     if (init.headers.keys.none { it.equals("Accept-Encoding", true) }) {
-        headers["Accept-Encoding"] = "identity"
+        // Compressed bodies cut the bytes pulled through meek ~7x for JSON APIs (each meek
+        // round trip costs 50ms-1s), and finishResponse decodes both.
+        headers["Accept-Encoding"] = "gzip, deflate"
     }
     headers.putAll(init.headers)
     val method = init.method.ifBlank { "GET" }
@@ -129,6 +134,22 @@ internal var httpsSessionFactory: (suspend (String, Int, Abort?) -> HttpsSession
 
 private val httpsLock = Mutex()
 private val httpsSessions = LinkedHashMap<Pair<String, Int>, HttpsSession>()
+private val httpsOpening = HashMap<Pair<String, Int>, CompletableDeferred<HttpsSession>>()
+
+/**
+ * Opens the kept-alive HTTPS session [httpsFetch] would use for [url] (Tor bootstrap, exit
+ * circuit, stream and TLS) without sending a request, so the first real fetch only pays for
+ * its own request. A fetch that starts while this runs joins it instead of opening another.
+ */
+suspend fun warmUpHttps(
+    url: String,
+    abort: Abort? = null,
+) {
+    val parsed = parseUrl(url)
+    timed("tor", "warm-up", { "host=${parsed.host}" }) {
+        obtainHttpsSession(parsed.host.lowercase() to parsed.port, parsed.host, parsed.port, abort)
+    }
+}
 
 internal suspend fun resetHttpsSessions() {
     resetTlsSessionCache()
@@ -161,8 +182,10 @@ suspend fun httpsFetch(
         val parsed = parseUrl(url)
         val key = parsed.host.lowercase() to parsed.port
         var retried = false
+        var staleRetried = false
         var last: Throwable? = null
         while (true) {
+            val reused = httpsLock.withLock { httpsSessions[key] } != null
             val session = obtainHttpsSession(key, parsed.host, parsed.port, abort)
             reporter.report(FetchStage.SENDING_REQUEST)
             val first =
@@ -194,8 +217,16 @@ suspend fun httpsFetch(
                 last = second.exceptionOrNull()
             }
             evictHttpsSession(key)
+            if (last is CoroutineCancellation || abort?.aborted == true) break
+            if (reused && !staleRetried) {
+                // A kept-alive session that went idle (e.g. opened by warmUpHttps) may have been
+                // closed by the server; the circuit is most likely fine, so keep it.
+                staleRetried = true
+                println("echalote.fetch ${parsed.host}:${parsed.port} stale session, reopening: ${last?.message}")
+                continue
+            }
             forgetDefaultCircuit(parsed.host, parsed.port)
-            if (last is CoroutineCancellation || retried || abort?.aborted == true) break
+            if (retried) break
             retried = true
         }
         throw last ?: Exception("https fetch failed")
@@ -223,21 +254,38 @@ private suspend fun obtainHttpsSession(
         println("echalote.fetch $host:$port reuse=true")
         return it
     }
-    println("echalote.fetch $host:$port reuse=false")
-    val opened = (httpsSessionFactory ?: ::openDefaultHttpsSession).invoke(host, port, abort)
-    return httpsLock.withLock {
-        val existing = httpsSessions[key]
-        if (existing != null) {
-            try {
-                opened.close()
-            } catch (_: Throwable) {
-            }
-            existing
-        } else {
-            httpsSessions[key] = opened
-            opened
+    val (pending, lead) =
+        httpsLock.withLock {
+            httpsSessions[key]?.let { return it }
+            httpsOpening[key]?.let { return@withLock it to false }
+            CompletableDeferred<HttpsSession>().also { httpsOpening[key] = it } to true
+        }
+    if (!lead) {
+        println("echalote.fetch $host:$port reuse=joined")
+        return try {
+            withAbort(abort) { pending.await() }
+        } catch (err: CoroutineCancellation) {
+            // The opener was cancelled (e.g. a warm-up whose scope ended): not our cancellation,
+            // so surface it as an ordinary failure and let the retry open a fresh session.
+            currentCoroutineContext().ensureActive()
+            throw Exception("shared HTTPS open cancelled", err)
         }
     }
+    println("echalote.fetch $host:$port reuse=false")
+    val opened =
+        try {
+            (httpsSessionFactory ?: ::openDefaultHttpsSession).invoke(host, port, abort)
+        } catch (err: Throwable) {
+            httpsLock.withLock { if (httpsOpening[key] === pending) httpsOpening.remove(key) }
+            pending.completeExceptionally(err)
+            throw err
+        }
+    httpsLock.withLock {
+        if (httpsOpening[key] === pending) httpsOpening.remove(key)
+        httpsSessions[key] = opened
+    }
+    pending.complete(opened)
+    return opened
 }
 
 private suspend fun evictHttpsSession(key: Pair<String, Int>) {
@@ -253,16 +301,33 @@ private suspend fun openDefaultHttpsSession(
     port: Int,
     abort: Abort?,
 ): HttpsSession {
-    val tcp = defaultExitDialer().dial(host, port, abort)
-    val tls =
-        runCatching { timed("tor", "tls-exit", { "host=$host" }) { wrapTls(tcp.outer, host, abort) } }.getOrElse { err ->
-            try {
-                tcp.close()
-            } catch (_: Throwable) {
-            }
-            forgetDefaultCircuit(host, port)
-            throw err
-        }
+    // Optimistic open: the ClientHello rides with RELAY_BEGIN, saving a round trip. An exit that
+    // refuses the stream now shows up as a TLS failure, so retry once on a fresh circuit, which
+    // is what dial() does itself when it waits for RELAY_CONNECTED.
+    var attempt = 0
+    while (true) {
+        attempt++
+        val tcp = defaultExitDialer().dialOptimistic(host, port, abort)
+        val tls =
+            runCatching { timed("tor", "tls-exit", { "host=$host attempt=$attempt" }) { wrapTls(tcp.outer, host, abort) } }
+                .getOrElse { err ->
+                    try {
+                        tcp.close()
+                    } catch (_: Throwable) {
+                    }
+                    forgetDefaultCircuit(host, port)
+                    if (attempt >= 2 || err is CoroutineCancellation || abort?.aborted == true) throw err
+                    println("echalote.open-fail $host:$port optimistic ${err.message}")
+                    null
+                } ?: continue
+        return openedHttpsSession(tls, tcp)
+    }
+}
+
+private suspend fun openedHttpsSession(
+    tls: ByteDuplex,
+    tcp: TorStreamDuplex,
+): HttpsSession {
     fetchProgress()?.report(FetchStage.OPENING_CONNECTION, 1.0)
     return HttpsSession(tls) {
         try {
@@ -367,7 +432,9 @@ private class HttpByteReader(
                 ?.lowercase()
         val decoded =
             when {
-                encoding == null || encoding == "identity" || encoding.isEmpty() -> bodyBytes
+                encoding == null || encoding == "identity" || encoding.isEmpty() || bodyBytes.isEmpty() -> bodyBytes
+                encoding == "gzip" || encoding == "x-gzip" ->
+                    inflateGzipOrNull(bodyBytes) ?: error("bad gzip body")
                 encoding.contains("deflate") || encoding.contains("zlib") ->
                     inflateZlibOrNull(bodyBytes) ?: error("bad zlib body")
                 else -> error("unsupported Content-Encoding: $encoding")

@@ -106,6 +106,21 @@ class ConsensusSignatureTest {
     }
 
     @Test
+    fun productionVerifierStopsAtTheThresholdAndStillRejects() {
+        val good = verifyConsensusWithStoreCerts(fixtureConsensus, fixtureCerts, pinned, FIXTURE_NOW) {}
+        assertEquals(DirectoryAuthorities.MIN_VALID_SIGNATURES, good.size)
+        assertTrue((pinned - BASTET).containsAll(good))
+        val two = ConsensusParser.parseOrThrow(withSignatures(signers.take(2)))
+        assertFails { verifyConsensusWithStoreCerts(two, fixtureCerts, pinned, FIXTURE_NOW) {} }
+        // Pin and validity window are still checked for store certificates.
+        val three = ConsensusParser.parseOrThrow(withSignatures(signers.take(3)))
+        assertFails { verifyConsensusWithStoreCerts(three, fixtureCerts, pinned - signers[0], FIXTURE_NOW) {} }
+        val afterMaatuskaExpiry = utcEpochMillis(2026, 12, 9, 0, 0, 0)
+        val expiredSigner = ConsensusParser.parseOrThrow(withSignatures(listOf(MAATUSKA) + signers.filter { it != MAATUSKA }.take(2)))
+        assertFails { verifyConsensusWithStoreCerts(expiredSigner, fixtureCerts, pinned, afterMaatuskaExpiry) {} }
+    }
+
+    @Test
     fun tamperedRelayLineFails() {
         val text = fixtureConsensusText
         val start = text.indexOf("\nr ") + 1

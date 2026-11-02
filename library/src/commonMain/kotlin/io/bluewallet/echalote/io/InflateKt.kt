@@ -21,6 +21,59 @@ internal object InflateKt {
         }
     }
 
+    /**
+     * Decodes a single-member gzip stream (RFC 1952): header (with optional FEXTRA/FNAME/
+     * FCOMMENT/FHCRC), raw deflate data, then CRC-32 and ISIZE, both checked. Returns null on
+     * any malformed or mismatching input.
+     */
+    fun inflateGzipOrNull(input: ByteArray): ByteArray? {
+        if (input.size < 18 || input.u8(0) != 0x1f || input.u8(1) != 0x8b || input.u8(2) != 8) return null
+        val flags = input.u8(3)
+        if (flags and 0xe0 != 0) return null
+        return try {
+            var i = 10
+            if (flags and 0x04 != 0) {
+                val xlen = input.u8(i) or (input.u8(i + 1) shl 8)
+                i += 2 + xlen
+            }
+            if (flags and 0x08 != 0) {
+                while (input[i] != 0.toByte()) i++
+                i++
+            }
+            if (flags and 0x10 != 0) {
+                while (input[i] != 0.toByte()) i++
+                i++
+            }
+            if (flags and 0x02 != 0) i += 2
+            val (out, end) = inflateDeflate(input, i)
+            if (end + 8 > input.size) return null
+            val crc = le32(input, end)
+            val size = le32(input, end + 4)
+            if (crc == crc32(out) && size == (out.size.toLong() and 0xffffffffL)) out else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun le32(
+        b: ByteArray,
+        at: Int,
+    ): Long =
+        (b.u8(at).toLong() or (b.u8(at + 1).toLong() shl 8) or (b.u8(at + 2).toLong() shl 16) or (b.u8(at + 3).toLong() shl 24))
+
+    private val CRC_TABLE =
+        IntArray(256) { n ->
+            var c = n
+            repeat(8) { c = if (c and 1 != 0) (c ushr 1) xor 0xedb88320.toInt() else c ushr 1 }
+            c
+        }
+
+    internal fun crc32(data: ByteArray): Long {
+        var c = -1
+        for (b in data) c = CRC_TABLE[(c xor b.toInt()) and 0xff] xor (c ushr 8)
+        return c.inv().toLong() and 0xffffffffL
+    }
+
     private fun adler32(data: ByteArray): Long {
         var a = 1L
         var b = 0L
