@@ -52,6 +52,8 @@ val stream = Echalote.dial(
 
 Directory consensus/microdescriptors are fetched over **clearnet HTTP** (same as the original). The Tor link TLS to the guard runs in userspace over meek (`TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`, no root CA check; the leaf certificate DER is used for CERTS `sign_to_tls`).
 
+Optional **direct relay mode** (`Echalote.setDirectRelay(true)`) skips meek and connects over TCP straight to a guard relay's ORPort (Android, JVM and iOS; not linuxX64). It is much faster but shows the network that the device uses Tor; if the guard can't be reached it falls back to meek. Switching takes effect immediately: the current Tor connection and HTTPS sessions are dropped and in-flight requests are retried on the new route. The Live Tor workflow runs it for real on the JVM and in the iOS simulator.
+
 ## Coordinates
 
 `io.bluewallet:echalote`
