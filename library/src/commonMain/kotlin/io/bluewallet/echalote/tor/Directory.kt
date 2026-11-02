@@ -1018,9 +1018,7 @@ fun createExitDialer(options: ExitDialerOptions = ExitDialerOptions()): ExitDial
             port: Int,
             abort: Abort?,
             onProgress: FetchProgressListener?,
-        ): TorStreamDuplex {
-            return openStream(host, port, abort, onProgress, wait = true)
-        }
+        ): TorStreamDuplex = openStream(host, port, abort, onProgress, wait = true)
 
         override suspend fun dialOptimistic(
             host: String,
@@ -1098,8 +1096,13 @@ internal const val DIRECT_GUARD_KEY = "direct-guard"
 
 internal fun isDirectGuardCandidate(head: MicrodescHead): Boolean {
     val f = head.flags
-    return "Guard" in f && "Fast" in f && "Stable" in f && "Running" in f && "Valid" in f &&
-        "Exit" !in f && head.orport > 0
+    return "Guard" in f &&
+        "Fast" in f &&
+        "Stable" in f &&
+        "Running" in f &&
+        "Valid" in f &&
+        "Exit" !in f &&
+        head.orport > 0
 }
 
 /**

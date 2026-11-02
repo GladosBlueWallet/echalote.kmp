@@ -27,7 +27,11 @@ class PlatformCryptoJvmTest {
 
     @Test
     fun platformRsaPublicOpAgreesWithBigNat() {
-        val modulus = secureRandom(256).also { it[0] = (it[0].toInt() or 0x80).toByte(); it[255] = (it[255].toInt() or 1).toByte() }
+        val modulus =
+            secureRandom(256).also {
+                it[0] = (it[0].toInt() or 0x80).toByte()
+                it[255] = (it[255].toInt() or 1).toByte()
+            }
         val exponent = byteArrayOf(1, 0, 1)
         repeat(5) {
             val base = secureRandom(256).also { it[0] = (it[0].toInt() and 0x3f).toByte() }

@@ -58,8 +58,7 @@ internal object InflateKt {
     private fun le32(
         b: ByteArray,
         at: Int,
-    ): Long =
-        (b.u8(at).toLong() or (b.u8(at + 1).toLong() shl 8) or (b.u8(at + 2).toLong() shl 16) or (b.u8(at + 3).toLong() shl 24))
+    ): Long = (b.u8(at).toLong() or (b.u8(at + 1).toLong() shl 8) or (b.u8(at + 2).toLong() shl 16) or (b.u8(at + 3).toLong() shl 24))
 
     private val CRC_TABLE =
         IntArray(256) { n ->
