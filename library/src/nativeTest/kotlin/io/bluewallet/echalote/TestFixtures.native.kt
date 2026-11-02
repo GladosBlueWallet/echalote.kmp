@@ -3,6 +3,7 @@ package io.bluewallet.echalote
 import kotlinx.cinterop.ExperimentalForeignApi
 import kotlinx.cinterop.addressOf
 import kotlinx.cinterop.convert
+import kotlinx.cinterop.toKString
 import kotlinx.cinterop.usePinned
 import platform.posix.SEEK_END
 import platform.posix.SEEK_SET
@@ -11,6 +12,7 @@ import platform.posix.fopen
 import platform.posix.fread
 import platform.posix.fseek
 import platform.posix.ftell
+import platform.posix.getenv
 
 @OptIn(ExperimentalForeignApi::class)
 internal actual fun readTestFixture(path: String): ByteArray {
@@ -30,3 +32,6 @@ internal actual fun readTestFixture(path: String): ByteArray {
         fclose(file)
     }
 }
+
+@OptIn(ExperimentalForeignApi::class)
+internal actual fun testEnv(name: String): String? = getenv(name)?.toKString()

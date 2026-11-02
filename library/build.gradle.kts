@@ -107,3 +107,18 @@ mavenPublishing {
         }
     }
 }
+
+// Live network tests are gated on ECHALOTE_LIVE_* variables. JVM tests inherit the Gradle
+// environment, but iOS simulator tests run via `xcrun simctl spawn`, which only passes on
+// variables named SIMCTL_CHILD_<name> (with the prefix stripped). Forward the flags explicitly
+// to every Kotlin/Native test task so `ECHALOTE_LIVE_DIRECT=1 ./gradlew iosSimulatorArm64Test`
+// just works.
+val liveTestFlags = listOf("ECHALOTE_LIVE_TOR", "ECHALOTE_LIVE_DIRECT", "ECHALOTE_LIVE_TLS")
+tasks.withType<org.jetbrains.kotlin.gradle.targets.native.tasks.KotlinNativeTest>().configureEach {
+    for (name in liveTestFlags) {
+        val value = providers.environmentVariable(name).orNull ?: continue
+        environment(name, value)
+        environment("SIMCTL_CHILD_$name", value)
+        inputs.property(name, value)
+    }
+}

@@ -11,3 +11,6 @@ internal expect fun readTestFixture(path: String): ByteArray
  * binary and more on the 3-core macOS CI runner's iOS simulator, where they hit that limit.
  */
 internal val RSA_TEST_TIMEOUT = 5.minutes
+
+/** An environment variable of the test process, or null (live tests are gated on these). */
+internal expect fun testEnv(name: String): String?
