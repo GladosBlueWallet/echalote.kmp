@@ -100,4 +100,63 @@ class ConsensusFetchVerifyTest {
                 resetCachedConsensus()
             }
         }
+
+    /** Parallel copies: verification runs one copy at a time, and stops at the first good one. */
+    private suspend fun racedVerifyCount(badFirst: Boolean): Pair<Int, Consensus> {
+        val delays = mapOf("a" to 100L, "b" to 200L, "c" to 300L)
+        val engine =
+            HttpEngine { _, url, _, _, _, _ ->
+                if (url.contains("/tor/keys/")) {
+                    HttpResponse(200, fixtureKeysText.encodeToByteArray())
+                } else {
+                    val host = url.substringAfter("://").substringBefore('/')
+                    kotlinx.coroutines.delay(delays.getValue(host))
+                    val text = if (badFirst && host == "a") tampered else fixtureConsensusText
+                    HttpResponse(200, text.encodeToByteArray())
+                }
+            }
+        var verified = 0
+        val trust =
+            ConsensusTrust(
+                DirectoryAuthorities.V3_IDENTITIES,
+                AuthorityCertStore(),
+                now = { FIXTURE_NOW },
+                verify = { c, certs, pinned, now, cp ->
+                    verified += 1
+                    verifyConsensusWithStoreCerts(c, certs, pinned, now, cp)
+                },
+            )
+        val got =
+            fetchVerifiedMicrodescConsensus(
+                source = ConsensusSource(listOf("http://a/c", "http://b/c", "http://c/c"), listOf("127.0.0.1:1"), engine, concurrency = 3),
+                trust = trust,
+                force = true,
+            )
+        return verified to got
+    }
+
+    @Test
+    fun parallelCopiesAreVerifiedOnceWhenTheFirstIsGood() =
+        runTest(timeout = RSA_TEST_TIMEOUT) {
+            try {
+                val (verified, got) = racedVerifyCount(badFirst = false)
+                assertEquals(fixtureConsensus.validAfterMillis, got.validAfterMillis)
+                assertEquals(1, verified)
+            } finally {
+                resetCachedConsensus()
+            }
+        }
+
+    @Test
+    fun aBadFirstCopyFallsBackToTheNextArrivedCopy() =
+        runTest(timeout = RSA_TEST_TIMEOUT) {
+            try {
+                val (verified, got) = racedVerifyCount(badFirst = true)
+                assertEquals(fixtureConsensus.validAfterMillis, got.validAfterMillis)
+                assertSame(got, cachedConsensus?.second)
+                assertEquals(2, verified)
+            } finally {
+                resetCachedConsensus()
+            }
+        }
 }
