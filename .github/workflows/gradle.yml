@@ -82,3 +82,25 @@ jobs:
           key: ${{ runner.os }}-konan-${{ hashFiles('**/gradle/libs.versions.toml', '**/gradle-wrapper.properties') }}
       - name: Run ${{ matrix.target }}
         run: ./gradlew :echalote:${{ matrix.target }} --no-daemon
+
+  ios-device:
+    # Nothing else compiles for a real iPhone (iosArm64); the test matrix only runs the simulator.
+    name: iOS device build (iosArm64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.konan
+          key: ${{ runner.os }}-konan-${{ hashFiles('**/gradle/libs.versions.toml', '**/gradle-wrapper.properties') }}
+      - name: Compile and link for iosArm64
+        run: ./gradlew :echalote:compileKotlinIosArm64 :echalote:linkDebugTestIosArm64 --no-daemon

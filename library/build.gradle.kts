@@ -54,7 +54,11 @@ kotlin {
         }
     }
     iosArm64()
-    iosSimulatorArm64()
+    iosSimulatorArm64 {
+        // An optimized test executable as well (linkReleaseTestIosSimulatorArm64), so CI can time
+        // the live Tor tests in release mode next to the default debug build.
+        binaries.test(listOf(org.jetbrains.kotlin.gradle.plugin.mpp.NativeBuildType.RELEASE))
+    }
     linuxX64()
 
     sourceSets {
