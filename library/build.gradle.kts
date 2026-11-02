@@ -122,3 +122,13 @@ tasks.withType<org.jetbrains.kotlin.gradle.targets.native.tasks.KotlinNativeTest
         inputs.property(name, value)
     }
 }
+
+// Kotlin/Native runs simulator tests with `simctl spawn --standalone`, which does not start the
+// device's trustd, so SecTrust (HTTPS certificate checks) fails with errSecInternal (-26276).
+// Live tests set ECHALOTE_IOS_SIMULATOR to the UDID of an already booted simulator to run there.
+providers.environmentVariable("ECHALOTE_IOS_SIMULATOR").orNull?.let { udid ->
+    tasks.withType<org.jetbrains.kotlin.gradle.targets.native.tasks.KotlinNativeSimulatorTest>().configureEach {
+        device.set(udid)
+        standalone.set(false)
+    }
+}

@@ -123,6 +123,20 @@ jobs:
           key: ${{ runner.os }}-konan-${{ hashFiles('**/gradle/libs.versions.toml', '**/gradle-wrapper.properties') }}
       - name: Build iOS simulator test binary
         run: ./gradlew :echalote:linkDebugTestIosSimulatorArm64 --no-daemon
+      - name: Boot an iPhone simulator
+        # A booted device runs trustd, which SecTrust needs for HTTPS certificate checks.
+        run: |
+          udid=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          for runtime in sorted((r for r in devices if ".iOS-" in r), reverse=True):
+              for d in devices[runtime]:
+                  if d["name"].startswith("iPhone"):
+                      print(d["udid"]); sys.exit(0)
+          sys.exit("no iPhone simulator available")
+          ')
+          xcrun simctl bootstatus "$udid" -b
+          echo "ECHALOTE_IOS_SIMULATOR=$udid" >> "$GITHUB_ENV"
       - name: Live direct-mode test in the iOS simulator (one retry on failure)
         env:
           # library/build.gradle.kts forwards this to the simulator as SIMCTL_CHILD_ECHALOTE_LIVE_DIRECT.
