@@ -120,12 +120,16 @@ jobs:
             echo "::warning::Live direct attempt $attempt failed (exit $rc)"
           done
           exit 1
+      - name: Timing lines
+        if: always()
+        run: python3 .github/scripts/timing-summary.py timing-jvm-direct.txt library/build/test-results/jvmTest
       - name: Upload test report
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: live-direct-jvm-report
           path: |
+            timing-jvm-direct.txt
             library/build/reports/tests/jvmTest
             library/build/test-results/jvmTest
           if-no-files-found: ignore
@@ -149,8 +153,8 @@ jobs:
         with:
           path: ~/.konan
           key: ${{ runner.os }}-konan-${{ hashFiles('**/gradle/libs.versions.toml', '**/gradle-wrapper.properties') }}
-      - name: Build iOS simulator test binary
-        run: ./gradlew :echalote:linkDebugTestIosSimulatorArm64 --no-daemon
+      - name: Build iOS simulator test binaries (debug and release)
+        run: ./gradlew :echalote:linkDebugTestIosSimulatorArm64 :echalote:linkReleaseTestIosSimulatorArm64 --no-daemon
       - name: Boot an iPhone simulator
         # A booted device runs trustd, which SecTrust needs for HTTPS certificate checks.
         run: |
@@ -186,6 +190,11 @@ jobs:
             rc=${PIPESTATUS[0]}
             set -e
             echo "::endgroup::"
+            # Keep each attempt's log and timing lines (the next attempt overwrites both).
+            mkdir -p "live-attempt-$attempt"
+            cp gradle-live.log "live-attempt-$attempt/"
+            cp -R "$results" "live-attempt-$attempt/" 2>/dev/null || true
+            python3 .github/scripts/timing-summary.py "timing-ios-debug-attempt$attempt.txt" "live-attempt-$attempt" || true
             # The test returns early when the env flag is missing; require proof it really ran
             # in direct mode (the marker is printed only after route=DIRECT was recorded).
             if [ "$rc" -eq 0 ] && { grep -rqsF --include='*.xml' "$marker" "$results" || grep -qF "$marker" gradle-live.log; }; then
@@ -199,13 +208,38 @@ jobs:
             echo "::warning::Live direct (iOS) attempt $attempt failed (exit $rc)"
           done
           exit 1
-      - name: Upload test report
-        if: failure()
+      - name: Timing lines (debug build)
+        if: always()
+        run: python3 .github/scripts/timing-summary.py timing-ios-debug.txt gradle-live.log library/build/test-results/iosSimulatorArm64Test
+      - name: Live direct-mode test, optimized (release) test binary
+        # Informational: the same live test run from the release (optimized) executable, to compare
+        # timings with the debug build that Gradle's test task uses. Does not gate the job, and runs
+        # even when the debug attempt failed.
+        if: always()
+        continue-on-error: true
+        env:
+          SIMCTL_CHILD_ECHALOTE_LIVE_DIRECT: "1"
+        run: |
+          set -u
+          kexe="$PWD/library/build/bin/iosSimulatorArm64/releaseTest/test.kexe"
+          set +e
+          perl -e 'alarm shift; exec @ARGV' 600 xcrun simctl spawn "$ECHALOTE_IOS_SIMULATOR" "$kexe" \
+            --ktest_filter='io.bluewallet.echalote.LiveDirectTorTest.*' > release-live.log 2>&1
+          rc=$?
+          set -e
+          python3 .github/scripts/timing-summary.py timing-ios-release.txt release-live.log
+          tail -n 20 release-live.log
+          grep -qF 'live direct tor api.rocketx.exchange -> route=DIRECT' release-live.log && [ "$rc" -eq 0 ]
+      - name: Upload test report and timing logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: live-direct-ios-report
           path: |
             gradle-live.log
+            release-live.log
+            timing-ios-*.txt
+            live-attempt-*
             library/build/reports/tests/iosSimulatorArm64Test
             library/build/test-results/iosSimulatorArm64Test
           if-no-files-found: ignore

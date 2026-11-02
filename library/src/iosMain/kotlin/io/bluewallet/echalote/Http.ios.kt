@@ -13,6 +13,7 @@ import kotlinx.cinterop.ptr
 import kotlinx.cinterop.usePinned
 import kotlinx.cinterop.value
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.IO
 import kotlinx.coroutines.suspendCancellableCoroutine
 import platform.Foundation.NSData
 import platform.Foundation.NSHTTPURLResponse
@@ -83,7 +84,7 @@ actual fun defaultHttpEngine(): HttpEngine {
     return HttpEngine { method, url, headers, body, timeoutMs, decompress ->
         val onDownload = http1ProgressSink()
         if (usesCleartextHttp1(url)) {
-            cancellableBlocking(Dispatchers.Default) { hook ->
+            cancellableBlocking(Dispatchers.IO) { hook ->
                 hook.http1OverTcp(method, url, headers, body, timeoutMs, onDownload)
             }
         } else {

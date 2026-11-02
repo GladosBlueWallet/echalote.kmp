@@ -89,12 +89,19 @@ private suspend fun fetchAuthorityKeys(
  * Downloads one mirror's consensus and returns it only if it is fresh and properly signed.
  * [race] is checked between every stage and between signature checks, so a copy that lost
  * the race stops instead of burning CPU.
+ *
+ * Copies download in parallel, but everything after the download (inflate, parse, certs,
+ * signatures) runs under [verifyGate], one copy at a time: the first copy to arrive is checked
+ * alone, and if it verifies the race ends and the queued copies are dropped unread. Only if it
+ * fails does the next arrived copy get checked. Without the gate every copy was inflated,
+ * parsed and verified at once, which cost seconds of CPU on slow-crypto platforms (iOS).
  */
 private suspend fun downloadVerifiedConsensus(
     url: String,
     source: ConsensusSource,
     trust: ConsensusTrust,
     race: Abort,
+    verifyGate: Mutex,
 ): Pair<Consensus, ByteArray> {
     val copy = "copy=${url.substringAfter("://").substringBefore('/')}"
     val started = timeMark()
@@ -105,15 +112,41 @@ private suspend fun downloadVerifiedConsensus(
         }
     check(res.status in 200..299) { "HTTP ${res.status}" }
     race.throwIfAborted()
+    val gateWait = timeMark()
+    return verifyGate.withLock {
+        logTiming("consensus", "verify-gate-wait", gateWait.elapsedNow(), copy)
+        race.throwIfAborted()
+        checkDownloadedConsensus(DownloadedCopy(url, copy, res.body, started), source, trust, race)
+    }
+}
+
+/** One mirror's raw consensus body; [label] is the `copy=<host>` timing tag. */
+private class DownloadedCopy(
+    val url: String,
+    val label: String,
+    val raw: ByteArray,
+    val started: kotlin.time.TimeMark,
+)
+
+private suspend fun checkDownloadedConsensus(
+    downloadedCopy: DownloadedCopy,
+    source: ConsensusSource,
+    trust: ConsensusTrust,
+    race: Abort,
+): Pair<Consensus, ByteArray> {
+    val url = downloadedCopy.url
+    val copy = downloadedCopy.label
+    val raw = downloadedCopy.raw
+    val started = downloadedCopy.started
     // A `.z` URL (or Content-Encoding: deflate) yields a zlib body; platform stacks that already
     // decoded it hand over plain text, which never starts with a zlib header byte (0x78).
     val body =
-        if (res.body.isNotEmpty() && res.body[0] == 0x78.toByte()) {
-            timed("consensus", "inflate", { "$copy bytes=${res.body.size}" }) {
-                inflateZlibOrNull(res.body) ?: error("bad zlib consensus body")
+        if (raw.isNotEmpty() && raw[0] == 0x78.toByte()) {
+            timed("consensus", "inflate", { "$copy bytes=${raw.size}" }) {
+                inflateZlibOrNull(raw) ?: error("bad zlib consensus body")
             }
         } else {
-            res.body
+            raw
         }
     val text = timed("consensus", "decode", { "$copy bytes=${body.size}" }) { body.decodeToString() }
     timed("consensus", "footer-check", { copy }) {
@@ -139,7 +172,7 @@ private suspend fun downloadVerifiedConsensus(
     println(
         "echalote.consensus verified sigs=${signers.size}/${trust.pinned.size} " +
             "need=${DirectoryAuthorities.MIN_VALID_SIGNATURES} by=${signers.sorted().joinToString(",") { it.take(8) }} " +
-            "bytes=${res.body.size} inflated=${body.size} downloadMs=${downloaded.inWholeMilliseconds} " +
+            "bytes=${raw.size} inflated=${body.size} downloadMs=${downloaded.inWholeMilliseconds} " +
             "verifyMs=${(total - downloaded).inWholeMilliseconds} url=$url",
     )
     return parsed to body
@@ -175,11 +208,12 @@ private suspend fun raceMirrors(
     trust: ConsensusTrust,
     signal: Abort,
 ): Consensus {
+    val verifyGate = Mutex()
     val (consensus, raw) =
         fetchFirstOk(
             source.mirrors.secureShuffled(),
             worker = { url, race ->
-                runCatching { downloadVerifiedConsensus(url, source, trust, race) }
+                runCatching { downloadVerifiedConsensus(url, source, trust, race, verifyGate) }
                     .onFailure { if (race.aborted) println("echalote.consensus cancelled url=$url reason=${race.reason?.message}") }
                     .getOrThrow()
             },
