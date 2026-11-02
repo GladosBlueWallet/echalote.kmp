@@ -208,7 +208,9 @@ jobs:
         run: python3 .github/scripts/timing-summary.py timing-ios-debug.txt gradle-live.log library/build/test-results/iosSimulatorArm64Test
       - name: Live direct-mode test, optimized (release) test binary
         # Informational: the same live test run from the release (optimized) executable, to compare
-        # timings with the debug build that Gradle's test task uses. Does not gate the job.
+        # timings with the debug build that Gradle's test task uses. Does not gate the job, and runs
+        # even when the debug attempt failed.
+        if: always()
         continue-on-error: true
         env:
           SIMCTL_CHILD_ECHALOTE_LIVE_DIRECT: "1"
