@@ -190,6 +190,11 @@ jobs:
             rc=${PIPESTATUS[0]}
             set -e
             echo "::endgroup::"
+            # Keep each attempt's log and timing lines (the next attempt overwrites both).
+            mkdir -p "live-attempt-$attempt"
+            cp gradle-live.log "live-attempt-$attempt/"
+            cp -R "$results" "live-attempt-$attempt/" 2>/dev/null || true
+            python3 .github/scripts/timing-summary.py "timing-ios-debug-attempt$attempt.txt" "live-attempt-$attempt" || true
             # The test returns early when the env flag is missing; require proof it really ran
             # in direct mode (the marker is printed only after route=DIRECT was recorded).
             if [ "$rc" -eq 0 ] && { grep -rqsF --include='*.xml' "$marker" "$results" || grep -qF "$marker" gradle-live.log; }; then
@@ -234,6 +239,7 @@ jobs:
             gradle-live.log
             release-live.log
             timing-ios-*.txt
+            live-attempt-*
             library/build/reports/tests/iosSimulatorArm64Test
             library/build/test-results/iosSimulatorArm64Test
           if-no-files-found: ignore

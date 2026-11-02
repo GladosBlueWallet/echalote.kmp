@@ -27,10 +27,12 @@ def files(paths):
 
 def main():
     out, inputs = sys.argv[1], sys.argv[2:]
-    seen, lines = set(), []
+    seen, lines, failures = set(), [], []
     for f in files(inputs):
         with open(f, encoding="utf-8", errors="replace") as fh:
-            text = html.unescape(fh.read())
+            raw = fh.read()
+        failures += [html.unescape(m) for m in re.findall(r'<failure message="([^"]*)"', raw)]
+        text = html.unescape(raw)
         for m in LINE.finditer(text):
             line = m.group(1).strip()
             if line not in seen:
@@ -54,6 +56,8 @@ def main():
     for line in lines:
         if line.startswith("live "):
             print(line)
+    for message in failures:
+        print(f"Test failure: {message[:500]}")
 
 
 if __name__ == "__main__":
