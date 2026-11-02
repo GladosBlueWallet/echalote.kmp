@@ -9,6 +9,7 @@ import kotlinx.cinterop.ptr
 import kotlinx.cinterop.reinterpret
 import kotlinx.cinterop.usePinned
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.IO
 import platform.posix.AF_INET
 import platform.posix.EAGAIN
 import platform.posix.EINTR
@@ -47,7 +48,7 @@ actual fun defaultHttpEngine(): HttpEngine =
             throw UnsupportedOperationException("linuxX64 default HttpEngine is HTTP-only; inject an engine for HTTPS meek")
         }
         val request = buildHttp1Request(method, parseHttpUrl(url), headers, body)
-        cancellableBlocking(Dispatchers.Default) { hook -> hook.http1OverTcp(url, request, timeoutMs, onDownload) }
+        cancellableBlocking(Dispatchers.IO) { hook -> hook.http1OverTcp(url, request, timeoutMs, onDownload) }
     }
 
 @OptIn(ExperimentalForeignApi::class)
