@@ -74,6 +74,29 @@ class StreamFetchTest {
         }
 
     @Test
+    fun requestsAndDecodesGzipBodies() =
+        runTest {
+            val gz = hexToBytes(GZIP_FIXTURE_HEX)
+            val head = utf8("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: ${gz.size}\r\n\r\n")
+            val mock = MockDuplex(listOf(concatBytes(head, gz)))
+            val res = streamFetch("https://api.rocketx.exchange/v1/configs", StreamFetchInit(mock))
+            assertEquals(200, res.status)
+            assertEquals(GZIP_FIXTURE_TEXT, res.text())
+            assertTrue(mock.requestText().contains("Accept-Encoding: gzip, deflate\r\n"))
+        }
+
+    @Test
+    fun pureGzipDecoderChecksCrcAndSize() {
+        val gz = hexToBytes(GZIP_FIXTURE_HEX)
+        assertEquals(GZIP_FIXTURE_TEXT, InflateKt.inflateGzipOrNull(gz)!!.decodeToString())
+        assertEquals(GZIP_FIXTURE_TEXT, inflateGzipOrNull(gz)!!.decodeToString())
+        val badCrc = gz.copyOf().also { it[it.size - 6] = (it[it.size - 6].toInt() xor 1).toByte() }
+        assertEquals(null, InflateKt.inflateGzipOrNull(badCrc))
+        assertEquals(null, InflateKt.inflateGzipOrNull(gz.copyOf(gz.size - 3)))
+        assertEquals(null, InflateKt.inflateGzipOrNull(utf8("not gzip at all, really")))
+    }
+
+    @Test
     fun postsJsonBodyWithContentLength() =
         runTest {
             val reply = """{"ok":true}"""
@@ -204,3 +227,7 @@ class StreamFetchTest {
             }
         }
 }
+
+private const val GZIP_FIXTURE_HEX =
+    "1f8b08080000000002ff612e6a736f6e00ab56ca48cdc9c957b2522ac92f52d251ca53b28a36d431d231d64122636baba9aa0c004a7c79e375000000"
+private val GZIP_FIXTURE_TEXT = """{"hello":"tor","n":[1,2,3,1,2,3,1,2,3]}""".repeat(3)

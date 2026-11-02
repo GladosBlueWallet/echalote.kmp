@@ -89,8 +89,12 @@ internal sealed class TorState {
     ) : TorState()
 }
 
-open class TorClientDuplex {
-    internal val secret = SecretTorClientDuplex()
+open class TorClientDuplex internal constructor(
+    expectedIdentity: ByteArray?,
+) {
+    constructor() : this(null)
+
+    internal val secret = SecretTorClientDuplex(expectedIdentity)
     val inner: ByteDuplex get() = secret.inner
     var closed: Any? = null
         get() = secret.closed
@@ -103,7 +107,31 @@ open class TorClientDuplex {
     open fun close() = secret.close()
 }
 
-internal class SecretTorClientDuplex {
+/**
+ * Sends NETINFO and the first CREATE_FAST right behind VERSIONS instead of waiting for the
+ * relay's VERSIONS/CERTS/NETINFO, saving a round trip (about a second over meek). Safe because
+ * we only speak link protocol 5 (so the cell format is known up front), our NETINFO holds
+ * nothing learned from the relay, and the circuit is only used after CERTS has authenticated
+ * the relay (createOrThrow still waits for the handshake).
+ */
+internal var pipelineLinkHandshake = true
+
+private class EarlyCreate(
+    val circuit: SecretCircuit,
+    val material: ByteArray,
+) {
+    val created = CompletableDeferred<Pair<ByteArray, ByteArray>>()
+    var claimed = false
+}
+
+/**
+ * [expectedIdentity]: RSA identity digest the relay must prove in CERTS. Null for a bridge
+ * reached over meek (its identity is learned from CERTS); set when dialing a relay picked from
+ * the consensus, so a man in the middle cannot stand in for it.
+ */
+internal class SecretTorClientDuplex(
+    private val expectedIdentity: ByteArray? = null,
+) {
     // The OR link certificate is self-signed; it is authenticated by the CERTS cell instead.
     val tls = TlsClientDuplex(trust = TlsTrust.TorLink)
     val inner: ByteDuplex get() = tls.inner
@@ -126,11 +154,26 @@ internal class SecretTorClientDuplex {
     internal val dataLock = Mutex()
     private val job = SupervisorJob()
     internal val scope = CoroutineScope(job + Dispatchers.Default)
+    private val pipelined = pipelineLinkHandshake
+    private var early: EarlyCreate? = null
 
     init {
+        // Allocated before the writer starts so close() always sees (and fails) it.
+        if (pipelined) early = EarlyCreate(allocateCircuit(null), secureRandom(20))
         scope.launch {
             try {
-                send(writeOldCell(0, CellCmd.VERSIONS, versionsPayload(intArrayOf(5))))
+                var first = writeOldCell(0, CellCmd.VERSIONS, versionsPayload(intArrayOf(5)))
+                val e = early
+                if (e != null) {
+                    first =
+                        concatBytes(
+                            first,
+                            writeCell(0, CellCmd.NETINFO, netinfoPayload()),
+                            writeCell(0, CellCmd.PADDING_NEGOTIATE, paddingNegotiateStop()),
+                            writeCell(e.circuit.id, CellCmd.CREATE_FAST, createFastPayload(e.material)),
+                        )
+                }
+                send(first)
                 readLoop()
             } catch (e: Throwable) {
                 error(e)
@@ -139,6 +182,7 @@ internal class SecretTorClientDuplex {
     }
 
     suspend fun send(bytes: ByteArray) {
+        trace("cell", "tx") { "bytes=${bytes.size}" }
         writeLock.withLock { tls.outer.write(bytes) }
     }
 
@@ -199,6 +243,7 @@ internal class SecretTorClientDuplex {
                 close()
                 return
             }
+            trace("cell", "rx-chunk") { "bytes=${chunk.size}" }
             buf = concatBytes(buf, chunk)
             val cursor = Cursor(buf)
             while (cursor.remaining > 0) {
@@ -215,6 +260,7 @@ internal class SecretTorClientDuplex {
     }
 
     private suspend fun onCell(cell: RawCell) {
+        if (cell.command != CellCmd.RELAY) trace("cell", "rx") { "cmd=${cell.command} circ=${cell.circuitId}" }
         if (cell.command == CellCmd.PADDING || cell.command == CellCmd.VPADDING) return
         when (val s = state) {
             is TorState.None -> {
@@ -230,14 +276,19 @@ internal class SecretTorClientDuplex {
                     val parsed = parseCertsCell(cell.payload)
                     val certs = verifyTorCerts(parsed, tlsDer)
                     val identity = certs.rsaSelf.sha1OrThrow()
+                    if (expectedIdentity != null && !equalBytes(identity, expectedIdentity)) {
+                        throw Exception("relay identity mismatch")
+                    }
                     state = TorState.Handshaking(identity, certs)
                 }
             }
             is TorState.Handshaking -> {
                 if (cell.command == CellCmd.AUTH_CHALLENGE) return
                 if (cell.command == CellCmd.NETINFO) {
-                    send(writeCell(0, CellCmd.NETINFO, netinfoPayload()))
-                    send(writeCell(0, CellCmd.PADDING_NEGOTIATE, paddingNegotiateStop()))
+                    if (!pipelined) {
+                        send(writeCell(0, CellCmd.NETINFO, netinfoPayload()))
+                        send(writeCell(0, CellCmd.PADDING_NEGOTIATE, paddingNegotiateStop()))
+                    }
                     state = TorState.Handshaked(s.identity, s.certs)
                     handshaked.complete(Unit)
                 }
@@ -246,11 +297,17 @@ internal class SecretTorClientDuplex {
                 val circ = if (cell.circuitId != 0) gate.withLock { circuits[cell.circuitId] } else null
                 when (cell.command) {
                     CellCmd.CREATED_FAST -> {
-                        if (circ != null) createdFast.emit(circ to readCreatedFast(cell.payload))
+                        val e = early
+                        if (circ != null && e != null && circ === e.circuit) {
+                            e.created.complete(readCreatedFast(cell.payload))
+                        } else if (circ != null) {
+                            createdFast.emit(circ to readCreatedFast(cell.payload))
+                        }
                     }
                     CellCmd.DESTROY -> {
                         if (circ != null) {
                             val reason = readDestroy(cell.payload)
+                            early?.takeIf { it.circuit === circ }?.created?.completeExceptionally(DestroyedError(reason))
                             circ.onCloseOrError(DestroyedError(reason))
                             destroyed.emit(circ to reason)
                         }
@@ -275,6 +332,9 @@ internal class SecretTorClientDuplex {
         circ: SecretCircuit,
         relay: DecodedRelay,
     ) {
+        if (relay.rcommand != RelayCmd.DATA || verboseTrace) {
+            trace("cell", "rx-relay") { "rcmd=${relay.rcommand} circ=${circ.id} stream=${relay.streamId} len=${relay.fragment.size}" }
+        }
         with(TorInbound) {
             when (relay.rcommand) {
                 RelayCmd.EXTENDED2 -> this@SecretTorClientDuplex.onExtended(circ, relay)
@@ -288,30 +348,65 @@ internal class SecretTorClientDuplex {
         }
     }
 
+    private fun allocateCircuit(abort: Abort?): SecretCircuit =
+        gate.withLock {
+            var id = 0
+            do {
+                abort?.throwIfAborted()
+                val raw = Cursor(secureRandom(4)).readU32()
+                if (raw == 0) continue
+                id = raw or Int.MIN_VALUE
+            } while (id == 0 || circuits.containsKey(id))
+            val secret = SecretCircuit(id, this)
+            circuits[id] = secret
+            secret
+        }
+
     suspend fun createOrThrow(abort: Abort? = null): Circuit {
         waitOrThrow(abort)
         val st = state as? TorState.Handshaked ?: throw InvalidTorStateError()
-        val circuit =
-            gate.withLock {
-                var id = 0
-                do {
-                    abort?.throwIfAborted()
-                    val raw = Cursor(secureRandom(4)).readU32()
-                    if (raw == 0) continue
-                    id = raw or Int.MIN_VALUE
-                } while (id == 0 || circuits.containsKey(id))
-                val secret = SecretCircuit(id, this)
-                circuits[id] = secret
-                secret
+        val e = gate.withLock { early?.takeIf { !it.claimed }?.also { it.claimed = true } }
+        if (e != null) {
+            val created =
+                try {
+                    withAbort(abort) { e.created.await() }
+                } catch (err: kotlinx.coroutines.CancellationException) {
+                    e.circuit.close()
+                    throw err
+                } catch (err: Throwable) {
+                    e.circuit.close()
+                    null
+                }
+            if (created != null) {
+                trace("tor", "create-fast-early") { "circ=${e.circuit.id}" }
+                return finishCreate(e.circuit, e.material, created, st)
             }
+        }
+        val circuit = allocateCircuit(abort)
         var opened = false
         try {
             val material = secureRandom(20)
             send(writeCell(circuit.id, CellCmd.CREATE_FAST, createFastPayload(material)))
             val created = createdFast.wait(abort) { it.first === circuit }
-            val k0 = concatBytes(material, created.second.first)
+            val live = finishCreate(circuit, material, created.second, st)
+            opened = true
+            return live
+        } finally {
+            if (!opened) circuit.close()
+        }
+    }
+
+    private suspend fun finishCreate(
+        circuit: SecretCircuit,
+        material: ByteArray,
+        created: Pair<ByteArray, ByteArray>,
+        st: TorState.Handshaked,
+    ): Circuit {
+        var opened = false
+        try {
+            val k0 = concatBytes(material, created.first)
             val result = KDFTorResult.computeOrThrow(k0)
-            if (!equalBytes(result.keyHash, created.second.second)) throw InvalidKdfKeyHashError()
+            if (!equalBytes(result.keyHash, created.second)) throw InvalidKdfKeyHashError()
             val forwardDigest = Sha1.Hasher().update(result.forwardDigest)
             val backwardDigest = Sha1.Hasher().update(result.backwardDigest)
             val target =
@@ -420,6 +515,7 @@ private object TorSend {
                 encodeRelayPayload(out.rcommand, out.streamId, out.fragment, targets, out.recordDigest)
             if (digest != null) gate.withLock { targets.last().digests += digest }
             val cmd = if (out.early) CellCmd.RELAY_EARLY else CellCmd.RELAY
+            trace("cell", "tx-relay") { "rcmd=${out.rcommand} circ=${out.circuit.id} stream=${out.streamId} len=${out.fragment.size}" }
             tls.outer.write(writeCell(out.circuit.id, cmd, payload))
         }
     }

@@ -79,6 +79,8 @@ internal class TlsClientDuplex(
             try {
                 handshakeAndPump(transport, outerPriv, hostName)
             } catch (e: Throwable) {
+                // With False Start [ready] may already be complete: surface the failure to readers.
+                if (ready.isCompleted && pumpError == null) pumpError = tlsPumpError(e)
                 leafCertDer.completeExceptionally(e)
                 ready.completeExceptionally(e)
                 try {
@@ -211,6 +213,7 @@ private suspend fun runTlsHandshake(
     transport: ByteDuplex,
     hostName: String?,
     trust: TlsTrust,
+    onClientFinished: (TlsEngine) -> Unit = {},
 ): TlsSession {
     // Only WebPKI-verified sessions are ever cached, so only WebPKI may resume one.
     val cached =
@@ -223,16 +226,17 @@ private suspend fun runTlsHandshake(
     val clientHello = buildClientHello(clientRandom, hostName, cached)
     hs.transcript = concatBytes(hs.transcript, clientHello)
     tls.writeRecord(REC_HS, clientHello)
-    println("echalote.tls $hostName hello-sent")
+    trace("tls", "hello-sent") { "host=$hostName" }
 
     // A malformed or out-of-order server flight is answered with a fatal alert before giving up.
     return runCatching {
         val (helloType, helloBody, helloRaw) = hs.next()
+        trace("tls", "server-hello") { "host=$hostName" }
         require(helloType == HS_SERVER_HELLO) { "expected ServerHello" }
         hs.transcript = concatBytes(hs.transcript, helloRaw)
         val hello = parseServerHello(helloBody)
         val next = hs.nextOrCcs()
-        val flow = TlsHandshake(tls, hs, hostName, clientRandom, trust)
+        val flow = TlsHandshake(tls, hs, hostName, clientRandom, trust, onClientFinished)
         val resume = cached
         val abbreviated =
             next is TlsNext.Ccs ||
@@ -274,6 +278,7 @@ private class TlsHandshake(
     val hostName: String?,
     val clientRandom: ByteArray,
     val trust: TlsTrust,
+    val onClientFinished: (TlsEngine) -> Unit,
 ) {
     fun installKeys(
         master: ByteArray,
@@ -376,8 +381,19 @@ private class TlsHandshake(
             val ms = started.elapsedNow().inWholeMilliseconds
             println("echalote.tls $hostName certificate verified chain=${auth.chain.size} ms=$ms")
         }
+        trace("tls", "server-flight-read") { "host=$hostName" }
         val master = sendClientKeyExchange(auth, hello)
+        trace("tls", "client-finished-sent") { "host=$hostName" }
+        // TLS False Start (RFC 7918): application data may follow our Finished before the
+        // server's arrives. Allowed because the only suite offered is ECDHE + AES-GCM (forward
+        // secret AEAD, so nothing to downgrade), and for WebPKI the chain and the signed ECDHE
+        // share were verified above. On the Tor link (TorLink, no PKI) the first bytes are the
+        // VERSIONS cell, which holds nothing secret, and the relay is only trusted after CERTS.
+        // Incoming data is only read after the server Finished checks out, and the session is
+        // only cached after that.
+        onClientFinished(tls)
         readServerFinished(auth, master)
+        trace("tls", "server-finished") { "host=$hostName" }
         val expiresAtMs = tlsResumeExpiryMs(auth.lifetime, ceilingMs = chainResumeCeilingMs(auth.chain))
         keepSession(master, hello.sessionId, auth.ticket, hello.ems, expiresAtMs)
         return TlsSession(auth.leaf, tls)
@@ -484,8 +500,15 @@ private class TlsHandshake(
         auth: FullServerAuth,
         hello: ParsedServerHello,
     ): ByteArray {
-        val (secret, public) = P256.generateKeyPair()
-        val premaster = P256.ecdh(secret, auth.peerPoint)
+        val ecdhStarted = TimeSource.Monotonic.markNow()
+        // On-curve check in common code first, so every provider gets a validated point.
+        P256.decodeUncompressed(auth.peerPoint)
+        val (public, premaster) =
+            platformP256Ecdh(auth.peerPoint) ?: run {
+                val (secret, pub) = P256.generateKeyPair()
+                pub to P256.ecdh(secret, auth.peerPoint)
+            }
+        trace("tls", "ecdh") { "host=$hostName ms=${ecdhStarted.elapsedNow().inWholeMilliseconds}" }
         val cke = handshakeMessage(HS_CLIENT_KEY_EXCHANGE, concatBytes(byteArrayOf(public.size.toByte()), public))
         hs.transcript = concatBytes(hs.transcript, cke)
         tls.writeRecord(REC_HS, cke)
@@ -546,11 +569,54 @@ private suspend fun TlsClientDuplex.handshakeAndPump(
     app: ByteDuplex,
     hostName: String?,
 ) {
-    val session = runTlsHandshake(transport, hostName, trust)
+    val handshakeDone = CompletableDeferred<Unit>()
+    val writable = CompletableDeferred<TlsEngine>()
+    // Outgoing app data may start at our Finished (False Start); see TlsHandshake.finishFull.
+    val writer =
+        scope.launch {
+            val tls = writable.await()
+            ready.complete(Unit)
+            var incoming: kotlinx.coroutines.Job? = null
+            try {
+                while (true) {
+                    val chunk = app.read(16 * 1024)
+                    if (chunk.isEmpty()) break
+                    tls.writeRecord(REC_APP, chunk)
+                    if (incoming == null) {
+                        incoming =
+                            scope.launch {
+                                handshakeDone.await()
+                                pumpIncoming(tls, app)
+                            }
+                    }
+                }
+            } catch (_: Throwable) {
+            } finally {
+                incoming?.cancel()
+                try {
+                    transport.close()
+                } catch (_: Throwable) {
+                }
+            }
+        }
+    val session =
+        try {
+            runTlsHandshake(transport, hostName, trust) { writable.complete(it) }
+        } catch (e: Throwable) {
+            writer.cancel()
+            throw e
+        }
     leafCertDer.complete(session.leaf)
-    val tls = session.tls
+    handshakeDone.complete(Unit)
+    writable.complete(session.tls)
+    writer.join()
+}
 
-    suspend fun pumpIncoming() {
+private suspend fun TlsClientDuplex.pumpIncoming(
+    tls: TlsEngine,
+    app: ByteDuplex,
+) {
+    run {
         runCatching {
             while (true) {
                 val (type, frag) = tls.readRecord()
@@ -567,23 +633,6 @@ private suspend fun TlsClientDuplex.handshakeAndPump(
                 app.close()
             } catch (_: Throwable) {
             }
-        }
-    }
-    ready.complete(Unit)
-    var incoming: kotlinx.coroutines.Job? = null
-    try {
-        while (true) {
-            val chunk = app.read(16 * 1024)
-            if (chunk.isEmpty()) break
-            tls.writeRecord(REC_APP, chunk)
-            if (incoming == null) incoming = scope.launch { pumpIncoming() }
-        }
-    } catch (_: Throwable) {
-    } finally {
-        incoming?.cancel()
-        try {
-            transport.close()
-        } catch (_: Throwable) {
         }
     }
 }

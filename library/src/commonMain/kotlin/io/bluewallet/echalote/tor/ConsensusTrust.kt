@@ -1,5 +1,6 @@
 package io.bluewallet.echalote
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -40,6 +41,7 @@ internal class SignedBytes(
 )
 
 /** A `dir-key-certificate-version 3` document (dir-spec "Creating key certificates"). */
+@Suppress("LongParameterList")
 internal class AuthorityKeyCert(
     val fingerprint: String,
     /** dir-key-published..dir-key-expires. */
@@ -51,6 +53,8 @@ internal class AuthorityKeyCert(
     val crossCert: ByteArray,
     /** Text from "dir-key-certificate-version" through the newline after "dir-key-certification", and its signature. */
     val certification: SignedBytes,
+    /** The whole document as parsed, so it can be stored and parsed (and checked) again. */
+    val raw: String = "",
 ) {
     val publishedMillis: Long get() = validMillis.first
     val expiresMillis: Long get() = validMillis.last
@@ -97,7 +101,7 @@ internal object AuthorityKeyCertParser {
         val fields = CertFields()
         var i = 1
         while (i < lines.size) i = fields.take(lines, i) + 1
-        return fields.build(block.substring(0, cut + CERTIFICATION.length).encodeToByteArray())
+        return fields.build(block.substring(0, cut + CERTIFICATION.length).encodeToByteArray(), block)
     }
 
     private class CertFields {
@@ -132,7 +136,10 @@ internal object AuthorityKeyCertParser {
             }
         }
 
-        fun build(certified: ByteArray): AuthorityKeyCert {
+        fun build(
+            certified: ByteArray,
+            raw: String,
+        ): AuthorityKeyCert {
             val fp = requireNotNull(fingerprint) { "missing fingerprint" }
             require(fp.length == 40 && fp.all { it in HEX }) { "bad fingerprint" }
             val from = requireNotNull(published) { "missing dir-key-published" }
@@ -146,6 +153,7 @@ internal object AuthorityKeyCertParser {
                 signingKey = obj("dir-signing-key"),
                 crossCert = obj("dir-key-crosscert"),
                 certification = SignedBytes(certified, obj("dir-key-certification")),
+                raw = raw,
             )
         }
     }
@@ -322,12 +330,18 @@ internal fun acceptAuthorityKeyCerts(
  * valid signature, or throws if that is fewer than
  * [DirectoryAuthorities.MIN_VALID_SIGNATURES]. [checkpoint] runs before each signature check
  * and may throw to stop the work.
+ *
+ * [certsPrechecked] skips the RSA checks of [certs] (their pin and validity window are still
+ * checked); only pass it for certificates that already passed [checkAuthorityKeyCert], i.e. the
+ * ones [AuthorityCertStore] hands out. Verification stops once [stopAfter] signers are valid.
  */
 internal fun verifyConsensusSignaturesOrThrow(
     consensus: Consensus,
     certs: Collection<AuthorityKeyCert>,
     pinned: Set<String>,
     now: Long,
+    certsPrechecked: Boolean = false,
+    stopAfter: Int = Int.MAX_VALUE,
     checkpoint: () -> Unit = {},
 ): Set<String> {
     val preimage = requireNotNull(consensus.preimage) { "consensus has no signatures" }
@@ -336,11 +350,16 @@ internal fun verifyConsensusSignaturesOrThrow(
     }
     val digests = ConsensusDigests(timed("consensus", "preimage-encode", { "chars=${preimage.length}" }) { preimage.encodeToByteArray() })
     val usable =
-        timed("consensus", "certs-recheck", { "certs=${certs.size}" }) {
-            acceptAuthorityKeyCerts(certs.toList(), pinned, now, checkpoint)
+        if (certsPrechecked) {
+            certs.filter { it.fingerprint in pinned && now >= it.publishedMillis && now <= it.expiresMillis }
+        } else {
+            timed("consensus", "certs-recheck", { "certs=${certs.size}" }) {
+                acceptAuthorityKeyCerts(certs.toList(), pinned, now, checkpoint)
+            }
         }.associateBy { it.fingerprint to it.signingKeyDigest }
     val good = HashSet<String>()
     for (sig in consensus.signatures) {
+        if (good.size >= stopAfter) break
         checkpoint()
         if (sig.identity.uppercase() in pinned && isValidConsensusSignature(sig, usable, digests)) good += sig.identity.uppercase()
     }
@@ -348,6 +367,29 @@ internal fun verifyConsensusSignaturesOrThrow(
     check(good.size >= required) { "consensus has ${good.size} valid authority signatures, need $required" }
     return good
 }
+
+/**
+ * The production [ConsensusVerifier]: the certificates come from [AuthorityCertStore], which
+ * only holds ones that passed [checkAuthorityKeyCert] (downloaded or loaded from disk), so their
+ * RSA checks are not repeated, and it stops at [DirectoryAuthorities.MIN_VALID_SIGNATURES],
+ * the acceptance threshold, instead of checking every signature.
+ */
+internal fun verifyConsensusWithStoreCerts(
+    consensus: Consensus,
+    certs: Collection<AuthorityKeyCert>,
+    pinned: Set<String>,
+    now: Long,
+    checkpoint: () -> Unit,
+): Set<String> =
+    verifyConsensusSignaturesOrThrow(
+        consensus,
+        certs,
+        pinned,
+        now,
+        certsPrechecked = true,
+        stopAfter = DirectoryAuthorities.MIN_VALID_SIGNATURES,
+        checkpoint = checkpoint,
+    )
 
 private class ConsensusDigests(
     private val signed: ByteArray,
@@ -395,6 +437,70 @@ private fun isValidConsensusSignature(
 internal class AuthorityCertStore {
     private val mutex = Mutex()
     private val certs = LinkedHashMap<Pair<String, String>, AuthorityKeyCert>()
+
+    /** Disk caches already loaded into this store (by identity). */
+    private val seeded = ArrayList<TorDirCache>()
+
+    /**
+     * Loads the certificates saved in [cache] into this store, once per cache. Each one is
+     * parsed and checked with [checkAuthorityKeyCert] exactly like a downloaded certificate, so
+     * expired, unpinned or forged ones are dropped. If any certificate fails for a reason other
+     * than its validity window, the file is deleted (it is rewritten on the next fetch).
+     */
+    @Suppress("TooGenericExceptionCaught")
+    suspend fun seedFrom(
+        cache: TorDirCache,
+        pinned: Set<String>,
+        now: Long,
+        checkpoint: () -> Unit = {},
+    ) {
+        if (cache === TorDirCache.None) return
+        mutex.withLock {
+            if (seeded.any { it === cache }) return
+            val started = timeMark()
+            val bytes = cache.readOrNull(TorDirCache.AUTHORITY_CERTS)
+            var kept = 0
+            var bad = 0
+            if (bytes != null) {
+                val good = ArrayList<AuthorityKeyCert>()
+                try {
+                    val text = bytes.decodeToString()
+                    val parsed = AuthorityKeyCertParser.parseAll(text)
+                    val declared = text.split("\n").count { it.startsWith("dir-key-certificate-version ") }
+                    bad += declared - parsed.size
+                    for (cert in parsed) {
+                        checkpoint()
+                        when (checkAuthorityKeyCert(cert, pinned, now)) {
+                            null -> good += cert
+                            "expired", "not yet published" -> Unit
+                            else -> bad += 1
+                        }
+                    }
+                } catch (err: CancellationException) {
+                    throw err
+                } catch (err: Exception) {
+                    // Garbage on disk must not poison every later bootstrap: drop the file.
+                    checkpoint()
+                    println("echalote.dircache certs rejected ${err.message ?: err}")
+                    good.clear()
+                    bad += 1
+                }
+                for (cert in good) certs[cert.fingerprint to cert.signingKeyDigest] = cert
+                kept = good.size
+                if (bad > 0) cache.deleteOrLog(TorDirCache.AUTHORITY_CERTS)
+            }
+            seeded += cache
+            logTiming("consensus", "cert-disk-load", started.elapsedNow(), "found=${bytes != null} kept=$kept bad=$bad")
+        }
+    }
+
+    /** The raw text of every unexpired certificate held, for [TorDirCache.AUTHORITY_CERTS]. */
+    suspend fun exportRaw(now: Long): String =
+        mutex.withLock {
+            certs.values
+                .filter { now <= it.expiresMillis && it.raw.isNotEmpty() }
+                .joinToString("") { it.raw.trimEnd('\n') + "\n" }
+        }
 
     /**
      * Returns usable certificates for the pinned signers of [consensus], fetching missing ones

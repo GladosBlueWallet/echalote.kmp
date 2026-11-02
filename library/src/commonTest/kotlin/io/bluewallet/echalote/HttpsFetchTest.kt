@@ -1,5 +1,7 @@
 package io.bluewallet.echalote
 
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -154,5 +156,89 @@ class HttpsFetchTest {
             assertEquals(100, events.last().first)
             assertEquals("Done", events.last().second)
             assertTrue(events.zipWithNext().all { it.first.first <= it.second.first })
+        }
+
+    private fun keepAlivePayload(): ByteArray {
+        val body = """{"ok":true}"""
+        return "HTTP/1.1 200 OK\r\nContent-Length: ${body.length}\r\nConnection: keep-alive\r\n\r\n$body"
+            .encodeToByteArray()
+    }
+
+    @Test
+    fun warmUpOpensTheSessionTheFirstFetchUses() =
+        runTest {
+            val stream = ScriptedDuplex(listOf(keepAlivePayload()))
+            var opens = 0
+            httpsSessionFactory = { _, _, _ ->
+                opens++
+                HttpsSession(stream) { stream.close() }
+            }
+            try {
+                resetHttpsSessions()
+                warmUpHttps("https://api.example.com/v1/configs")
+                assertEquals(1, opens)
+                assertEquals(0, stream.writes.size)
+                val res = httpsFetch("https://api.example.com/v1/configs")
+                assertEquals(200, res.status)
+                assertEquals(1, opens)
+            } finally {
+                resetHttpsSessions()
+                httpsSessionFactory = null
+            }
+        }
+
+    @Test
+    fun fetchDuringWarmUpJoinsItInsteadOfOpeningAnother() =
+        runTest {
+            val stream = ScriptedDuplex(listOf(keepAlivePayload()))
+            val gate = CompletableDeferred<Unit>()
+            var opens = 0
+            httpsSessionFactory = { _, _, _ ->
+                opens++
+                gate.await()
+                HttpsSession(stream) { stream.close() }
+            }
+            try {
+                resetHttpsSessions()
+                val warm = async { warmUpHttps("https://api.example.com/") }
+                testScheduler.runCurrent()
+                val fetch = async { httpsFetch("https://api.example.com/") }
+                testScheduler.runCurrent()
+                gate.complete(Unit)
+                warm.await()
+                assertEquals(200, fetch.await().status)
+                assertEquals(1, opens)
+            } finally {
+                resetHttpsSessions()
+                httpsSessionFactory = null
+            }
+        }
+
+    @Test
+    fun staleWarmSessionIsReopenedOnce() =
+        runTest {
+            val dead =
+                object : ByteDuplex {
+                    override suspend fun read(n: Int): ByteArray = throw Exception("connection reset")
+
+                    override suspend fun write(bytes: ByteArray) {}
+
+                    override fun close() {}
+                }
+            val good = ScriptedDuplex(listOf(keepAlivePayload()))
+            var opens = 0
+            httpsSessionFactory = { _, _, _ ->
+                opens++
+                if (opens == 1) HttpsSession(dead) {} else HttpsSession(good) { good.close() }
+            }
+            try {
+                resetHttpsSessions()
+                warmUpHttps("https://api.example.com/")
+                assertEquals(200, httpsFetch("https://api.example.com/").status)
+                assertEquals(2, opens)
+            } finally {
+                resetHttpsSessions()
+                httpsSessionFactory = null
+            }
         }
 }

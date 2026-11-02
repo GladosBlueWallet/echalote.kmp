@@ -12,12 +12,16 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
-/** Where to download the consensus and the authority key certificates from. */
+/**
+ * Where to download the consensus and the authority key certificates from, and the disk
+ * [cache] that sits beneath the in-memory one (see [TorDirCache]).
+ */
 internal class ConsensusSource(
     val mirrors: List<String>,
     val authorityHosts: List<String>,
     val engine: HttpEngine,
     val concurrency: Int = 3,
+    val cache: TorDirCache = torDirCache,
 )
 
 /** What to trust: the pinned authority identities, verified certificates, and the clock. */
@@ -25,7 +29,7 @@ internal class ConsensusTrust(
     val pinned: Set<String> = DirectoryAuthorities.V3_IDENTITIES,
     val store: AuthorityCertStore = defaultAuthorityCertStore,
     val now: () -> Long = ::currentEpochMillis,
-    val verify: ConsensusVerifier = ::verifyConsensusSignaturesOrThrow,
+    val verify: ConsensusVerifier = ::verifyConsensusWithStoreCerts,
 )
 
 /** Signature check used by [ConsensusTrust]; a seam for tests. */
@@ -52,8 +56,10 @@ private const val KEY_FETCH_TIMEOUT_MS = 10_000L
 private const val CONSENSUS_FETCH_TIMEOUT_MS = 30_000L
 
 /**
- * GETs [path] from the authorities, one at a time, and returns the first body that holds key
- * certificates. The response is ~20 KB, so a short timeout is enough.
+ * GETs [path] from the authorities, two at a time, and returns the first body that holds key
+ * certificates. The response is ~20 KB, so a short timeout is enough. Two at a time because an
+ * authority that accepts the connection and then stalls cost a full [KEY_FETCH_TIMEOUT_MS]
+ * (10 s) on the cold path in live runs; a second request in flight hides that for ~20 KB.
  */
 private suspend fun fetchAuthorityKeys(
     path: String,
@@ -75,7 +81,7 @@ private suspend fun fetchAuthorityKeys(
             check(text.contains("dir-key-certificate-version ")) { "no key certificates from $host" }
             text
         },
-        concurrency = 1,
+        concurrency = 2,
         signal = signal,
     )
 
@@ -89,7 +95,7 @@ private suspend fun downloadVerifiedConsensus(
     source: ConsensusSource,
     trust: ConsensusTrust,
     race: Abort,
-): Consensus {
+): Pair<Consensus, ByteArray> {
     val copy = "copy=${url.substringAfter("://").substringBefore('/')}"
     val started = timeMark()
     race.throwIfAborted()
@@ -99,7 +105,17 @@ private suspend fun downloadVerifiedConsensus(
         }
     check(res.status in 200..299) { "HTTP ${res.status}" }
     race.throwIfAborted()
-    val text = timed("consensus", "decode", { "$copy bytes=${res.body.size}" }) { res.body.decodeToString() }
+    // A `.z` URL (or Content-Encoding: deflate) yields a zlib body; platform stacks that already
+    // decoded it hand over plain text, which never starts with a zlib header byte (0x78).
+    val body =
+        if (res.body.isNotEmpty() && res.body[0] == 0x78.toByte()) {
+            timed("consensus", "inflate", { "$copy bytes=${res.body.size}" }) {
+                inflateZlibOrNull(res.body) ?: error("bad zlib consensus body")
+            }
+        } else {
+            res.body
+        }
+    val text = timed("consensus", "decode", { "$copy bytes=${body.size}" }) { body.decodeToString() }
     timed("consensus", "footer-check", { copy }) {
         check(text.contains("directory-footer")) { "truncated consensus (no directory-footer)" }
     }
@@ -113,10 +129,7 @@ private suspend fun downloadVerifiedConsensus(
     val checkpoint = { race.throwIfAborted() }
     val signers =
         runCatching {
-            val certs =
-                timed("consensus", "certs", { copy }) {
-                    trust.store.certsFor(parsed, trust.pinned, trust.now(), checkpoint) { path -> fetchAuthorityKeys(path, source, race) }
-                }
+            val certs = timed("consensus", "certs", { copy }) { certsWithDiskCache(parsed, source, trust, race, checkpoint) }
             race.throwIfAborted()
             timed("consensus", "verify-signatures", { copy }) { trust.verify(parsed, certs, trust.pinned, trust.now(), checkpoint) }
         }.onFailure { println("echalote.consensus rejected url=$url ${it.message}") }
@@ -126,10 +139,34 @@ private suspend fun downloadVerifiedConsensus(
     println(
         "echalote.consensus verified sigs=${signers.size}/${trust.pinned.size} " +
             "need=${DirectoryAuthorities.MIN_VALID_SIGNATURES} by=${signers.sorted().joinToString(",") { it.take(8) }} " +
-            "bytes=${res.body.size} downloadMs=${downloaded.inWholeMilliseconds} " +
+            "bytes=${res.body.size} inflated=${body.size} downloadMs=${downloaded.inWholeMilliseconds} " +
             "verifyMs=${(total - downloaded).inWholeMilliseconds} url=$url",
     )
-    return parsed
+    return parsed to body
+}
+
+/**
+ * Authority certificates for [consensus]: the store is first seeded from the disk cache (each
+ * certificate re-checked), missing ones are fetched, and newly fetched ones are written back.
+ */
+internal suspend fun certsWithDiskCache(
+    consensus: Consensus,
+    source: ConsensusSource,
+    trust: ConsensusTrust,
+    signal: Abort,
+    checkpoint: () -> Unit,
+): List<AuthorityKeyCert> {
+    trust.store.seedFrom(source.cache, trust.pinned, trust.now(), checkpoint)
+    var fetched = false
+    val certs =
+        trust.store.certsFor(consensus, trust.pinned, trust.now(), checkpoint) { path ->
+            fetchAuthorityKeys(path, source, signal).also { fetched = true }
+        }
+    if (fetched && source.cache !== TorDirCache.None) {
+        val raw = trust.store.exportRaw(trust.now())
+        if (raw.isNotEmpty()) source.cache.writeOrLog(TorDirCache.AUTHORITY_CERTS, raw.encodeToByteArray())
+    }
+    return certs
 }
 
 /** Races the mirrors (with failover) and caches the first copy that verifies. */
@@ -138,7 +175,7 @@ private suspend fun raceMirrors(
     trust: ConsensusTrust,
     signal: Abort,
 ): Consensus {
-    val consensus =
+    val (consensus, raw) =
         fetchFirstOk(
             source.mirrors.secureShuffled(),
             worker = { url, race ->
@@ -150,6 +187,8 @@ private suspend fun raceMirrors(
             signal = signal,
         )
     cachedConsensus = trust.now() to consensus
+    clearStaleConsensus()
+    source.cache.writeOrLog(TorDirCache.CONSENSUS_MICRODESC, raw)
     return consensus
 }
 
@@ -171,7 +210,7 @@ private suspend fun joinSharedFetch(
     trust: ConsensusTrust,
 ): SharedConsensusFetch =
     sharedFetchLock.withLock {
-        val key = listOf(source.mirrors, source.authorityHosts, trust.pinned)
+        val key = listOf(source.mirrors, source.authorityHosts, trust.pinned, source.cache)
         val shared =
             sharedFetch?.takeIf { it.key == key && it.result.isActive } ?: run {
                 val abort = Abort()
@@ -200,6 +239,27 @@ private suspend fun leaveSharedFetch(shared: SharedConsensusFetch) =
         }
     }
 
+/** The in-memory consensus if it is younger than [CONSENSUS_CACHE_MS] and still fresh; else clears it. */
+private fun memoryCachedConsensus(now: Long): Consensus? {
+    val cached = cachedConsensus
+    val stillValid =
+        cached != null &&
+            now - cached.first < CONSENSUS_CACHE_MS &&
+            try {
+                cached.second.ensureFresh(now)
+                true
+            } catch (_: IllegalStateException) {
+                false
+            }
+    if (cached != null && !stillValid) cachedConsensus = null
+    return if (stillValid) {
+        println("echalote.consensus cache-hit ageMs=${now - cached.first}")
+        cached.second
+    } else {
+        null
+    }
+}
+
 /**
  * Downloads the microdesc consensus and accepts it only if it is fresh and carries valid
  * signatures from at least [DirectoryAuthorities.MIN_VALID_SIGNATURES] distinct pinned
@@ -218,22 +278,16 @@ internal suspend fun fetchVerifiedMicrodescConsensus(
 ): Consensus {
     val progress = fetchProgress()
     progress?.report(FetchStage.DOWNLOADING_DIRECTORY)
-    val started = trust.now()
-    val cached = cachedConsensus
-    if (!force && cached != null && started - cached.first < CONSENSUS_CACHE_MS) {
-        val stillValid =
-            try {
-                cached.second.ensureFresh(started)
-                true
-            } catch (_: IllegalStateException) {
-                false
-            }
-        if (stillValid) {
-            println("echalote.consensus cache-hit ageMs=${started - cached.first}")
-            progress?.report(FetchStage.DOWNLOADING_DIRECTORY, 1.0)
-            return cached.second
+    val hit =
+        if (force) {
+            null
+        } else {
+            memoryCachedConsensus(trust.now())
+                ?: if (source.cache !== TorDirCache.None) consensusFromDisk(source, trust, signal) else null
         }
-        cachedConsensus = null
+    if (hit != null) {
+        progress?.report(FetchStage.DOWNLOADING_DIRECTORY, 1.0)
+        return hit
     }
     signal.throwIfAborted()
     val waitStart = timeMark()

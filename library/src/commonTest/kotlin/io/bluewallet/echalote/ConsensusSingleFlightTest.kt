@@ -64,7 +64,7 @@ class ConsensusSingleFlightTest {
             now = { FIXTURE_NOW },
             verify = { consensus, certs, pinned, now, checkpoint ->
                 verifications++
-                verifyConsensusSignaturesOrThrow(consensus, certs, pinned, now, checkpoint)
+                verifyConsensusSignaturesOrThrow(consensus, certs, pinned, now, checkpoint = checkpoint)
             },
         )
 

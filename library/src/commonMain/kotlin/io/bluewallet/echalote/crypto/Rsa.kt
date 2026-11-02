@@ -212,6 +212,8 @@ class RsaPublicKey private constructor(
     private val n: BigNat,
     private val e: BigNat,
     private val k: Int,
+    private val nBytes: ByteArray,
+    private val eBytes: ByteArray,
 ) {
     /** How long the modular exponentiation of the last verify on this key took (for timing logs). */
     internal var lastModPow: kotlin.time.Duration = kotlin.time.Duration.ZERO
@@ -228,9 +230,8 @@ class RsaPublicKey private constructor(
             val modPowStart =
                 kotlin.time.TimeSource.Monotonic
                     .markNow()
-            val m = s.modPow(e, n)
+            val em = platformRsaPublicOp(signature.bytes, eBytes, nBytes, k) ?: s.modPow(e, n).toFixedBytes(k)
             lastModPow = modPowStart.elapsedNow()
-            val em = m.toFixedBytes(k)
             if (em.u8(0) != 0x00 || em.u8(1) != 0x01) return false
             var i = 2
             while (i < em.size && em.u8(i) == 0xff) i++
@@ -277,7 +278,7 @@ class RsaPublicKey private constructor(
                 "RSA exponent out of range"
             }
             val k = nBytes.size
-            return RsaPublicKey(n, e, k)
+            return RsaPublicKey(n, e, k, nBytes, eBytes)
         }
     }
 }

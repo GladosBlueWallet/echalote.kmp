@@ -22,11 +22,15 @@ actual fun defaultHttpEngine(): HttpEngine =
                         setRequestProperty("Accept-Encoding", "identity")
                     }
                     for ((k, v) in headers) setRequestProperty(k, v)
-                    if (method == "POST" || body.isNotEmpty()) {
-                        doOutput = true
-                        outputStream.use { it.write(body) }
-                    }
+                    if (method == "POST" || body.isNotEmpty()) doOutput = true
                 }
+            val httpsTrace = verboseTrace && url.startsWith("https://")
+            val t0 = timeMark()
+            if (httpsTrace) {
+                conn.connect()
+                trace("http", "https-connected") { "ms=${t0.elapsedNow().msText()} host=${conn.url.host}" }
+            }
+            if (conn.doOutput) conn.outputStream.use { it.write(body) }
             try {
                 runCatching { conn.connect() }
                 timing.connected()
