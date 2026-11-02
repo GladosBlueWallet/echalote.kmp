@@ -3,8 +3,9 @@ name: Live Tor
 # Builds a real Tor circuit (meek bootstrap, consensus, microdescriptors, 3-hop exit)
 # and fetches https://api.rocketx.exchange/v1/configs through it. Catches breakage from
 # changes on the live Tor network (e.g. directory format changes) as well as code regressions.
-# Also runs direct relay mode (TCP straight to a guard's ORPort, no meek bridge) on the JVM
-# and in the iOS simulator, asserting the circuit really went direct rather than falling back.
+# "Live Tor direct" jobs run direct relay mode (TCP straight to a guard's ORPort, no meek bridge)
+# on the JVM (ubuntu) and in the iOS simulator (macOS), asserting the circuit really went direct
+# rather than falling back to meek.
 
 on:
   pull_request:
@@ -67,6 +68,33 @@ jobs:
             echo "::warning::Live Tor attempt $attempt failed (exit $rc)"
           done
           exit 1
+      - name: Upload test report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-tor-report
+          path: |
+            library/build/reports/tests/jvmTest
+            library/build/test-results/jvmTest
+          if-no-files-found: ignore
+
+  live-direct-jvm:
+    name: Live Tor direct
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Compile tests
+        run: ./gradlew :echalote:jvmTestClasses --no-daemon
       - name: Live direct-mode test (one retry on failure)
         env:
           ECHALOTE_LIVE_DIRECT: "1"
@@ -96,7 +124,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: live-tor-report
+          name: live-direct-jvm-report
           path: |
             library/build/reports/tests/jvmTest
             library/build/test-results/jvmTest
@@ -152,8 +180,11 @@ jobs:
             rm -rf "$results"
             rc=0
             # perl alarm: macOS has no coreutils timeout.
-            perl -e 'alarm shift; exec @ARGV' 600 ./gradlew :echalote:iosSimulatorArm64Test --tests "$test_filter" --rerun --no-build-cache --no-daemon 2>&1 | tee gradle-live.log || true
+            # The runner's bash uses -e and pipefail; capture Gradle's own exit code instead.
+            set +e
+            perl -e 'alarm shift; exec @ARGV' 600 ./gradlew :echalote:iosSimulatorArm64Test --tests "$test_filter" --rerun --no-build-cache --no-daemon 2>&1 | tee gradle-live.log
             rc=${PIPESTATUS[0]}
+            set -e
             echo "::endgroup::"
             # The test returns early when the env flag is missing; require proof it really ran
             # in direct mode (the marker is printed only after route=DIRECT was recorded).

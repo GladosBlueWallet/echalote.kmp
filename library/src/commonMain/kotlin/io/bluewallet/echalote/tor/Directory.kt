@@ -152,7 +152,12 @@ data class ExitDialerOptions(
      */
     val directGuard: Boolean = false,
     val directConnectTimeoutMs: Long = 5_000,
-    val directHandshakeTimeoutMs: Long = 8_000,
+    /**
+     * Link handshake budget once the guard accepted the TCP connection. Its certificate checks
+     * run in Kotlin and took 7.4-8 s in a debug build in the iOS simulator on CI, so 8 s made
+     * slow devices throw away a working direct connection for the slower meek path.
+     */
+    val directHandshakeTimeoutMs: Long = 15_000,
 ) {
     internal var hooks: ExitDialerHooks = ExitDialerHooks()
 }
