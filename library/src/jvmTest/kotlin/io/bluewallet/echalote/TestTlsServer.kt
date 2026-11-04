@@ -21,7 +21,12 @@ internal fun tlsFixture(name: String): ByteArray =
 /** Plain JSSE TLS 1.2 server on 127.0.0.1 serving one fixed HTTP response per connection. */
 internal class TestTlsServer(
     p12: String,
+    /** The first this-many connections are closed right after the handshake, like a keep-alive idle timeout. */
+    private val idleCloseFirst: Int = 0,
 ) : Closeable {
+    private val accepted =
+        java.util.concurrent.atomic
+            .AtomicInteger()
     private val server: SSLServerSocket
     val errors = LinkedBlockingQueue<Throwable>()
     val port: Int get() = server.localPort
@@ -46,6 +51,7 @@ internal class TestTlsServer(
         try {
             sock.soTimeout = 15_000
             sock.startHandshake()
+            if (accepted.getAndIncrement() < idleCloseFirst) return
             val input = sock.inputStream
             val seen = StringBuilder()
             while (!seen.endsWith("\r\n\r\n")) {

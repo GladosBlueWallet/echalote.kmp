@@ -576,23 +576,23 @@ private suspend fun TlsClientDuplex.handshakeAndPump(
         scope.launch {
             val tls = writable.await()
             ready.complete(Unit)
-            var incoming: kotlinx.coroutines.Job? = null
+            // Read from the end of the handshake on, not from the first write: a session kept
+            // open unused (warmUpHttps) must notice the server closing it while idle, or the
+            // next request is written into a dead stream and waits for a reply forever.
+            val incoming =
+                scope.launch {
+                    handshakeDone.await()
+                    pumpIncoming(tls, app)
+                }
             try {
                 while (true) {
                     val chunk = app.read(16 * 1024)
                     if (chunk.isEmpty()) break
                     tls.writeRecord(REC_APP, chunk)
-                    if (incoming == null) {
-                        incoming =
-                            scope.launch {
-                                handshakeDone.await()
-                                pumpIncoming(tls, app)
-                            }
-                    }
                 }
             } catch (_: Throwable) {
             } finally {
-                incoming?.cancel()
+                incoming.cancel()
                 try {
                     transport.close()
                 } catch (_: Throwable) {
